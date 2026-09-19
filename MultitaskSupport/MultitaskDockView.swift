@@ -162,9 +162,20 @@ class AppInfoProvider {
     /// re-registered when the main window actually changed (fullscreen toggle or promotion).
     private var lastSettledFullscreen: Bool?
     private var lastSettledMainUUID: String?
-    /// True between arming a geometry commit (foreground-off at animation start) and settling
-    /// it (foreground-on at animation end). See armGeometryCommitIfNeeded().
+    /// True between arming a geometry commit and settling it. See armGeometryCommitIfNeeded().
     private var pendingGeometryCommit = false
+    /// Snapshot cover that hides the touch-region re-registration blip at settle.
+    private var geometryCommitCover: UIView?
+
+    /// Runtime diagnostics shown in the build label: they prove on-device how far a side-window
+    /// tap travels through the interception chain (seen by the UIApplication hook / the UIWindow
+    /// hook / swallowed / promoted) and whether the close path fires (exit callback / removal).
+    @objc public var diagBeganApp = 0
+    @objc public var diagBeganWindow = 0
+    @objc public var diagIntercepted = 0
+    @objc public var diagPromoted = 0
+    @objc public var diagExited = 0
+    @objc public var diagRemoved = 0
 
     private static let layoutAnimationDuration: TimeInterval = 0.4
 
@@ -244,17 +255,32 @@ class AppInfoProvider {
             self.keyWindow?.addSubview(host.view)
             self.dockHost = host
 
-            // Build marker: shows the stamped commit so the package on device is unmistakable.
+            // Build marker: shows the stamped commit so the package on device is unmistakable,
+            // plus the live diagnostic counters that trace the touch interception chain.
             self.buildLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
             self.buildLabel.textColor = .label
             self.buildLabel.alpha = 0.55
             self.buildLabel.isHidden = true
-            let commit = Bundle.main.object(forInfoDictionaryKey: "LCBuildCommit") as? String ?? ""
-            self.buildLabel.text = commit.isEmpty ? nil : "build " + commit
+            self.updateBuildLabel()
             self.keyWindow?.addSubview(self.buildLabel)
             // The stage only becomes a page once a window exists, so it starts out hidden.
             self.windowHostingView.isHidden = true
             self.performLayout(animated: false)
+        }
+    }
+
+    /// Re-stamps the build label with the commit and the live diagnostic counters.
+    private func updateBuildLabel() {
+        let commit = Bundle.main.object(forInfoDictionaryKey: "LCBuildCommit") as? String ?? ""
+        let build = commit.isEmpty ? "build ?" : "build " + commit
+        buildLabel.text = "\(build)  e\(diagBeganApp) w\(diagBeganWindow) h\(diagIntercepted) p\(diagPromoted) x\(diagExited) r\(diagRemoved)"
+    }
+
+    /// Counters are bumped from the sendEvent hooks on whatever thread UIKit delivers events on,
+    /// so the label refresh is marshalled onto the main queue.
+    @objc public func refreshDiagnosticsLabel() {
+        DispatchQueue.main.async { [weak self] in
+            self?.updateBuildLabel()
         }
     }
 
@@ -359,7 +385,7 @@ class AppInfoProvider {
             self.buildLabel.frame = CGRect(
                 x: safeArea.left + 10,
                 y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20,
-                width: 160,
+                width: 300,
                 height: 14
             )
         }
@@ -412,22 +438,22 @@ class AppInfoProvider {
 
     /// Called when an animated relayout changes the main window (fullscreen toggle, promotion
     /// or refill after a close). The hosted scene's system touch region only re-registers on a
-    /// foreground transition, so the foreground-off phase is sent right now — while the window
-    /// is visibly moving, which masks what would otherwise be a visible flash — and the
-    /// foreground-on phase lands at settle with the final geometry (settleAfterAnimation).
+    /// foreground NO→YES transition, so settleAfterAnimation runs that blip once the final
+    /// geometry is in place. The scene stays foreground for the whole animation: backgrounding it
+    /// mid-gesture froze the content and the reactivation showed up as a flash.
     private func armGeometryCommitIfNeeded() {
         let changed = lastSettledFullscreen != isFullscreen
             || lastSettledMainUUID != apps.first?.appUUID
         guard changed else { return }
         pendingGeometryCommit = true
-        if let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
-            main.appSceneVC.prepareHostedGeometryCommit()
-        }
     }
 
     /// Runs once when the geometry animation has landed. The settled layout is re-applied without
-    /// animation, and the main window's hosted scene finishes its geometry commit (foreground-on
-    /// with the final geometry), which re-registers the system touch region.
+    /// animation, then the main window's hosted scene re-registers its system touch region with a
+    /// short foreground NO→YES blip. The blip blanks the scene for a moment, so the window is first
+    /// covered with a snapshot of its current content; the cover leaves once the scene has had time
+    /// to render a live frame at the final geometry, which reads as a gentle crossfade instead of
+    /// a flash — the same snapshot swap the system app switcher performs.
     private func settleAfterAnimation() {
         isLayoutAnimating = false
         performLayout(animated: false)
@@ -435,9 +461,35 @@ class AppInfoProvider {
         pendingGeometryCommit = false
         lastSettledFullscreen = isFullscreen
         lastSettledMainUUID = apps.first?.appUUID
-        if let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
+        guard let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController else { return }
+        coverMainWindowForGeometryCommit()
+        main.appSceneVC.prepareHostedGeometryCommit()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             main.appSceneVC.finishHostedGeometryCommit()
+            guard let cover = self?.geometryCommitCover else { return }
+            self?.geometryCommitCover = nil
+            // Keep the cover until the re-foregrounded scene has rendered at the new geometry,
+            // then reveal it with a quick fade so any residual mismatch reads as a crossfade.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                UIView.animate(withDuration: 0.15, animations: { cover.alpha = 0 }) { _ in
+                    cover.removeFromSuperview()
+                }
+            }
         }
+    }
+
+    /// Snapshots the main window's current content and pins the snapshot above the live scene, so
+    /// the foreground blip underneath is never visible. A failed capture yields a transparent
+    /// view, which degrades gracefully to the uncovered behaviour.
+    private func coverMainWindowForGeometryCommit() {
+        geometryCommitCover?.removeFromSuperview()
+        geometryCommitCover = nil
+        guard let container = apps.first?.view,
+              let cover = container.snapshotView(afterScreenUpdates: false) else { return }
+        cover.frame = container.bounds
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(cover)
+        geometryCommitCover = cover
     }
 
     private func dismissStage() {
@@ -516,6 +568,8 @@ class AppInfoProvider {
 
     @objc public func removeRunningApp(_ appUUID: String) {
         guard isDockEnabled() else { return }
+        diagRemoved += 1
+        refreshDiagnosticsLabel()
 
         DispatchQueue.main.async {
             if let index = self.apps.firstIndex(where: { $0.appUUID == appUUID }) {
@@ -568,6 +622,8 @@ class AppInfoProvider {
             if view.convert(view.bounds, to: window).contains(location) {
                 // promoteToMain no-ops while a layout animation is in flight, but the touch
                 // is always swallowed so it can never leak into the side app.
+                diagIntercepted += 1
+                refreshDiagnosticsLabel()
                 promoteToMain(index: index)
                 return true
             }
@@ -582,6 +638,8 @@ class AppInfoProvider {
             let app = apps.remove(at: index)
             apps.insert(app, at: 0)
         }
+        diagPromoted += 1
+        refreshDiagnosticsLabel()
         relayout(animated: true)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }

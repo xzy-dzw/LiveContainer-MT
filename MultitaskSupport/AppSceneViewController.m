@@ -448,10 +448,9 @@
 /// The hosted scene's system touch region only re-registers on a foreground transition:
 /// transform and bounds changes alone never trigger it on iOS 26, which left the main window
 /// untouchable after a fullscreen toggle until the user went to the home screen and back (a
-/// real foreground cycle). The commit is therefore split in two halves: the foreground-off
-/// phase is sent when the geometry animation starts and the foreground-on phase once it has
-/// settled — the deactivation happens while the window is visibly moving, which masks the
-/// blip, and the re-registration lands with the final geometry.
+/// real foreground cycle). MultitaskDockManager runs the NO→YES blip once the layout animation
+/// has settled (prepare → ~0.12s → finish) while a snapshot of the window covers the screen, so
+/// the brief deactivation never shows up as a flash.
 - (void)prepareHostedGeometryCommit {
     if(!self.presenter || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
         return;

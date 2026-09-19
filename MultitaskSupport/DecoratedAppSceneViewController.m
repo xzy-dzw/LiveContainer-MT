@@ -198,6 +198,11 @@
 #pragma mark - AppSceneViewControllerDelegate
 
 - (void)appSceneVCAppDidExit:(AppSceneViewController*)vc {
+    // Diagnostics: the guest process exit callback fired (close path reaches this VC).
+    if(@available(iOS 16.0, *)) {
+        MultitaskDockManager.shared.diagExited += 1;
+        [MultitaskDockManager.shared refreshDiagnosticsLabel];
+    }
     BOOL skipTerminationScreen = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCSkipTerminatedScreen"];
     BOOL isManual = _isAppTerminationRequested;
     if(isManual || skipTerminationScreen) {
