@@ -4,19 +4,20 @@
 API_AVAILABLE(ios(16.0))
 @interface DecoratedAppSceneViewController : UIViewController<AppSceneViewControllerDelegate>
 @property(nonatomic) AppSceneViewController* appSceneVC;
-@property(nonatomic) UIStackView *view;
-@property(nonatomic) UINavigationBar *navigationBar;
-@property(nonatomic) UINavigationItem *navigationItem;
-@property(nonatomic) UIView *resizeHandle;
-@property(nonatomic) UIView* contentView;
+@property(nonatomic) UIView *view;
 
 @property(nonatomic) BOOL isMaximized;
 @property(nonatomic) CGFloat scaleRatio;
+@property(nonatomic, copy) void (^pidAvailableHandler)(NSNumber *pid, NSError *error);
 - (instancetype)initWindowName:(NSString*)windowName bundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID rootVC:(UIViewController*)rootVC;
-- (void)minimizeWindow;
+
+/// Places this window into its stage slot. The guest app always renders at the phone's
+/// original resolution and is scaled down by `ratio`, so it never relayouts.
+/// `maximized` is the live fullscreen state owned by the stage; it has to be pushed in here
+/// because the safe area differs between a split slot and fullscreen.
+- (void)applyStageFrame:(CGRect)frame scaleRatio:(CGFloat)ratio maximized:(BOOL)maximized;
+- (void)closeWindow;
 - (void)minimizeWindowPiP;
 - (void)unminimizeWindowPiP;
 - (void)updateVerticalConstraints;
-@property(nonatomic, copy) void (^pidAvailableHandler)(NSNumber *pid, NSError *error);
 @end
-

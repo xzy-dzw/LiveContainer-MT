@@ -275,7 +275,10 @@
             settings.deviceOrientation = UIDevice.currentDevice.orientation;
             settings.interfaceOrientation = self.view.window.windowScene.interfaceOrientation;
             CGRect frame = self.view.frame;
-            if(!self.usesHostingControllerAPI) {
+            // The guest app always renders at its original resolution and is scaled down by
+            // contentView.transform afterwards, so the scene size must be the unscaled size.
+            // This applies to the iOS 18+ hosting controller path as well.
+            if(self.scaleRatio > 0) {
                 frame.size.width /= self.scaleRatio;
                 frame.size.height /= self.scaleRatio;
             }

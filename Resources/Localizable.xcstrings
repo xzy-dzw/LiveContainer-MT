@@ -18350,6 +18350,40 @@
         }
       }
     },
+    "lc.multitask.stageLimitMessage" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "At most four apps can run at the same time. Close one window first."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最多只能同时运行 4 个应用，请先关闭一个窗口。"
+          }
+        }
+      }
+    },
+    "lc.multitask.stageLimitTitle" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Too many windows"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "窗口数量已达上限"
+          }
+        }
+      }
+    },
     "lc.multitask.copyPid" : {
       "extractionState" : "stale",
       "localizations" : {
