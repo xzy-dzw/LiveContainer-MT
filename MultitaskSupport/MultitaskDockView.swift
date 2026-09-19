@@ -538,7 +538,7 @@ struct MultitaskStageDockIcon: View {
 
     private func loadIcon() {
         guard icon == nil else { return }
-        let cacheKey = app.appInfo.displayName()
+        let cacheKey = app.appInfo.displayName() ?? app.appInfo.bundleIdentifier() ?? "?"
 
         if let cachedIcon = IconCacheManager.shared.getIcon(for: cacheKey) {
             icon = cachedIcon
