@@ -435,18 +435,24 @@
     return _hostingController != nil;
 }
 
-/// Mirrors the "home and back" cycle that used to be the only way to restore touches after a
-/// fullscreen toggle: deactivate the presenter so the system tears down the scene's old touch
-/// region, then re-activate it on the next runloop so the region is registered against the
-/// settled geometry. Safer than poking at private geometry methods that differ per iOS version.
+/// Forces the hosted scene to re-register its touch region by nudging the hosting view's
+/// bounds by a sub-pixel amount on the settled layout. Pure scale changes never trigger the
+/// system's geometry commit, which is what used to leave the main window untouchable after a
+/// fullscreen toggle; but a 0.5pt write is visible to UIKit's "did anything change" gate
+/// without the momentary render teardown that a deactivate/activate round trip causes.
 - (void)commitHostedGeometry {
-    if(!self.presenter) { return; }
-    if(self.presenter.isActive) {
-        [self.presenter deactivate];
+    if(!self.presenter || !self.usesHostingControllerAPI || !self.contentView) {
+        return;
     }
+    CGRect current = self.contentView.bounds;
+    // Nudge by half a point: small enough to be invisible but large enough that
+    // CGRectEqualToRect sees a different value and UIKit commits the geometry.
+    CGRect nudged = CGRectMake(current.origin.x, current.origin.y,
+                               current.size.width + 0.5,
+                               current.size.height + 0.5);
+    self.contentView.bounds = nudged;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self.presenter activate];
-        [self setBackgroundNotificationEnabled:YES];
+        self.contentView.bounds = current;
     });
 }
 
