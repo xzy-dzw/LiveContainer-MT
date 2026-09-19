@@ -305,6 +305,14 @@ class AppInfoProvider {
                 timingParameters: UISpringTimingParameters(dampingRatio: 1.0)
             )
             animator.addAnimations(update)
+            animator.addCompletion { _ in
+                // Re-apply the settled layout once, without animation. UIKit only re-registers a
+                // hosted scene as a touch target when its geometry is committed outside of an
+                // animation, so after an animated fullscreen toggle the windows used to stop
+                // responding until the host scene was reactivated. Running the very same layout
+                // again once the animation has landed is what brings the touches back.
+                self.performLayout(animated: false)
+            }
             animator.startAnimation()
         } else {
             update()

@@ -81,6 +81,11 @@
     BOOL maximizedChanged = (_isMaximized != maximized);
     _isMaximized = maximized;
 
+    // Side windows are display only. Switching interaction off on the guest view does two things:
+    // the app inside never reacts to a touch, and UIKit stops handing the touch over to the hosted
+    // scene, so the tap gesture below is the one that actually receives it and promotes the window.
+    self.appSceneVC.view.userInteractionEnabled = isMainWindow;
+
     // Only a side window in split layout can be promoted by tapping it.
     _promoteGesture.enabled = !maximized && !isMainWindow;
 
@@ -95,6 +100,15 @@
     } else {
         [self.appSceneVC updateFrameWithSettingsBlock:nil];
     }
+
+    // UIKit picks the touch target from the live view hierarchy, and the hosted scene is only
+    // reachable while its hosting view sits at the final frame. Right after a slot change that
+    // frame can stay stale until the next layout pass, which left the window unable to receive
+    // touches until the host scene was reactivated (going to the home screen and coming back).
+    // Laying the hosting view out here keeps it in sync with the slot it was just moved into.
+    UIView* hostedView = self.appSceneVC.contentView;
+    [hostedView setNeedsLayout];
+    [hostedView layoutIfNeeded];
 }
 
 - (void)applyScaleRatio {
