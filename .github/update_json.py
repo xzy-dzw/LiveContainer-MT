@@ -5,6 +5,11 @@ import requests
 import os
 from datetime import datetime
 
+# The repo the AltStore source should point at. Hardcoding the upstream name made every fork
+# publish a source whose downloadURL was the upstream IPA, so installing from it silently gave
+# upstream's binary instead of the fork's own build.
+REPO = os.environ.get("GITHUB_REPOSITORY", "LiveContainer/LiveContainer")
+
 def prepare_description(text):
     text = re.sub('<[^<]+?>', '', text) # Remove HTML tags
     text = re.sub(r'#{1,6}\s?', '', text) # Remove markdown header tags
@@ -166,7 +171,7 @@ def update_json_file_nightly(json_file, nightly_release):
     commit_msg = os.environ.get("commit_msg", "").strip()
 
     description = f"""\
-Nightly build from [{commit_sha}](https://github.com/LiveContainer/LiveContainer/commit/{commit_sha}):\
+Nightly build from [{commit_sha}](https://github.com/{REPO}/commit/{commit_sha}):\
  {commit_msg}
 
 This is a nightly release [created automatically with GitHub Actions workflow]({nightly_link}).
@@ -251,7 +256,7 @@ def update_json_file_release_ss_lc(repo_url, json_file, latest_release, is_night
     commit_msg = os.environ.get("commit_msg", "").strip()
 
     description = f"""\
-Nightly build from [{commit_sha}](https://github.com/LiveContainer/LiveContainer/commit/{commit_sha}):\
+Nightly build from [{commit_sha}](https://github.com/{REPO}/commit/{commit_sha}):\
  {commit_msg}
     """
     assets = latest_release.get("assets", [])
@@ -332,7 +337,7 @@ Nightly build from [{commit_sha}](https://github.com/LiveContainer/LiveContainer
 
 
 def main():
-    repo_url = "LiveContainer/LiveContainer"
+    repo_url = REPO
     is_nightly = "NIGHTLY_LINK" in os.environ
 
     try:
