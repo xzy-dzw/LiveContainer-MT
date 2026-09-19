@@ -275,9 +275,10 @@
             settings.deviceOrientation = UIDevice.currentDevice.orientation;
             settings.interfaceOrientation = self.view.window.windowScene.interfaceOrientation;
             CGRect frame = self.view.frame;
+            // [LOCAL CHANGE] Keep this in sync when merging upstream.
             // The guest app always renders at its original resolution and is scaled down by
             // contentView.transform afterwards, so the scene size must be the unscaled size.
-            // This applies to the iOS 18+ hosting controller path as well.
+            // This applies to the iOS 18+ hosting controller path as well, not just the legacy one.
             if(self.scaleRatio > 0) {
                 frame.size.width /= self.scaleRatio;
                 frame.size.height /= self.scaleRatio;
@@ -330,7 +331,19 @@
         if(@available(iOS 19.0, *)) { if(@available(iOS 27.0, *)) {} else isiOS26 = YES; }
         // Discard position
         frame.origin = CGPointZero;
-        self.contentView.frame = frame;
+        // [LOCAL CHANGE] Keep this in sync when merging upstream.
+        // The stage scales contentView with a transform, and UIKit leaves `frame` undefined once
+        // the transform is not the identity: the frame setter would divide by the scale and store
+        // a wrong bounds, which made guest views stretch or shrink inconsistently. contentView
+        // already has anchorPoint/position at (0,0), so set bounds directly instead.
+        //
+        // Only write when the size actually changes. This assignment triggers a layout pass, which
+        // calls viewWillLayoutSubviews and pushes the settings again through the debounced path;
+        // writing an identical value kept that cycle alive and made the window pulse forever.
+        CGRect newBounds = CGRectMake(0, 0, frame.size.width, frame.size.height);
+        if(!CGRectEqualToRect(self.contentView.bounds, newBounds)) {
+            self.contentView.bounds = newBounds;
+        }
     } else {
         // This method can be called while contentView is nil to set up initial frame
         self.view.frame = frame;

@@ -11,6 +11,7 @@
 @property(nonatomic) NSString* dataUUID;
 @property(nonatomic) int pid;
 @property(nonatomic) bool isAppTerminationRequested;
+@property(nonatomic) UITapGestureRecognizer* promoteGesture;
 @end
 
 @implementation DecoratedAppSceneViewController
@@ -22,7 +23,10 @@
 
     _dataUUID = dataUUID;
     _scaleRatio = 1.0;
-    _isMaximized = [NSUserDefaults.lcUserDefaults boolForKey:@"LCLaunchMultitaskMaximized"];
+    // The stage owns the fullscreen state; MultitaskDockManager pushes it through
+    // applyStageFrame:scaleRatio:maximized:. Never read the launch setting here, or the two
+    // sides disagree and the first layout flips between fullscreen and the split stage.
+    _isMaximized = NO;
     _appSceneVC = [[AppSceneViewController alloc] initWithBundleId:bundleId dataUUID:dataUUID delegate:self];
     self.title = windowName;
     [self setupDecoratedView];
@@ -53,11 +57,22 @@
         [_appSceneVC.view.topAnchor constraintEqualToAnchor:container.topAnchor],
         [_appSceneVC.view.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
     ]];
+
+    // Tapping a side window promotes it to the main slot. The gesture is disabled on the main
+    // window (and while fullscreen) so the guest app keeps receiving its own touches.
+    _promoteGesture = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapPromoteWindow)];
+    _promoteGesture.cancelsTouchesInView = YES;
+    _promoteGesture.enabled = NO;
+    [container addGestureRecognizer:_promoteGesture];
+}
+
+- (void)tapPromoteWindow {
+    [MultitaskDockManager.shared promoteWindowForUUID:self.dataUUID];
 }
 
 #pragma mark - Stage layout
 
-- (void)applyStageFrame:(CGRect)frame scaleRatio:(CGFloat)ratio maximized:(BOOL)maximized {
+- (void)applyStageFrame:(CGRect)frame scaleRatio:(CGFloat)ratio maximized:(BOOL)maximized isMainWindow:(BOOL)isMainWindow {
     self.view.frame = frame;
     _scaleRatio = ratio > 0 ? ratio : 1.0;
 
@@ -65,6 +80,9 @@
     // block when it actually flips, because split slots and fullscreen use different safe areas.
     BOOL maximizedChanged = (_isMaximized != maximized);
     _isMaximized = maximized;
+
+    // Only a side window in split layout can be promoted by tapping it.
+    _promoteGesture.enabled = !maximized && !isMainWindow;
 
     [self applyScaleRatio];
     [self.view layoutIfNeeded];

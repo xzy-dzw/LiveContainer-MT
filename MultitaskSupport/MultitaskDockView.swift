@@ -150,6 +150,8 @@ class AppInfoProvider {
         if let rootView = keyWindow?.rootViewController?.view {
             // The windows live inside the app's own hierarchy; the controls and the dock sit on
             // the window itself so they are always drawn above every guest window.
+            // The stage only becomes a page once a window exists, so it starts out hidden.
+            windowHostingView.isHidden = true
             (rootView.subviews.first ?? rootView).addSubview(self.windowHostingView)
         }
 
@@ -224,8 +226,10 @@ class AppInfoProvider {
             isFullscreen = false
             controls.isHidden = true
             blockShadowView.isHidden = true
-            // The dock is how apps get launched in the first place, so it stays visible and
-            // keeps its place even while no window is open.
+            // With no window open the stage is not a page yet, so it steps aside and lets the
+            // launcher show through. The dock is how apps get launched in the first place, so it
+            // stays visible and keeps its place even while no window is open.
+            windowHostingView.isHidden = true
             if let dockView = dockHost?.view {
                 dockView.isHidden = false
                 dockView.alpha = 1
@@ -233,6 +237,9 @@ class AppInfoProvider {
             }
             return
         }
+
+        // As soon as a window exists the stage becomes its own page with an opaque background.
+        windowHostingView.isHidden = false
 
         let update = {
             for (index, app) in self.apps.enumerated() {
@@ -246,7 +253,7 @@ class AppInfoProvider {
                     : MultitaskStageLayout.slotScaleRatio(index, bounds: bounds, safeArea: safeArea)
 
                 (view._viewDelegate() as? DecoratedAppSceneViewController)?
-                    .applyStageFrame(frame, scaleRatio: ratio, maximized: fullscreen)
+                    .applyStageFrame(frame, scaleRatio: ratio, maximized: fullscreen, isMainWindow: index == 0)
 
                 view.isHidden = false
                 // Corner, border and frame all change in the same block so the layer animates
@@ -326,7 +333,9 @@ class AppInfoProvider {
 
         DispatchQueue.main.async {
             self.apps.append(appModel)
-            // The setting lives in the host app's own defaults, matching DecoratedAppSceneViewController.
+            // This manager is the single owner of the fullscreen state. On the very first window
+            // the "launch maximized" setting decides whether it starts fullscreen or in the split
+            // stage; default (off) is always split first.
             if self.apps.count == 1, UserDefaults.standard.bool(forKey: "LCLaunchMultitaskMaximized") {
                 self.isFullscreen = true
             }
@@ -357,6 +366,14 @@ class AppInfoProvider {
         }
         promoteToMain(index: index)
         return true
+    }
+
+    /// Called when the user taps a side window, so it takes over the main slot.
+    @objc public func promoteWindowForUUID(_ appUUID: String) {
+        guard isDockEnabled(), let index = apps.firstIndex(where: { $0.appUUID == appUUID }) else {
+            return
+        }
+        promoteToMain(index: index)
     }
 
     func promoteToMain(index: Int) {
@@ -505,35 +522,26 @@ struct MultitaskStageDockIcon: View {
     let action: () -> Void
 
     @State private var icon: UIImage?
-    @State private var isPressed = false
 
     var body: some View {
-        Group {
-            if let icon {
-                Image(uiImage: icon)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-            } else {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color.gray.opacity(0.3))
+        // A plain Button keeps SwiftUI's native gesture arbitration with the horizontal
+        // ScrollView, so the dock can still be scrolled while a press still highlights.
+        Button(action: action) {
+            Group {
+                if let icon {
+                    Image(uiImage: icon)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                } else {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color.gray.opacity(0.3))
+                }
             }
+            .frame(width: 60, height: 60)
+            .contentShape(Rectangle())
         }
-        .frame(width: 60, height: 60)
-        .scaleEffect(isPressed ? 1.12 : 1.0)
-        // Spring with a touch of overshoot reads like the macOS dock bounce: press is instant,
-        // release snaps back a little before settling.
-        .animation(.spring(response: 0.28, dampingFraction: 0.62), value: isPressed)
+        .buttonStyle(StagePressButtonStyle())
         .onAppear(perform: loadIcon)
-        .onPressGesture(
-            onPress: { isPressed = true },
-            onRelease: { translation in
-                isPressed = false
-                // Ignore the release that ends a horizontal scroll of the dock.
-                guard abs(translation.width) < 8, abs(translation.height) < 8 else { return }
-                action()
-            }
-        )
-        .contentShape(Rectangle())
     }
 
     private func loadIcon() {
@@ -558,20 +566,15 @@ struct MultitaskStageDockIcon: View {
     }
 }
 
-// MARK: - Press gesture helper
-extension View {
-    func onPressGesture(onPress: @escaping () -> Void, onRelease: @escaping (_ translation: CGSize) -> Void) -> some View {
-        self.simultaneousGesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { value in
-                    if value.translation == .zero {
-                        onPress()
-                    }
-                }
-                .onEnded { value in
-                    onRelease(value.translation)
-                }
-        )
+// MARK: - Press feedback
+/// macOS dock style press feedback: the icon scales up instantly while held and springs back
+/// with a slight overshoot on release.
+@available(iOS 16.0, *)
+struct StagePressButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 1.12 : 1.0)
+            .animation(.spring(response: 0.28, dampingFraction: 0.62), value: configuration.isPressed)
     }
 }
 

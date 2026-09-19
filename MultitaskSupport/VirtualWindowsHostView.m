@@ -12,6 +12,9 @@
     CGRect frame = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).keyWindow.bounds;
     self = [super initWithFrame:frame];
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    // The stage is its own page rather than an overlay on the app list, so it paints an opaque
+    // neutral background and swallows touches that land on empty space.
+    self.backgroundColor = UIColor.systemGray5Color;
     self.shouldForwardTapAction = YES;
     return self;
 }
@@ -28,8 +31,10 @@
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView* hitView = [super hitTest:point withEvent:event];
     if(hitView == self) {
+        // Keep the touch instead of forwarding it to the launcher underneath, so the empty
+        // areas of the stage behave like a real page background.
         self.shouldForwardTapAction = NO;
-        return nil;
+        return self;
     } else {
         self.shouldForwardTapAction = YES;
         return hitView;

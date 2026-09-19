@@ -15,7 +15,9 @@ API_AVAILABLE(ios(16.0))
 /// original resolution and is scaled down by `ratio`, so it never relayouts.
 /// `maximized` is the live fullscreen state owned by the stage; it has to be pushed in here
 /// because the safe area differs between a split slot and fullscreen.
-- (void)applyStageFrame:(CGRect)frame scaleRatio:(CGFloat)ratio maximized:(BOOL)maximized;
+/// `isMainWindow` keeps the tap-to-promote gesture off the main slot, where the guest app
+/// needs to receive its own touches.
+- (void)applyStageFrame:(CGRect)frame scaleRatio:(CGFloat)ratio maximized:(BOOL)maximized isMainWindow:(BOOL)isMainWindow;
 - (void)closeWindow;
 - (void)minimizeWindowPiP;
 - (void)unminimizeWindowPiP;

@@ -161,13 +161,17 @@ import UIKit
 
     private let closeButton = UIButton(type: .custom)
     private let zoomButton = UIButton(type: .custom)
+    private let closeDot = UIView()
+    private let zoomDot = UIView()
     private let capsuleButton = UIButton(type: .custom)
     private let capsuleBackground = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterialDark))
     private let capsuleDot = UIView()
     private let capsuleIcon = UIImageView()
 
-    private let dotSize: CGFloat = 13
-    private let dotSpacing: CGFloat = 9
+    /// The visible dot stays small and macOS like, but the tappable area around it is much
+    /// larger so the controls are easy to hit on a phone.
+    private let dotSize: CGFloat = 18
+    private let hitSpacing: CGFloat = 2
     /// Keeps the traffic lights off the very edge of the main window, like macOS does.
     private let dotLeftInset: CGFloat = 8
     private let capsuleSize = CGSize(width: 88, height: 34)
@@ -179,8 +183,8 @@ import UIKit
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
-        setupTrafficLight(closeButton, color: MultitaskStageControlsView.closeColor, action: #selector(tapClose))
-        setupTrafficLight(zoomButton, color: MultitaskStageControlsView.zoomColor, action: #selector(tapZoom))
+        setupTrafficLight(closeButton, dot: closeDot, color: MultitaskStageControlsView.closeColor, action: #selector(tapClose))
+        setupTrafficLight(zoomButton, dot: zoomDot, color: MultitaskStageControlsView.zoomColor, action: #selector(tapZoom))
         setupCapsule()
         applyMode()
     }
@@ -189,13 +193,18 @@ import UIKit
         fatalError("init(coder:) has not been implemented")
     }
 
-    private func setupTrafficLight(_ button: UIButton, color: UIColor, action: Selector) {
-        button.backgroundColor = color
-        button.layer.cornerRadius = dotSize / 2
-        button.layer.borderWidth = MultitaskStageLayout.hairline
-        button.layer.borderColor = UIColor.black.withAlphaComponent(0.12).cgColor
+    /// Builds a transparent tap target with a smaller colored dot centered inside it.
+    private func setupTrafficLight(_ button: UIButton, dot: UIView, color: UIColor, action: Selector) {
+        button.backgroundColor = .clear
         button.addTarget(self, action: action, for: .touchUpInside)
         addSubview(button)
+
+        dot.backgroundColor = color
+        dot.layer.cornerRadius = dotSize / 2
+        dot.layer.borderWidth = MultitaskStageLayout.hairline
+        dot.layer.borderColor = UIColor.black.withAlphaComponent(0.12).cgColor
+        dot.isUserInteractionEnabled = false
+        button.addSubview(dot)
     }
 
     private func setupCapsule() {
@@ -259,14 +268,27 @@ import UIKit
             )
             capsuleIcon.frame = CGRect(x: 34, y: (capsuleSize.height - 16) / 2, width: 42, height: 16)
         } else {
-            let y = (bounds.height - dotSize) / 2
-            closeButton.frame = CGRect(x: dotLeftInset, y: y, width: dotSize, height: dotSize)
+            // The tap target fills the whole strip vertically and is wider than the dot, so it is
+            // easy to hit without making the strip taller and stealing room from the window.
+            // The width is kept close to the dot size so the two dots keep macOS like spacing.
+            let hitWidth: CGFloat = 32
+            let hitHeight = bounds.height
+            let y: CGFloat = 0
+            closeButton.frame = CGRect(x: dotLeftInset, y: y, width: hitWidth, height: hitHeight)
             zoomButton.frame = CGRect(
-                x: dotLeftInset + dotSize + dotSpacing,
+                x: dotLeftInset + hitWidth + hitSpacing,
                 y: y,
+                width: hitWidth,
+                height: hitHeight
+            )
+            let dotFrame = CGRect(
+                x: (hitWidth - dotSize) / 2,
+                y: (hitHeight - dotSize) / 2,
                 width: dotSize,
                 height: dotSize
             )
+            closeDot.frame = dotFrame
+            zoomDot.frame = dotFrame
         }
     }
 
