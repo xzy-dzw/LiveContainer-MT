@@ -445,37 +445,39 @@
     }];
 }
 
-/// Forces the hosted scene's system touch region to be re-registered after a stage geometry
-/// change. The region only gets committed on a foreground transition: transform and bounds
-/// changes alone never trigger it on iOS 26, which left the main window untouchable after a
-/// fullscreen toggle until the user went to the home screen and back (a real foreground cycle).
-/// Replicating that cycle with a short foreground blip re-registers the region without the
-/// render teardown that a presenter deactivate/activate round trip causes.
-- (void)commitHostedGeometry {
+/// The hosted scene's system touch region only re-registers on a foreground transition:
+/// transform and bounds changes alone never trigger it on iOS 26, which left the main window
+/// untouchable after a fullscreen toggle until the user went to the home screen and back (a
+/// real foreground cycle). The commit is therefore split in two halves: the foreground-off
+/// phase is sent when the geometry animation starts and the foreground-on phase once it has
+/// settled — the deactivation happens while the window is visibly moving, which masks the
+/// blip, and the re-registration lands with the final geometry.
+- (void)prepareHostedGeometryCommit {
     if(!self.presenter || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
         return;
     }
     [self setHostedSceneForeground:NO];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if(!self.presenter) {
-            return;
-        }
-        [self setHostedSceneForeground:YES];
-        // Belt and braces: right after the flip, re-assert the settings block and write the
-        // hosting view's current geometry into it, the same way the system does internally.
-        __weak typeof(self) weakSelf = self;
-        [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
-            __strong typeof(weakSelf) self = weakSelf;
-            if(!self) return;
-            settings.foreground = YES;
-            settings.deactivationReasons = 0;
-            if(@available(iOS 19.0, *)) {
-                if([self.contentView isKindOfClass:PrivClass(_UISceneHostingView)]) {
-                    [(id)self.contentView applyViewGeometryToSettings:settings];
-                }
+}
+
+- (void)finishHostedGeometryCommit {
+    if(!self.presenter || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
+        return;
+    }
+    [self setHostedSceneForeground:YES];
+    // Belt and braces: right after the flip, re-assert the settings block and write the
+    // hosting view's current (final) geometry into it, the same way the system does internally.
+    __weak typeof(self) weakSelf = self;
+    [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if(!self) return;
+        settings.foreground = YES;
+        settings.deactivationReasons = 0;
+        if(@available(iOS 19.0, *)) {
+            if([self.contentView isKindOfClass:PrivClass(_UISceneHostingView)]) {
+                [(id)self.contentView applyViewGeometryToSettings:settings];
             }
-        }];
-    });
+        }
+    }];
 }
 
 @end

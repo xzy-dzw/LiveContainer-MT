@@ -144,7 +144,7 @@
         // Legacy presenter path: push the whole settings block (insets included) right away.
         // On the iOS 18+ hosting path this delegate re-push is a no-op by design (see
         // didUpdateFromSettings); the geometry goes through updateFrameWithSettingsBlock and
-        // the touch region is re-registered by commitHostedGeometry at settle.
+        // the touch region is re-registered by finishHostedGeometryCommit at settle.
         [self appSceneVC:self.appSceneVC
     didUpdateFromSettings:self.appSceneVC.presenter.scene.settings.mutableCopy
        transitionContext:nil

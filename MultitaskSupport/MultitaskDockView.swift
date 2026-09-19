@@ -162,6 +162,9 @@ class AppInfoProvider {
     /// re-registered when the main window actually changed (fullscreen toggle or promotion).
     private var lastSettledFullscreen: Bool?
     private var lastSettledMainUUID: String?
+    /// True between arming a geometry commit (foreground-off at animation start) and settling
+    /// it (foreground-on at animation end). See armGeometryCommitIfNeeded().
+    private var pendingGeometryCommit = false
 
     private static let layoutAnimationDuration: TimeInterval = 0.4
 
@@ -293,6 +296,13 @@ class AppInfoProvider {
 
         let update = { [weak self] in
             guard let self else { return }
+            // Self-heal: a terminated window's view can be detached from the stage before its
+            // model left the array (lost removal callback). Dropping detached models here lets
+            // the next app slide into the main slot on this very layout pass instead of leaving
+            // an empty main slot behind.
+            if self.apps.contains(where: { $0.view?.window == nil }) {
+                self.apps.removeAll { $0.view?.window == nil }
+            }
             for (index, app) in self.apps.enumerated() {
                 guard let view = app.view else { continue }
                 let fullscreen = self.isFullscreen && index == 0
@@ -355,6 +365,7 @@ class AppInfoProvider {
         }
 
         if animated && UIAccessibility.isReduceMotionEnabled {
+            armGeometryCommitIfNeeded()
             isLayoutAnimating = true
             UIView.transition(with: windowHostingView, duration: 0.2, options: .transitionCrossDissolve, animations: update)
             UIView.animate(withDuration: 0.2) { self.dockHost?.view.alpha = self.isFullscreen ? 0 : 1 }
@@ -362,6 +373,7 @@ class AppInfoProvider {
                 self?.settleAfterAnimation()
             }
         } else if animated {
+            armGeometryCommitIfNeeded()
             let animator = UIViewPropertyAnimator(
                 duration: MultitaskDockManager.layoutAnimationDuration,
                 timingParameters: UISpringTimingParameters(dampingRatio: 1.0)
@@ -398,23 +410,33 @@ class AppInfoProvider {
         window.bringSubviewToFront(buildLabel)
     }
 
+    /// Called when an animated relayout changes the main window (fullscreen toggle, promotion
+    /// or refill after a close). The hosted scene's system touch region only re-registers on a
+    /// foreground transition, so the foreground-off phase is sent right now — while the window
+    /// is visibly moving, which masks what would otherwise be a visible flash — and the
+    /// foreground-on phase lands at settle with the final geometry (settleAfterAnimation).
+    private func armGeometryCommitIfNeeded() {
+        let changed = lastSettledFullscreen != isFullscreen
+            || lastSettledMainUUID != apps.first?.appUUID
+        guard changed else { return }
+        pendingGeometryCommit = true
+        if let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
+            main.appSceneVC.prepareHostedGeometryCommit()
+        }
+    }
+
     /// Runs once when the geometry animation has landed. The settled layout is re-applied without
-    /// animation, and the main window's hosted scene has its settings (including the system
-    /// touch region) re-registered through a foreground flip — but only when its geometry or its
-    /// app actually changed, because a foreground blip makes the guest app see a brief
-    /// deactivation and doing it on every relayout would be visible.
+    /// animation, and the main window's hosted scene finishes its geometry commit (foreground-on
+    /// with the final geometry), which re-registers the system touch region.
     private func settleAfterAnimation() {
         isLayoutAnimating = false
         performLayout(animated: false)
-        let mainUUID = apps.first?.appUUID
-        let fullscreenChanged = lastSettledFullscreen != isFullscreen
-        let mainAppChanged = lastSettledMainUUID != mainUUID
-        if fullscreenChanged || mainAppChanged {
-            lastSettledFullscreen = isFullscreen
-            lastSettledMainUUID = mainUUID
-            if let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
-                main.appSceneVC.commitHostedGeometry()
-            }
+        guard pendingGeometryCommit else { return }
+        pendingGeometryCommit = false
+        lastSettledFullscreen = isFullscreen
+        lastSettledMainUUID = apps.first?.appUUID
+        if let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
+            main.appSceneVC.finishHostedGeometryCommit()
         }
     }
 
@@ -496,12 +518,14 @@ class AppInfoProvider {
         guard isDockEnabled() else { return }
 
         DispatchQueue.main.async {
-            guard let index = self.apps.firstIndex(where: { $0.appUUID == appUUID }) else { return }
-            self.apps.remove(at: index)
-            if index == 0 {
-                self.isFullscreen = false
+            if let index = self.apps.firstIndex(where: { $0.appUUID == appUUID }) {
+                self.apps.remove(at: index)
+                if index == 0 {
+                    self.isFullscreen = false
+                }
             }
-            // The remaining windows move up, so a slot is never left empty.
+            // Relayout even when the UUID was not found: performLayout self-heals detached
+            // windows, so this pass is what lets the next app slide into the main slot.
             self.relayout(animated: true)
         }
     }
@@ -525,20 +549,20 @@ class AppInfoProvider {
         promoteToMain(index: index)
     }
 
-    /// Called from the UIApplication.sendEvent hook in UIKitHooks.m for every touch that begins
-    /// anywhere in the process. Hosted scenes receive touches through a system-level channel
-    /// that bypasses the regular UIKit hit-test chain, so view-level shields cannot stop a side
+    /// Called from the sendEvent hooks in UIKitHooks.m for every touch that begins inside the
+    /// stage's window. Hosted scenes receive touches through a system-level channel that
+    /// bypasses the regular UIKit hit-test chain, so view-level shields cannot stop a side
     /// window's app from getting the touch. sendEvent, however, is upstream of that channel:
-    /// swallowing the touch here means the side app never sees it at all.
-    /// Returns true when the touch landed in a side slot and the window was promoted.
-    @objc public func interceptTouchIfSideSlot(_ touch: UITouch) -> Bool {
+    /// swallowing the touch there means the side app never sees it at all.
+    /// Returns true when the location landed in a side slot and the window was promoted.
+    @objc public func interceptTouch(at location: CGPoint, in window: UIWindow) -> Bool {
         guard !isFullscreen, apps.count > 1 else { return false }
-        guard let window = touch.window else { return false }
-        let location = touch.location(in: window)
+        // Only the window that actually hosts the stage can match a side slot; a touch over
+        // any other window (alert, sheet, ...) must never promote anything.
+        guard let stageView = apps.first?.view, stageView.window === window else { return false }
         for index in 1..<apps.count {
             guard let view = apps[index].view else { continue }
-            let slotRect = view.convert(view.bounds, to: window)
-            if slotRect.contains(location) {
+            if view.convert(view.bounds, to: window).contains(location) {
                 // promoteToMain no-ops while a layout animation is in flight, but the touch
                 // is always swallowed so it can never leak into the side app.
                 promoteToMain(index: index)

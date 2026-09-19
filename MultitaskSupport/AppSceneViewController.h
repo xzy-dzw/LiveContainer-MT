@@ -41,11 +41,12 @@ API_AVAILABLE(ios(16.0))
 - (void)terminate;
 - (void)openURLScheme:(NSString *)urlString;
 - (void)handleStatusBarTapAction:(UIAction *)action;
-/// Re-registers the hosted scene's system touch region after a stage geometry change by
-/// flipping the scene's foreground state off and back on — the same thing that happens when
-/// the user leaves to the home screen and returns, which is the only reliable trigger for
-/// that re-registration on iOS 26. Runs once after the layout animation has completed.
-- (void)commitHostedGeometry;
+/// Re-registers the hosted scene's system touch region after a stage geometry change, in two
+/// halves: the foreground-off phase runs when the geometry animation starts (masked by the
+/// motion), and the foreground-on phase once it has settled with the final geometry — the
+/// only reliable trigger for that re-registration on iOS 26.
+- (void)prepareHostedGeometryCommit;
+- (void)finishHostedGeometryCommit;
 /// Set foreground state on the hosted scene. Used to suspend side windows while the app is
 /// backgrounded (so iOS does not kill them for memory pressure) and to wake them back up.
 - (void)setHostedSceneForeground:(BOOL)foreground;
