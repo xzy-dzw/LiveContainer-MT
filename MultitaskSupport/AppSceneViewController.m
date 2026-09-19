@@ -445,24 +445,36 @@
     }];
 }
 
-/// Forces the hosted scene to re-register its touch region by nudging the hosting view's
-/// bounds by a sub-pixel amount on the settled layout. Pure scale changes never trigger the
-/// system's geometry commit, which is what used to leave the main window untouchable after a
-/// fullscreen toggle; but a 0.5pt write is visible to UIKit's "did anything change" gate
-/// without the momentary render teardown that a deactivate/activate round trip causes.
+/// Forces the hosted scene's system touch region to be re-registered after a stage geometry
+/// change. The region only gets committed on a foreground transition: transform and bounds
+/// changes alone never trigger it on iOS 26, which left the main window untouchable after a
+/// fullscreen toggle until the user went to the home screen and back (a real foreground cycle).
+/// Replicating that cycle with a short foreground blip re-registers the region without the
+/// render teardown that a presenter deactivate/activate round trip causes.
 - (void)commitHostedGeometry {
-    if(!self.presenter || !self.usesHostingControllerAPI || !self.contentView) {
+    if(!self.presenter || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
         return;
     }
-    CGRect current = self.contentView.bounds;
-    // Nudge by half a point: small enough to be invisible but large enough that
-    // CGRectEqualToRect sees a different value and UIKit commits the geometry.
-    CGRect nudged = CGRectMake(current.origin.x, current.origin.y,
-                               current.size.width + 0.5,
-                               current.size.height + 0.5);
-    self.contentView.bounds = nudged;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.contentView.bounds = current;
+    [self setHostedSceneForeground:NO];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if(!self.presenter) {
+            return;
+        }
+        [self setHostedSceneForeground:YES];
+        // Belt and braces: right after the flip, re-assert the settings block and write the
+        // hosting view's current geometry into it, the same way the system does internally.
+        __weak typeof(self) weakSelf = self;
+        [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if(!self) return;
+            settings.foreground = YES;
+            settings.deactivationReasons = 0;
+            if(@available(iOS 19.0, *)) {
+                if([self.contentView isKindOfClass:PrivClass(_UISceneHostingView)]) {
+                    [(id)self.contentView applyViewGeometryToSettings:settings];
+                }
+            }
+        }];
     });
 }
 

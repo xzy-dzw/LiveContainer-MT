@@ -140,7 +140,11 @@
     [self applyScaleRatio];
     [self.view layoutIfNeeded];
 
-    if(maximizedChanged && self.appSceneVC.presenter) {
+    if(maximizedChanged && self.appSceneVC.presenter && !self.appSceneVC.usesHostingControllerAPI) {
+        // Legacy presenter path: push the whole settings block (insets included) right away.
+        // On the iOS 18+ hosting path this delegate re-push is a no-op by design (see
+        // didUpdateFromSettings); the geometry goes through updateFrameWithSettingsBlock and
+        // the touch region is re-registered by commitHostedGeometry at settle.
         [self appSceneVC:self.appSceneVC
     didUpdateFromSettings:self.appSceneVC.presenter.scene.settings.mutableCopy
        transitionContext:nil
@@ -251,6 +255,17 @@
 }
 
 - (void)appSceneVC:(AppSceneViewController*)vc didUpdateFromSettings:(UIMutableApplicationSceneSettings *)baseSettings transitionContext:(id)newContext lifecycleActionType:(uint32_t)actionType {
+    if(self.appSceneVC.usesHostingControllerAPI) {
+        // iOS 18+ hosting path: the hosting view derives the scene geometry from the view
+        // hierarchy itself, and the periphery insets are rewritten by the FBScene safe-area
+        // hook. Re-writing contentView.bounds from a settings diff here would feed the
+        // hosting view's own push straight back into the scene — our write triggers a new
+        // system diff, which writes again — which showed up as the occasional endless
+        // zoom-in/zoom-out pulse after a fullscreen toggle. Stay out of the loop entirely.
+        return;
+    }
+
+    // Legacy presenter path: the scene settings have to be pushed explicitly.
     [self.appSceneVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
         settings.userInterfaceStyle = baseSettings.userInterfaceStyle;
         settings.interfaceOrientation = baseSettings.interfaceOrientation;

@@ -143,13 +143,9 @@ class AppInfoProvider {
     private let buildLabel = UILabel()
 
     /// Highest-level invisible window that routes touches for the stage. Side-window touches are
-    /// captured here (because the system-level hosted-view touch delivery bypasses the regular
-    /// UIKit hit-test chain), while the main window's touches are forwarded straight through.
-    private var overlayTouchWindow: UIWindow?
-    /// One shield per running side slot, in the same order as `apps`.
-    private var overlayShields: [UIView] = []
-    /// One-shot flag so setupOverlayTouchWindow is only called once, lazily on first layout.
-    private var overlayWindowSetup = false
+    /// captured in UIApplication.sendEvent (hooked in UIKitHooks.m), because the system-level
+    /// hosted-view touch delivery bypasses the regular UIKit hit-test chain, while the main
+    /// window's touches are forwarded straight through.
 
     /// The four slots tile into one rectangle, so a single shadow caster behind them lifts the
     /// whole block off the desktop without drawing overlapping shadows inside the shared edges.
@@ -162,6 +158,10 @@ class AppInfoProvider {
     /// Re-entry guard while the stage geometry is animating, so quick repeated zoom/promote
     /// taps cannot stack two geometry animations on top of each other.
     private var isLayoutAnimating = false
+    /// Stage state at the moment of the last settle, so the hosted scene's touch region is only
+    /// re-registered when the main window actually changed (fullscreen toggle or promotion).
+    private var lastSettledFullscreen: Bool?
+    private var lastSettledMainUUID: String?
 
     private static let layoutAnimationDuration: TimeInterval = 0.4
 
@@ -231,65 +231,6 @@ class AppInfoProvider {
         ?? (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.windows.first
     }
 
-    private func setupOverlayTouchWindow() {
-        guard !overlayWindowSetup else { return }
-        overlayWindowSetup = true
-        // Lazy on first real window — init() may run before keyWindow exists.
-        guard let hostWindow = keyWindow else { overlayWindowSetup = false; return }
-        // Guard with optional cast: if the ObjC class is missing from the target (e.g. the .m
-        // file was not picked up by the Xcode 16 file sync), degrade gracefully and leave the
-        // overlay disabled instead of force-casting nil and crashing on startup.
-        guard let cls = NSClassFromString("OverlayTouchWindow") as? UIWindow.Type else {
-            overlayWindowSetup = false
-            return
-        }
-        let win = cls.init(frame: hostWindow.bounds)
-        // Just show the window — do NOT make it key. A transparent overlay should never steal
-        // key-window status from the real app window (that breaks the responder chain on iOS).
-        win.isHidden = false
-        self.overlayTouchWindow = win
-        // Pre-allocate 4 shield subviews (one per possible side slot). They are hidden by
-        // default and only show when a side window is active.
-        for i in 0..<MultitaskStageLayout.maxWindows {
-            let shield = UIView(frame: .zero)
-            shield.tag = 100 + i
-            shield.backgroundColor = .clear
-            shield.isUserInteractionEnabled = true
-            shield.isHidden = true
-            let tap = UITapGestureRecognizer(target: self, action: NSSelectorFromString("overlayShieldTapped:"))
-            tap.cancelsTouchesInView = true
-            shield.addGestureRecognizer(tap)
-            win.addSubview(shield)
-            overlayShields.append(shield)
-        }
-    }
-
-    @objc private func overlayShieldTapped(_ gesture: UITapGestureRecognizer) {
-        guard let shield = gesture.view else { return }
-        // shield.tag = 100 + index (of the slot it was covering when it became visible). But
-        // indices shift as apps move between slots, so the tag stored when creating is wrong
-        // once promoted. Instead, find the first currently-visible shield and route it to
-        // the side slot that matches its current frame's topmost app.
-        let frame = shield.frame
-        // Find which app view's frame most-closely matches this shield's frame (they are set
-        // identically in performLayout, so compare centres).
-        let targetCentre = CGPoint(x: frame.midX, y: frame.midY)
-        var bestIndex = -1
-        var bestDistance = CGFloat.greatestFiniteMagnitude
-        for (index, app) in apps.enumerated() {
-            guard let view = app.view else { continue }
-            let centre = CGPoint(x: view.frame.midX, y: view.frame.midY)
-            let d = hypot(centre.x - targetCentre.x, centre.y - targetCentre.y)
-            if d < bestDistance {
-                bestDistance = d
-                bestIndex = index
-            }
-        }
-        if bestIndex > 0 { // only side slots can be promoted from a shield
-            promoteToMain(index: bestIndex)
-        }
-    }
-
     private func setupDockView() {
         DispatchQueue.main.async {
             let host = UIHostingController(rootView: AnyView(
@@ -352,9 +293,6 @@ class AppInfoProvider {
 
         let update = { [weak self] in
             guard let self else { return }
-            // Lazy init the overlay touch window on the first real layout — if the ObjC class
-            // is missing from the target we gracefully degrade and the shields simply won't exist.
-            self.setupOverlayTouchWindow()
             for (index, app) in self.apps.enumerated() {
                 guard let view = app.view else { continue }
                 let fullscreen = self.isFullscreen && index == 0
@@ -414,23 +352,6 @@ class AppInfoProvider {
                 width: 160,
                 height: 14
             )
-
-            // Overlay touch window follows the real app window frame and covers the screen.
-            // Its shields mirror the side-window slots: hidden when fullscreen or no side slot,
-            // visible with the exact slot frame so they intercept side-window touches only.
-            self.overlayTouchWindow?.frame = window.bounds
-            let hasSide = !self.isFullscreen && self.apps.count > 1
-            self.overlayTouchWindow?.setValue(hasSide, forKey: "routingEnabled")
-            for i in 0..<self.overlayShields.count {
-                let shield = self.overlayShields[i]
-                let sideFrame = self.apps.count > i + 1 && !self.isFullscreen
-                    ? self.apps[i + 1].view?.frame ?? .zero
-                    : CGRect.zero
-                shield.isHidden = !sideFrame.isEmpty ? false : true
-                if !sideFrame.isEmpty {
-                    shield.frame = sideFrame
-                }
-            }
         }
 
         if animated && UIAccessibility.isReduceMotionEnabled {
@@ -478,15 +399,22 @@ class AppInfoProvider {
     }
 
     /// Runs once when the geometry animation has landed. The settled layout is re-applied without
-    /// animation and the main window's hosted scene geometry is pushed through the system pipeline
-    /// again: a pure transform change (split 0.75 scale vs fullscreen 1.0) does not re-register
-    /// the system touch region by itself, so without this the main window stayed untouchable
-    /// until the scene was reactivated by leaving to the home screen and coming back.
+    /// animation, and the main window's hosted scene has its settings (including the system
+    /// touch region) re-registered through a foreground flip — but only when its geometry or its
+    /// app actually changed, because a foreground blip makes the guest app see a brief
+    /// deactivation and doing it on every relayout would be visible.
     private func settleAfterAnimation() {
         isLayoutAnimating = false
         performLayout(animated: false)
-        if let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
-            main.appSceneVC.commitHostedGeometry()
+        let mainUUID = apps.first?.appUUID
+        let fullscreenChanged = lastSettledFullscreen != isFullscreen
+        let mainAppChanged = lastSettledMainUUID != mainUUID
+        if fullscreenChanged || mainAppChanged {
+            lastSettledFullscreen = isFullscreen
+            lastSettledMainUUID = mainUUID
+            if let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
+                main.appSceneVC.commitHostedGeometry()
+            }
         }
     }
 
@@ -495,8 +423,6 @@ class AppInfoProvider {
         isFullscreen = false
         controls.isHidden = true
         blockShadowView.isHidden = true
-        overlayShields.forEach { $0.isHidden = true }
-        overlayTouchWindow?.setValue(false, forKey: "routingEnabled")
         UIView.animate(withDuration: 0.2, animations: {
             self.windowHostingView.alpha = 0
             self.dockHost?.view.alpha = 0
@@ -597,6 +523,29 @@ class AppInfoProvider {
             return
         }
         promoteToMain(index: index)
+    }
+
+    /// Called from the UIApplication.sendEvent hook in UIKitHooks.m for every touch that begins
+    /// anywhere in the process. Hosted scenes receive touches through a system-level channel
+    /// that bypasses the regular UIKit hit-test chain, so view-level shields cannot stop a side
+    /// window's app from getting the touch. sendEvent, however, is upstream of that channel:
+    /// swallowing the touch here means the side app never sees it at all.
+    /// Returns true when the touch landed in a side slot and the window was promoted.
+    @objc public func interceptTouchIfSideSlot(_ touch: UITouch) -> Bool {
+        guard !isFullscreen, apps.count > 1 else { return false }
+        guard let window = touch.window else { return false }
+        let location = touch.location(in: window)
+        for index in 1..<apps.count {
+            guard let view = apps[index].view else { continue }
+            let slotRect = view.convert(view.bounds, to: window)
+            if slotRect.contains(location) {
+                // promoteToMain no-ops while a layout animation is in flight, but the touch
+                // is always swallowed so it can never leak into the side app.
+                promoteToMain(index: index)
+                return true
+            }
+        }
+        return false
     }
 
     func promoteToMain(index: Int) {

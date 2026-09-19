@@ -41,9 +41,10 @@ API_AVAILABLE(ios(16.0))
 - (void)terminate;
 - (void)openURLScheme:(NSString *)urlString;
 - (void)handleStatusBarTapAction:(UIAction *)action;
-/// Re-pushes the hosted scene geometry from the hosting view's current (settled) layout.
-/// A pure transform change between the split stage and fullscreen does not re-register the
-/// system touch region, so this has to run once after the layout animation has completed.
+/// Re-registers the hosted scene's system touch region after a stage geometry change by
+/// flipping the scene's foreground state off and back on — the same thing that happens when
+/// the user leaves to the home screen and returns, which is the only reliable trigger for
+/// that re-registration on iOS 26. Runs once after the layout animation has completed.
 - (void)commitHostedGeometry;
 /// Set foreground state on the hosted scene. Used to suspend side windows while the app is
 /// backgrounded (so iOS does not kill them for memory pressure) and to wake them back up.

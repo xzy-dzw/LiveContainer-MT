@@ -7,6 +7,7 @@
 @import ObjectiveC;
 #import "utils.h"
 #import "UIKitPrivate+MultitaskSupport.h"
+#import "LiveContainerSwiftUI-Swift.h"
 
 static BOOL LCHasRemoteSheetProviderSelector;
 
@@ -65,11 +66,66 @@ void hook_FBScene_performUpdateWithoutActivation(FBScene* self, SEL _cmd, void (
     [self hook__performUpdateWithoutActivation:wrappedBlock];
 }
 
+#pragma mark - Stage touch interception
+
+// Touches destined for a hosted scene are delivered through a system-level channel that
+// bypasses the regular UIKit hit-test chain, so no view placed above the scene view (neither
+// in the hierarchy nor in a separate window) can reliably block them. UIApplication.sendEvent,
+// however, is the entry point of every UIEvent in this process and sits upstream of that
+// channel: swallowing a touch here means the guest app never sees it. The hook asks the
+// multitask stage whether a new touch began inside one of the side slots; if so the whole
+// touch sequence is swallowed and the window is promoted to the main slot instead.
+static NSHashTable<UITouch *> *LCInterceptedTouches;
+
+@interface UIApplication (LCSendEventHook)
+// Exchange-implemented with sendEvent:, so calling this dispatches to the original
+// implementation.
+- (void)hook_UIApplication_sendEvent:(UIEvent *)event;
+@end
+
+static void hook_UIApplication_sendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
+    NSSet<UITouch *> *touches = event.allTouches;
+    if(touches.count > 0 && @available(iOS 16.0, *)) {
+        // Ask the stage only for freshly began touches; later phases of an already
+        // intercepted sequence are swallowed without further checks.
+        for(UITouch *touch in touches) {
+            if(touch.phase != UITouchPhaseBegan) continue;
+            if([MultitaskDockManager.shared interceptTouchIfSideSlot:touch]) {
+                if(!LCInterceptedTouches) {
+                    LCInterceptedTouches = [NSHashTable weakObjectsHashTable];
+                }
+                [LCInterceptedTouches addObject:touch];
+            }
+        }
+
+        BOOL allTracked = YES;
+        for(UITouch *touch in touches) {
+            if(![LCInterceptedTouches containsObject:touch]) {
+                allTracked = NO;
+                break;
+            }
+        }
+        if(allTracked) {
+            // The whole event belongs to an intercepted sequence: drop it so the guest
+            // never receives it. The table holds touches weakly, so entries evaporate on
+            // their own once UIKit releases the ended touches.
+            return;
+        }
+        // Mixed event (an intercepted sequence plus an unrelated touch): give up on the
+        // interception and deliver everything, a half-swallowed sequence would be worse.
+        [LCInterceptedTouches removeAllObjects];
+    }
+    [self hook_UIApplication_sendEvent:event];
+}
+
 void UIKitFixesInit(void) {
     if (@available(iOS 17.0, *)) {
         Class FBSceneClass = PrivClass(FBScene);
         LCHasRemoteSheetProviderSelector = [FBSceneClass instancesRespondToSelector:@selector(ui_viewServiceComponent)];
         class_addMethod(FBSceneClass, @selector(hook__performUpdateWithoutActivation:), (IMP)hook_FBScene_performUpdateWithoutActivation, "v@:@");
         swizzle(FBSceneClass, @selector(_performUpdateWithoutActivation:), @selector(hook__performUpdateWithoutActivation:));
+    }
+    if (@available(iOS 16.0, *)) {
+        swizzle(UIApplication.class, @selector(sendEvent:), @selector(hook_UIApplication_sendEvent:));
     }
 }
