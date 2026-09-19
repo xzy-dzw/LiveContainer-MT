@@ -148,6 +148,8 @@ class AppInfoProvider {
     private var overlayTouchWindow: UIWindow?
     /// One shield per running side slot, in the same order as `apps`.
     private var overlayShields: [UIView] = []
+    /// One-shot flag so setupOverlayTouchWindow is only called once, lazily on first layout.
+    private var overlayWindowSetup = false
 
     /// The four slots tile into one rectangle, so a single shadow caster behind them lifts the
     /// whole block off the desktop without drawing overlapping shadows inside the shared edges.
@@ -188,10 +190,6 @@ class AppInfoProvider {
         controls.delegate = self
         controls.isHidden = true
         keyWindow?.addSubview(controls)
-
-        // Overlay touch window is set up as early as possible so it is above every other window
-        // from the moment the app launches — it will only show shields when there are side windows.
-        setupOverlayTouchWindow()
 
         setupDockView()
 
@@ -234,13 +232,21 @@ class AppInfoProvider {
     }
 
     private func setupOverlayTouchWindow() {
-        guard let hostWindow = keyWindow else { return }
-        let cls = NSClassFromString("OverlayTouchWindow") as! UIWindow.Type
+        guard !overlayWindowSetup else { return }
+        overlayWindowSetup = true
+        // Lazy on first real window — init() may run before keyWindow exists.
+        guard let hostWindow = keyWindow else { overlayWindowSetup = false; return }
+        // Guard with optional cast: if the ObjC class is missing from the target (e.g. the .m
+        // file was not picked up by the Xcode 16 file sync), degrade gracefully and leave the
+        // overlay disabled instead of force-casting nil and crashing on startup.
+        guard let cls = NSClassFromString("OverlayTouchWindow") as? UIWindow.Type else {
+            overlayWindowSetup = false
+            return
+        }
         let win = cls.init(frame: hostWindow.bounds)
+        // Just show the window — do NOT make it key. A transparent overlay should never steal
+        // key-window status from the real app window (that breaks the responder chain on iOS).
         win.isHidden = false
-        // Show without stealing key-window status from the real app window.
-        win.makeKeyAndVisible()
-        hostWindow.makeKey()
         self.overlayTouchWindow = win
         // Pre-allocate 4 shield subviews (one per possible side slot). They are hidden by
         // default and only show when a side window is active.
@@ -344,7 +350,11 @@ class AppInfoProvider {
             dockHost?.view.alpha = 0
         }
 
-        let update = {
+        let update = { [weak self] in
+            guard let self else { return }
+            // Lazy init the overlay touch window on the first real layout — if the ObjC class
+            // is missing from the target we gracefully degrade and the shields simply won't exist.
+            self.setupOverlayTouchWindow()
             for (index, app) in self.apps.enumerated() {
                 guard let view = app.view else { continue }
                 let fullscreen = self.isFullscreen && index == 0
