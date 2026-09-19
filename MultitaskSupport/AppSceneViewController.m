@@ -435,6 +435,16 @@
     return _hostingController != nil;
 }
 
+- (void)setHostedSceneForeground:(BOOL)foreground {
+    if(!self.presenter || _shouldIgnoreSceneUpdates) { return; }
+    [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+        settings.foreground = foreground;
+        if(foreground) {
+            settings.deactivationReasons = 0;
+        }
+    }];
+}
+
 /// Forces the hosted scene to re-register its touch region by nudging the hosting view's
 /// bounds by a sub-pixel amount on the settled layout. Pure scale changes never trigger the
 /// system's geometry commit, which is what used to leave the main window untouchable after a

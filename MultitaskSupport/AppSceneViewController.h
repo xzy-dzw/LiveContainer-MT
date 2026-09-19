@@ -26,7 +26,7 @@ API_AVAILABLE(ios(16.0))
 @property(nonatomic) NSString* bundleId;
 @property(nonatomic) NSString* dataUUID;
 @property(nonatomic) int pid;
-@property(nonatomic) id<AppSceneViewControllerDelegate> delegate;
+@property(nonatomic, weak) id<AppSceneViewControllerDelegate> delegate;
 @property(nonatomic) BOOL isAppRunning;
 @property(nonatomic) BOOL shouldIgnoreSceneUpdates, shouldSkipDebounceOnce;
 @property(nonatomic) CGFloat scaleRatio;
@@ -45,6 +45,9 @@ API_AVAILABLE(ios(16.0))
 /// A pure transform change between the split stage and fullscreen does not re-register the
 /// system touch region, so this has to run once after the layout animation has completed.
 - (void)commitHostedGeometry;
+/// Set foreground state on the hosted scene. Used to suspend side windows while the app is
+/// backgrounded (so iOS does not kill them for memory pressure) and to wake them back up.
+- (void)setHostedSceneForeground:(BOOL)foreground;
 - (BOOL)usesHostingControllerAPI;
 @end
 

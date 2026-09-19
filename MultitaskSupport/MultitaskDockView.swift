@@ -9,6 +9,7 @@ import Foundation
 import SwiftUI
 import UIKit
 import Combine
+import ObjectiveC.runtime
 
 // MARK: - App Info Provider
 class AppInfoProvider {
@@ -141,6 +142,13 @@ class AppInfoProvider {
     /// Tiny build marker shown on the stage so the exact commit running on device is obvious.
     private let buildLabel = UILabel()
 
+    /// Highest-level invisible window that routes touches for the stage. Side-window touches are
+    /// captured here (because the system-level hosted-view touch delivery bypasses the regular
+    /// UIKit hit-test chain), while the main window's touches are forwarded straight through.
+    private var overlayTouchWindow: UIWindow?
+    /// One shield per running side slot, in the same order as `apps`.
+    private var overlayShields: [UIView] = []
+
     /// The four slots tile into one rectangle, so a single shadow caster behind them lifts the
     /// whole block off the desktop without drawing overlapping shadows inside the shared edges.
     private let blockShadowView = UIView()
@@ -181,12 +189,30 @@ class AppInfoProvider {
         controls.isHidden = true
         keyWindow?.addSubview(controls)
 
+        // Overlay touch window is set up as early as possible so it is above every other window
+        // from the moment the app launches — it will only show shields when there are side windows.
+        setupOverlayTouchWindow()
+
         setupDockView()
 
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(deviceOrientationDidChange),
             name: UIDevice.orientationDidChangeNotification,
+            object: nil
+        )
+        // Memory management while the device is locked: suspend side-window scenes so the
+        // system does not kill them under background memory pressure. Restore on unlock.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
             object: nil
         )
     }
@@ -200,7 +226,62 @@ class AppInfoProvider {
     }
 
     public var keyWindow: UIWindow? {
-        (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.windows.first
+        (UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first(where: { $0.activationState == .foregroundActive }))?.keyWindow
+        ?? (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.keyWindow
+        ?? (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.windows.first
+    }
+
+    private func setupOverlayTouchWindow() {
+        guard let hostWindow = keyWindow else { return }
+        let cls = NSClassFromString("OverlayTouchWindow") as! UIWindow.Type
+        let win = cls.init(frame: hostWindow.bounds)
+        win.isHidden = false
+        // Show without stealing key-window status from the real app window.
+        win.makeKeyAndVisible()
+        hostWindow.makeKey()
+        self.overlayTouchWindow = win
+        // Pre-allocate 4 shield subviews (one per possible side slot). They are hidden by
+        // default and only show when a side window is active.
+        for i in 0..<MultitaskStageLayout.maxWindows {
+            let shield = UIView(frame: .zero)
+            shield.tag = 100 + i
+            shield.backgroundColor = .clear
+            shield.isUserInteractionEnabled = true
+            shield.isHidden = true
+            let tap = UITapGestureRecognizer(target: self, action: NSSelectorFromString("overlayShieldTapped:"))
+            tap.cancelsTouchesInView = true
+            shield.addGestureRecognizer(tap)
+            win.addSubview(shield)
+            overlayShields.append(shield)
+        }
+    }
+
+    @objc private func overlayShieldTapped(_ gesture: UITapGestureRecognizer) {
+        guard let shield = gesture.view else { return }
+        // shield.tag = 100 + index (of the slot it was covering when it became visible). But
+        // indices shift as apps move between slots, so the tag stored when creating is wrong
+        // once promoted. Instead, find the first currently-visible shield and route it to
+        // the side slot that matches its current frame's topmost app.
+        let frame = shield.frame
+        // Find which app view's frame most-closely matches this shield's frame (they are set
+        // identically in performLayout, so compare centres).
+        let targetCentre = CGPoint(x: frame.midX, y: frame.midY)
+        var bestIndex = -1
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for (index, app) in apps.enumerated() {
+            guard let view = app.view else { continue }
+            let centre = CGPoint(x: view.frame.midX, y: view.frame.midY)
+            let d = hypot(centre.x - targetCentre.x, centre.y - targetCentre.y)
+            if d < bestDistance {
+                bestDistance = d
+                bestIndex = index
+            }
+        }
+        if bestIndex > 0 { // only side slots can be promoted from a shield
+            promoteToMain(index: bestIndex)
+        }
     }
 
     private func setupDockView() {
@@ -323,6 +404,23 @@ class AppInfoProvider {
                 width: 160,
                 height: 14
             )
+
+            // Overlay touch window follows the real app window frame and covers the screen.
+            // Its shields mirror the side-window slots: hidden when fullscreen or no side slot,
+            // visible with the exact slot frame so they intercept side-window touches only.
+            self.overlayTouchWindow?.frame = window.bounds
+            let hasSide = !self.isFullscreen && self.apps.count > 1
+            self.overlayTouchWindow?.setValue(hasSide, forKey: "routingEnabled")
+            for i in 0..<self.overlayShields.count {
+                let shield = self.overlayShields[i]
+                let sideFrame = self.apps.count > i + 1 && !self.isFullscreen
+                    ? self.apps[i + 1].view?.frame ?? .zero
+                    : CGRect.zero
+                shield.isHidden = !sideFrame.isEmpty ? false : true
+                if !sideFrame.isEmpty {
+                    shield.frame = sideFrame
+                }
+            }
         }
 
         if animated && UIAccessibility.isReduceMotionEnabled {
@@ -387,6 +485,8 @@ class AppInfoProvider {
         isFullscreen = false
         controls.isHidden = true
         blockShadowView.isHidden = true
+        overlayShields.forEach { $0.isHidden = true }
+        overlayTouchWindow?.setValue(false, forKey: "routingEnabled")
         UIView.animate(withDuration: 0.2, animations: {
             self.windowHostingView.alpha = 0
             self.dockHost?.view.alpha = 0
@@ -401,6 +501,29 @@ class AppInfoProvider {
         })
     }
 
+    // MARK: - Background memory management
+    // Four simultaneously-active hosted scenes put a lot of pressure on iOS memory when the
+    // device is locked. Suspend the side windows' scenes (foreground = NO) while the app is
+    // backgrounded so they don't get killed outright; wake them back up on foreground.
+
+    @objc private func appDidEnterBackground() {
+        for app in apps.dropFirst() { // skip index 0 = main window (still foregrounded by system)
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            _ = vc.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: false)
+        }
+    }
+
+    @objc private func appWillEnterForeground() {
+        for app in apps {
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            _ = vc.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: true)
+        }
+        // Re-layout so the stage and shields are restored to their proper positions.
+        DispatchQueue.main.async {
+            self.relayout(animated: false)
+        }
+    }
+
     // MARK: - Running apps
 
     @objc public func addRunningApp(_ appName: String, appUUID: String, view: UIView?) {
@@ -412,6 +535,8 @@ class AppInfoProvider {
     @objc public func addRunningAppWithInfo(_ appInfo: LCAppInfo?, appUUID: String, view: UIView?) {
         guard isDockEnabled() else { return }
         guard !apps.contains(where: { $0.appUUID == appUUID }) else { return }
+        // Single choke point for the maxWindows guard — every entry path flows through here.
+        guard apps.count < MultitaskStageLayout.maxWindows else { return }
 
         let appName = appInfo?.displayName() ?? "Unknown App"
         let appModel = DockAppModel(appName: appName, appUUID: appUUID, appInfo: appInfo, view: view)
