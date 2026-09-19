@@ -555,7 +555,10 @@ class AppInfoProvider {
     /// window's app from getting the touch. sendEvent, however, is upstream of that channel:
     /// swallowing the touch there means the side app never sees it at all.
     /// Returns true when the location landed in a side slot and the window was promoted.
-    @objc public func interceptTouch(at location: CGPoint, in window: UIWindow) -> Bool {
+    /// The explicit ObjC name keeps the descriptive selector used by UIKitHooks.m — the
+    /// implicit one for (at:in:) would be "interceptTouchAt:in:".
+    @objc(interceptTouchAtLocation:inWindow:)
+    public func interceptTouch(at location: CGPoint, in window: UIWindow) -> Bool {
         guard !isFullscreen, apps.count > 1 else { return false }
         // Only the window that actually hosts the stage can match a side slot; a touch over
         // any other window (alert, sheet, ...) must never promote anything.
