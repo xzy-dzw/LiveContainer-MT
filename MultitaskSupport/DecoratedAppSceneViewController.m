@@ -12,6 +12,9 @@
 @property(nonatomic) int pid;
 @property(nonatomic) bool isAppTerminationRequested;
 @property(nonatomic) UITapGestureRecognizer* promoteGesture;
+/// Sits above the guest while this window is a side window, so the app inside never sees a touch
+/// and the tap that should promote the window is always caught here.
+@property(nonatomic) UIView* tapShield;
 @end
 
 @implementation DecoratedAppSceneViewController
@@ -58,12 +61,19 @@
         [_appSceneVC.view.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
     ]];
 
-    // Tapping a side window promotes it to the main slot. The gesture is disabled on the main
-    // window (and while fullscreen) so the guest app keeps receiving its own touches.
+    // Tapping a side window promotes it to the main slot. The gesture lives on a transparent
+    // shield that is only shown over side windows, so the tap is caught here instead of reaching
+    // the app inside, and the main window stays fully interactive.
+    _tapShield = [[UIView alloc] initWithFrame:container.bounds];
+    _tapShield.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _tapShield.backgroundColor = UIColor.clearColor;
+    _tapShield.hidden = YES;
+    [container addSubview:_tapShield];
+
     _promoteGesture = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapPromoteWindow)];
     _promoteGesture.cancelsTouchesInView = YES;
     _promoteGesture.enabled = NO;
-    [container addGestureRecognizer:_promoteGesture];
+    [_tapShield addGestureRecognizer:_promoteGesture];
 }
 
 - (void)tapPromoteWindow {
@@ -81,11 +91,17 @@
     BOOL maximizedChanged = (_isMaximized != maximized);
     _isMaximized = maximized;
 
-    // Side windows are display only. Switching interaction off on the guest view does two things:
-    // the app inside never reacts to a touch, and UIKit stops handing the touch over to the hosted
-    // scene, so the tap gesture below is the one that actually receives it and promotes the window.
-    self.appSceneVC.view.userInteractionEnabled = isMainWindow;
-
+    // Side windows are display only. Switch interaction off on the whole guest stack (the enclosing
+    // view, the content view and the remote hosting view itself) so the app inside never reacts to
+    // a touch. On top of that, a transparent shield sits above the guest and catches the tap that
+    // should promote the window. The main window, fullscreen included, stays fully interactive.
+    BOOL interact = isMainWindow;
+    self.appSceneVC.view.userInteractionEnabled = interact;
+    self.appSceneVC.contentView.userInteractionEnabled = interact;
+    if(self.appSceneVC.usesHostingControllerAPI) {
+        self.appSceneVC.hostingController.sceneView.userInteractionEnabled = interact;
+    }
+    _tapShield.hidden = interact || maximized;
     // Only a side window in split layout can be promoted by tapping it.
     _promoteGesture.enabled = !maximized && !isMainWindow;
 
@@ -101,14 +117,10 @@
         [self.appSceneVC updateFrameWithSettingsBlock:nil];
     }
 
-    // UIKit picks the touch target from the live view hierarchy, and the hosted scene is only
-    // reachable while its hosting view sits at the final frame. Right after a slot change that
-    // frame can stay stale until the next layout pass, which left the window unable to receive
-    // touches until the host scene was reactivated (going to the home screen and coming back).
-    // Laying the hosting view out here keeps it in sync with the slot it was just moved into.
-    UIView* hostedView = self.appSceneVC.contentView;
-    [hostedView setNeedsLayout];
-    [hostedView layoutIfNeeded];
+    // Going to the home screen and coming back used to be the only way to get touches back after a
+    // slot change, so mirror what that cycle does to the hosted scene: re-activate its presenter,
+    // push the foreground state again and force a geometry commit.
+    [self.appSceneVC refreshHostedSceneInteraction];
 }
 
 - (void)applyScaleRatio {

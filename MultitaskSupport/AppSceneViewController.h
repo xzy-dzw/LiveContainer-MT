@@ -41,6 +41,7 @@ API_AVAILABLE(ios(16.0))
 - (void)terminate;
 - (void)openURLScheme:(NSString *)urlString;
 - (void)handleStatusBarTapAction:(UIAction *)action;
+- (void)refreshHostedSceneInteraction;
 - (BOOL)usesHostingControllerAPI;
 @end
 

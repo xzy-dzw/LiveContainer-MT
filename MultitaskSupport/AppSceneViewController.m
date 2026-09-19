@@ -435,5 +435,31 @@
     return _hostingController != nil;
 }
 
+/// Mirrors what going to the home screen and coming back does to a hosted scene. Without it a
+/// window could stop accepting touches after a fullscreen toggle, and only a trip through the
+/// home screen brought them back.
+- (void)refreshHostedSceneInteraction {
+    if(!self.presenter) {
+        return;
+    }
+    if(!self.presenter.isActive) {
+        [self.presenter activate];
+    }
+    if(self.usesHostingControllerAPI) {
+        // Re-push the foreground state, exactly like returning from the background does. Some apps
+        // stop processing input while the host tells them they are not in the foreground.
+        [self setBackgroundNotificationEnabled:YES];
+    }
+    // UIKit ignores a geometry write that changes nothing, so after an animated slot change the
+    // hosted scene could keep the geometry it had mid-animation. Nudging the scale by an invisible
+    // amount makes UIKit commit the settled value again.
+    if(self.usesHostingControllerAPI && self.contentView) {
+        UIView* hostedView = self.contentView;
+        CGAffineTransform settled = hostedView.transform;
+        hostedView.transform = CGAffineTransformScale(settled, 1.0001, 1.0001);
+        hostedView.transform = settled;
+    }
+}
+
 @end
  
