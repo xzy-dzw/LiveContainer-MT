@@ -41,7 +41,13 @@ API_AVAILABLE(ios(16.0))
 - (void)terminate;
 - (void)openURLScheme:(NSString *)urlString;
 - (void)handleStatusBarTapAction:(UIAction *)action;
-- (void)refreshHostedSceneInteraction;
+/// Only the main window's scene may be foreground. Side windows stay backgrounded so the
+/// system stops routing touches to the app inside them (their last frame stays on screen).
+- (void)setHostedSceneForeground:(BOOL)foreground;
+/// Re-pushes the hosted scene geometry from the hosting view's current (settled) layout.
+/// A pure transform change between the split stage and fullscreen does not re-register the
+/// system touch region, so this has to run once after the layout animation has completed.
+- (void)commitHostedGeometry;
 - (BOOL)usesHostingControllerAPI;
 @end
 

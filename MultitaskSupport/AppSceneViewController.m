@@ -435,30 +435,58 @@
     return _hostingController != nil;
 }
 
-/// Mirrors what going to the home screen and coming back does to a hosted scene. Without it a
-/// window could stop accepting touches after a fullscreen toggle, and only a trip through the
-/// home screen brought them back.
-- (void)refreshHostedSceneInteraction {
-    if(!self.presenter) {
+/// The stage keeps one foreground scene (the main window) and backgrounds the other three.
+/// A backgrounded hosted scene keeps rendering its last frame but the system stops delivering
+/// touches to it, which is what makes a side window display-only. On the iOS 18+ hosting path
+/// updateSettingsWithBlock: only writes the content view bounds, so foreground has to go through
+/// the scene directly, the same way setBackgroundNotificationEnabled: does.
+- (void)setHostedSceneForeground:(BOOL)foreground {
+    if(!self.presenter || _shouldIgnoreSceneUpdates) {
+        return;
+    }
+    if(!self.usesHostingControllerAPI) {
+        if(foreground && !self.presenter.isActive) {
+            [self.presenter activate];
+        }
+    }
+    [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+        settings.foreground = foreground;
+        settings.deactivationReasons = foreground ? 0 : settings.deactivationReasons;
+    }];
+    if(foreground) {
+        // Keep the host notification observers for the foreground window, mirroring the
+        // foreground/background bookkeeping the rest of the file relies on.
+        [self setBackgroundNotificationEnabled:YES];
+    }
+}
+
+/// Runs the system's own hosted-scene geometry pipeline against the hosting view's settled
+/// layout. Toggling fullscreen only changes contentView.transform (the bounds stay identical),
+/// and a pure transform change never re-registers the scene's touch region: the picture lands
+/// in the right place but touches keep going to the old geometry until the scene is deactivated
+/// and activated again (which is what leaving to the home screen and coming back does).
+/// Pushing the geometry explicitly after the animation completes does the same re-registration
+/// without a background/foreground round trip.
+- (void)commitHostedGeometry {
+    if(!self.presenter || !self.usesHostingControllerAPI) {
+        if(!self.presenter.isActive && self.presenter) {
+            [self.presenter activate];
+        }
         return;
     }
     if(!self.presenter.isActive) {
         [self.presenter activate];
     }
-    if(self.usesHostingControllerAPI) {
-        // Re-push the foreground state, exactly like returning from the background does. Some apps
-        // stop processing input while the host tells them they are not in the foreground.
-        [self setBackgroundNotificationEnabled:YES];
-    }
-    // UIKit ignores a geometry write that changes nothing, so after an animated slot change the
-    // hosted scene could keep the geometry it had mid-animation. Nudging the scale by an invisible
-    // amount makes UIKit commit the settled value again.
-    if(self.usesHostingControllerAPI && self.contentView) {
-        UIView* hostedView = self.contentView;
-        CGAffineTransform settled = hostedView.transform;
-        hostedView.transform = CGAffineTransformScale(settled, 1.0001, 1.0001);
-        hostedView.transform = settled;
-    }
+    _UISceneHostingView *sceneView = self.hostingController.sceneView;
+    [self.presenter.scene _performUpdateWithoutActivation:^(UIMutableApplicationSceneSettings *settings, FBSSceneTransitionContext *context) {
+        // Let the hosting view fill the settings with its current frame/scale overrides.
+        [sceneView _applyOverridesToHostedSceneSettings:settings];
+        if(@available(iOS 19.0, *)) {
+            [sceneView applyViewGeometryToSettings:settings];
+        }
+        settings.foreground = YES;
+        settings.deactivationReasons = 0;
+    }];
 }
 
 @end

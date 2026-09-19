@@ -50,6 +50,8 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>3.8.10</string>
+	<key>LCBuildCommit</key>
+	<string>debug</string>
 	<key>GCSupportedGameControllers</key>
 	<array>
 		<dict>

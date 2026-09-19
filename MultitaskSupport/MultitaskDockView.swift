@@ -138,10 +138,20 @@ class AppInfoProvider {
 
     private var dockHost: UIHostingController<AnyView>?
     private let controls = MultitaskStageControlsView(frame: .zero)
+    /// Tiny build marker shown on the stage so the exact commit running on device is obvious.
+    private let buildLabel = UILabel()
 
     /// The four slots tile into one rectangle, so a single shadow caster behind them lifts the
     /// whole block off the desktop without drawing overlapping shadows inside the shared edges.
     private let blockShadowView = UIView()
+
+    /// Whether the stage page (background, windows, controls, dock) is currently on screen.
+    /// The stage is a page of its own, not a permanent overlay: it fades in when the first app
+    /// launches and fades out together with the dock once the last window closes.
+    private var isStagePresented = false
+    /// Re-entry guard while the stage geometry is animating, so quick repeated zoom/promote
+    /// taps cannot stack two geometry animations on top of each other.
+    private var isLayoutAnimating = false
 
     private static let layoutAnimationDuration: TimeInterval = 0.4
 
@@ -202,8 +212,17 @@ class AppInfoProvider {
             host.view.isHidden = true
             self.keyWindow?.addSubview(host.view)
             self.dockHost = host
-            // The dock is built asynchronously, so it can miss the first layout pass. Lay out
-            // right away, with or without windows, so it is never left without a frame.
+
+            // Build marker: shows the stamped commit so the package on device is unmistakable.
+            self.buildLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            self.buildLabel.textColor = .label
+            self.buildLabel.alpha = 0.55
+            self.buildLabel.isHidden = true
+            let commit = Bundle.main.object(forInfoDictionaryKey: "LCBuildCommit") as? String ?? ""
+            self.buildLabel.text = commit.isEmpty ? nil : "build " + commit
+            self.keyWindow?.addSubview(self.buildLabel)
+            // The stage only becomes a page once a window exists, so it starts out hidden.
+            self.windowHostingView.isHidden = true
             self.performLayout(animated: false)
         }
     }
@@ -223,23 +242,26 @@ class AppInfoProvider {
         let count = apps.count
 
         guard count > 0 else {
-            isFullscreen = false
-            controls.isHidden = true
-            blockShadowView.isHidden = true
-            // With no window open the stage is not a page yet, so it steps aside and lets the
-            // launcher show through. The dock is how apps get launched in the first place, so it
-            // stays visible and keeps its place even while no window is open.
-            windowHostingView.isHidden = true
-            if let dockView = dockHost?.view {
-                dockView.isHidden = false
-                dockView.alpha = 1
-                dockView.frame = MultitaskStageLayout.dockFrame(bounds: bounds, safeArea: safeArea)
+            // Last window closed: leave the stage page and go back to the launcher. The dock,
+            // controls and stage background all leave together, so nothing is left floating on
+            // top of LiveContainer's own UI.
+            if isStagePresented {
+                dismissStage()
             }
             return
         }
 
-        // As soon as a window exists the stage becomes its own page with an opaque background.
+        // First window: the stage page enters as a whole on top of the launcher.
+        let entering = !isStagePresented
+        isStagePresented = true
         windowHostingView.isHidden = false
+        dockHost?.view.isHidden = false
+        buildLabel.isHidden = false
+        if entering {
+            windowHostingView.alpha = 0
+            buildLabel.alpha = 0
+            dockHost?.view.alpha = 0
+        }
 
         let update = {
             for (index, app) in self.apps.enumerated() {
@@ -294,34 +316,89 @@ class AppInfoProvider {
                 dockView.alpha = self.isFullscreen ? 0 : 1
                 dockView.frame = MultitaskStageLayout.dockFrame(bounds: bounds, safeArea: safeArea)
             }
+
+            self.buildLabel.frame = CGRect(
+                x: safeArea.left + 10,
+                y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20,
+                width: 160,
+                height: 14
+            )
         }
 
         if animated && UIAccessibility.isReduceMotionEnabled {
+            isLayoutAnimating = true
             UIView.transition(with: windowHostingView, duration: 0.2, options: .transitionCrossDissolve, animations: update)
             UIView.animate(withDuration: 0.2) { self.dockHost?.view.alpha = self.isFullscreen ? 0 : 1 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.settleAfterAnimation()
+            }
         } else if animated {
             let animator = UIViewPropertyAnimator(
                 duration: MultitaskDockManager.layoutAnimationDuration,
                 timingParameters: UISpringTimingParameters(dampingRatio: 1.0)
             )
+            isLayoutAnimating = true
             animator.addAnimations(update)
-            animator.addCompletion { _ in
-                // Re-apply the settled layout once, without animation. UIKit only re-registers a
-                // hosted scene as a touch target when its geometry is committed outside of an
-                // animation, so after an animated fullscreen toggle the windows used to stop
-                // responding until the host scene was reactivated. Running the very same layout
-                // again once the animation has landed is what brings the touches back.
-                self.performLayout(animated: false)
+            animator.addCompletion { [weak self] _ in
+                self?.settleAfterAnimation()
             }
             animator.startAnimation()
         } else {
             update()
         }
 
+        if entering {
+            // Cross-fade the whole page in, independently of the slot layout inside it. Reset
+            // the alphas after `update` ran (it sets the dock's settled alpha) so the fade
+            // always starts from 0.
+            let dockTargetAlpha: CGFloat = isFullscreen ? 0 : 1
+            windowHostingView.alpha = 0
+            buildLabel.alpha = 0
+            dockHost?.view.alpha = 0
+            UIView.animate(withDuration: 0.22, delay: 0, options: .allowUserInteraction) {
+                self.windowHostingView.alpha = 1
+                self.buildLabel.alpha = 0.55
+                self.dockHost?.view.alpha = dockTargetAlpha
+            }
+        }
+
         window.bringSubviewToFront(controls)
         if let dockView = dockHost?.view {
             window.bringSubviewToFront(dockView)
         }
+        window.bringSubviewToFront(buildLabel)
+    }
+
+    /// Runs once when the geometry animation has landed. The settled layout is re-applied without
+    /// animation and the main window's hosted scene geometry is pushed through the system pipeline
+    /// again: a pure transform change (split 0.75 scale vs fullscreen 1.0) does not re-register
+    /// the system touch region by itself, so without this the main window stayed untouchable
+    /// until the scene was reactivated by leaving to the home screen and coming back.
+    private func settleAfterAnimation() {
+        isLayoutAnimating = false
+        performLayout(animated: false)
+        if let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
+            main.appSceneVC.commitHostedGeometry()
+        }
+    }
+
+    private func dismissStage() {
+        isStagePresented = false
+        isFullscreen = false
+        controls.isHidden = true
+        blockShadowView.isHidden = true
+        UIView.animate(withDuration: 0.2, animations: {
+            self.windowHostingView.alpha = 0
+            self.dockHost?.view.alpha = 0
+            self.buildLabel.alpha = 0
+        }, completion: { _ in
+            // A new app may have entered the stage while the fade-out was running; in that case
+            // the entry path already showed everything again, so don't hide it here.
+            guard !self.isStagePresented else { return }
+            self.windowHostingView.isHidden = true
+            self.dockHost?.view.isHidden = true
+            self.buildLabel.isHidden = true
+        })
     }
 
     // MARK: - Running apps
@@ -385,6 +462,7 @@ class AppInfoProvider {
     }
 
     func promoteToMain(index: Int) {
+        guard !isLayoutAnimating else { return }
         guard index >= 0, index < apps.count else { return }
         if index > 0 {
             let app = apps.remove(at: index)
@@ -402,6 +480,7 @@ class AppInfoProvider {
     }
 
     @objc func stageControlsDidTapZoom() {
+        guard !isLayoutAnimating else { return }
         isFullscreen.toggle()
         relayout(animated: true)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
