@@ -17,11 +17,32 @@
 @property(nonatomic) UIView* tapShield;
 @end
 
+/// The remote hosting view behind this window delivers touches through a system-level channel,
+/// so neither stacking a transparent UIView on top nor flipping userInteractionEnabled actually
+/// prevents it from receiving taps. The only reliable way to route a side-window touch to the
+/// shield instead of the guest is to override hitTest: on the container itself and return the
+/// shield whenever it is visible.
+@interface DecoratedStageContainerView : UIView
+@property(nonatomic, weak) UIView* tapShield;
+@end
+
+@implementation DecoratedStageContainerView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if(self.tapShield && !self.tapShield.hidden) {
+        UIView* hit = [super hitTest:point withEvent:event];
+        // Any touch inside this container while the shield is active must go to the shield,
+        // never to the hosted remote view beneath it.
+        return hit ? self.tapShield : nil;
+    }
+    return [super hitTest:point withEvent:event];
+}
+@end
+
 @implementation DecoratedAppSceneViewController
 
 - (instancetype)initWindowName:(NSString*)windowName bundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID rootVC:(UIViewController*)rootVC {
     self = [super initWithNibName:nil bundle:nil];
-    self.view = [[UIView alloc] initWithFrame:CGRectZero];
+    self.view = [[DecoratedStageContainerView alloc] initWithFrame:CGRectZero];
     [MultitaskDockManager.shared.windowHostingView addSubview:self.view];
 
     _dataUUID = dataUUID;
@@ -80,6 +101,10 @@
     _promoteGesture.cancelsTouchesInView = YES;
     _promoteGesture.enabled = NO;
     [_tapShield addGestureRecognizer:_promoteGesture];
+
+    // Hand the shield to the container's hitTest override so a side-window touch is forced to
+    // the shield regardless of what the system-level remote view would otherwise deliver.
+    ((DecoratedStageContainerView*)container).tapShield = _tapShield;
 }
 
 - (void)tapPromoteWindow {

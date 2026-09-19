@@ -417,11 +417,14 @@ class AppInfoProvider {
         let appModel = DockAppModel(appName: appName, appUUID: appUUID, appInfo: appInfo, view: view)
 
         DispatchQueue.main.async {
-            self.apps.append(appModel)
-            // This manager is the single owner of the fullscreen state. On the very first window
-            // the "launch maximized" setting decides whether it starts fullscreen or in the split
-            // stage; default (off) is always split first.
-            if self.apps.count == 1, UserDefaults.standard.bool(forKey: "LCLaunchMultitaskMaximized") {
+            // New apps always enter the main slot (head of the array); any previous main window
+            // slides down to a side slot. This matches the "open on the main slot" behaviour
+            // users expect from a dock, instead of every new app landing as a side card.
+            let first = self.apps.isEmpty
+            self.apps.insert(appModel, at: 0)
+            // When it is the very first window, honour the "launch maximized" user preference.
+            // Otherwise a fresh open always starts split, so the user sees all four cards.
+            if first, UserDefaults.standard.bool(forKey: "LCLaunchMultitaskMaximized") {
                 self.isFullscreen = true
             }
             self.relayout(animated: false)

@@ -435,33 +435,19 @@
     return _hostingController != nil;
 }
 
-/// Runs the system's own hosted-scene geometry pipeline against the hosting view's settled
-/// layout. Toggling fullscreen only changes contentView.transform (the bounds stay identical),
-/// and a pure transform change never re-registers the scene's touch region: the picture lands
-/// in the right place but touches keep going to the old geometry until the scene is deactivated
-/// and activated again (which is what leaving to the home screen and coming back does).
-/// Pushing the geometry explicitly after the animation completes does the same re-registration
-/// without a background/foreground round trip.
+/// Mirrors the "home and back" cycle that used to be the only way to restore touches after a
+/// fullscreen toggle: deactivate the presenter so the system tears down the scene's old touch
+/// region, then re-activate it on the next runloop so the region is registered against the
+/// settled geometry. Safer than poking at private geometry methods that differ per iOS version.
 - (void)commitHostedGeometry {
-    if(!self.presenter || !self.usesHostingControllerAPI) {
-        if(!self.presenter.isActive && self.presenter) {
-            [self.presenter activate];
-        }
-        return;
+    if(!self.presenter) { return; }
+    if(self.presenter.isActive) {
+        [self.presenter deactivate];
     }
-    if(!self.presenter.isActive) {
+    dispatch_async(dispatch_get_main_queue(), ^{
         [self.presenter activate];
-    }
-    _UISceneHostingView *sceneView = self.hostingController.sceneView;
-    [self.presenter.scene _performUpdateWithoutActivation:^(UIMutableApplicationSceneSettings *settings, FBSSceneTransitionContext *context) {
-        // Let the hosting view fill the settings with its current frame/scale overrides.
-        [sceneView _applyOverridesToHostedSceneSettings:settings];
-        if(@available(iOS 19.0, *)) {
-            [sceneView applyViewGeometryToSettings:settings];
-        }
-        settings.foreground = YES;
-        settings.deactivationReasons = 0;
-    }];
+        [self setBackgroundNotificationEnabled:YES];
+    });
 }
 
 @end
