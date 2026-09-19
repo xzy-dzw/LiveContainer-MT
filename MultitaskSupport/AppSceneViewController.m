@@ -435,31 +435,6 @@
     return _hostingController != nil;
 }
 
-/// The stage keeps one foreground scene (the main window) and backgrounds the other three.
-/// A backgrounded hosted scene keeps rendering its last frame but the system stops delivering
-/// touches to it, which is what makes a side window display-only. On the iOS 18+ hosting path
-/// updateSettingsWithBlock: only writes the content view bounds, so foreground has to go through
-/// the scene directly, the same way setBackgroundNotificationEnabled: does.
-- (void)setHostedSceneForeground:(BOOL)foreground {
-    if(!self.presenter || _shouldIgnoreSceneUpdates) {
-        return;
-    }
-    if(!self.usesHostingControllerAPI) {
-        if(foreground && !self.presenter.isActive) {
-            [self.presenter activate];
-        }
-    }
-    [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
-        settings.foreground = foreground;
-        settings.deactivationReasons = foreground ? 0 : settings.deactivationReasons;
-    }];
-    if(foreground) {
-        // Keep the host notification observers for the foreground window, mirroring the
-        // foreground/background bookkeeping the rest of the file relies on.
-        [self setBackgroundNotificationEnabled:YES];
-    }
-}
-
 /// Runs the system's own hosted-scene geometry pipeline against the hosting view's settled
 /// layout. Toggling fullscreen only changes contentView.transform (the bounds stay identical),
 /// and a pure transform change never re-registers the scene's touch region: the picture lands

@@ -11,7 +11,6 @@
 @property(nonatomic) NSString* dataUUID;
 @property(nonatomic) int pid;
 @property(nonatomic) bool isAppTerminationRequested;
-@property(nonatomic) bool isMainWindow;
 @property(nonatomic) UITapGestureRecognizer* promoteGesture;
 /// Sits above the guest while this window is a side window, so the app inside never sees a touch
 /// and the tap that should promote the window is always caught here.
@@ -97,20 +96,18 @@
     // block when it actually flips, because split slots and fullscreen use different safe areas.
     BOOL maximizedChanged = (_isMaximized != maximized);
     _isMaximized = maximized;
-    _isMainWindow = isMainWindow;
 
-    // Side windows are display only. The real block is the hosted scene's foreground state:
-    // only the main window's scene is foreground, so the system routes touches to that app
-    // alone. The side scenes stay backgrounded (last frame stays visible, no touch delivery),
-    // and the transparent shield above them catches the tap that promotes the window.
-    // Switching the view chain off as well is just a belt-and-braces backstop.
+    // Side windows are display only, but the apps inside them stay fully foreground and live
+    // (rendering, animation, audio keep running). Touches are blocked at the view layer only:
+    // the transparent tap shield sits above the guest and wins hit testing, with the interaction
+    // switch below as a backstop. Never background the side scenes here: a backgrounded hosted
+    // scene freezes on its last frame, which defeats the live-preview purpose of the stage.
     BOOL interact = isMainWindow;
     self.appSceneVC.view.userInteractionEnabled = interact;
     self.appSceneVC.contentView.userInteractionEnabled = interact;
     if(self.appSceneVC.usesHostingControllerAPI) {
         self.appSceneVC.hostingController.sceneView.userInteractionEnabled = interact;
     }
-    [self.appSceneVC setHostedSceneForeground:interact];
     _tapShield.hidden = interact || maximized;
     // Only a side window in split layout can be promoted by tapping it.
     _promoteGesture.enabled = !maximized && !isMainWindow;
@@ -233,11 +230,8 @@
         settings.userInterfaceStyle = baseSettings.userInterfaceStyle;
         settings.interfaceOrientation = baseSettings.interfaceOrientation;
         settings.deviceOrientation = baseSettings.deviceOrientation;
-        // Only the main window's scene is ever foreground; side scenes are display only.
-        settings.foreground = self.isMainWindow;
-        if(self.isMainWindow) {
-            settings.deactivationReasons = 0;
-        }
+        // Every window's scene stays foreground so all four apps keep rendering live.
+        settings.foreground = YES;
 
         if(self.isMaximized) {
             // Fullscreen shows the guest exactly like the original app does, safe area included.
