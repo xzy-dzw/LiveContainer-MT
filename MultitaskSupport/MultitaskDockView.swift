@@ -596,14 +596,15 @@ class AppInfoProvider {
                 // Step A: move scene frame to off-screen, push NO.
                 // SwiftUI's View.frame() collides with UIMutableApplicationSceneSettings.frame
                 // so badly that even an explicit Optional type annotation cannot convince the
-                // compiler to pick the ObjC property — it still resolves 'frame' to a method on
-                // Optional's SwiftUI conditional conformance. The only way to win is to drop
-                // into ObjC runtime: cast to AnyObject and send the setter as an ObjC message.
-                // All other settings properties (peripheryInsets, safeAreaInsetsPortrait,
-                // foreground) have no SwiftUI twin so they stay on the Swift-typed object.
+                // compiler to pick the ObjC property — it still resolves 'frame' on Optional to
+                // SwiftUI's View.frame() conditional-conformance method. Casting to AnyObject
+                // routes through ObjC runtime but Swift only knows NSObject.frame as read-only.
+                // KVC setValue(_:forKey:) is the final escape hatch — it invokes the ObjC setter
+                // via objc_msgSend('setFrame:', offscreenFrame) at runtime, bypassing all
+                // compile-time type checks.
                 vc.appSceneVC.updateSettingsWithBlock { (settings: UIMutableApplicationSceneSettings?) in
                     guard let settings else { return }
-                    (settings as AnyObject).frame = offscreenFrame
+                    (settings as AnyObject).setValue(NSValue(cgRect: offscreenFrame), forKey: "frame")
                     settings.peripheryInsets = .zero
                     settings.safeAreaInsetsPortrait = .zero
                     settings.foreground = false
