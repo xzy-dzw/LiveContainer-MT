@@ -170,13 +170,15 @@ class AppInfoProvider {
     /// The generation that settleAfterAnimation observed last time it ran. Used to detect
     /// double-fires from overlapping animators (beginFromCurrentState + a second arm).
     private var lastSettledGeneration: UInt = 0
-    /// Snapshot cover that hides the touch-region re-registration blip at settle.
+    /// Snapshot cover that hides the touch-region blips while a commit runs.
     private var geometryCommitCover: UIView?
-    /// True once we've kicked off a C2 offscreen re-registration for the side windows in the
-    /// current settleAfterAnimation. Used to guard against double-blips when pendingGeometry
-    /// gets re-armed mid-settle (the generation counter handles this too, but the flag catches
-    /// the case where a single settle tries to flip side-window foreground twice).
-    private var sideWindowRegistrationInFlight = false
+    /// Number of touch-region commits currently running. The cover lives while this is above
+    /// zero, so two commits in quick succession (a window restored right after another) share one
+    /// snapshot instead of re-capturing a stage that still has a window parked off-screen.
+    private var pendingTouchRegionCommits: Int = 0
+    /// Cover that is still fading out. Removed before the next snapshot, otherwise the snapshot
+    /// would bake the half-faded image into it and leave the stage looking dimmed.
+    private weak var fadingCommitCover: UIView?
 
     private static let layoutAnimationDuration: TimeInterval = 0.4
 
@@ -386,6 +388,11 @@ class AppInfoProvider {
                 }
             }
             self.windowHostingView.sendSubviewToBack(self.blockShadowView)
+            // A relayout during a touch-region commit must not push the windows above the commit
+            // cover, or the blip phase would show through.
+            if let cover = self.geometryCommitCover {
+                self.windowHostingView.bringSubviewToFront(cover)
+            }
 
             self.blockShadowView.frame = MultitaskStageLayout.blockFrame(bounds: bounds, safeArea: safeArea)
             self.blockShadowView.isHidden = self.isFullscreen
@@ -469,24 +476,9 @@ class AppInfoProvider {
         pendingGeometryGeneration += 1
     }
 
-    /// Runs once when the geometry animation has landed. The settled layout is re-applied without
-    /// animation, then every window gets its system touch region pushed to the right spot:
-    ///
-    ///   - Main window → re-registered at its on-screen slot (so it stays interactive).
-    ///   - Side windows → re-registered at an off-screen CGRect. The window content still
-    ///     renders live in its side slot (the view frame is real), but the system touch region
-    ///     lives at {x = screenWidth + 100} so taps land nowhere in the visible stage and
-    ///     cascade down to the host process' normal hit-test chain where they are intercepted.
-    ///
-    /// This is Plan C2 — "register offscreen, display onscreen" — and it is the only known way
-    /// to satisfy "4 windows all live + side windows tappable without touching the app inside"
-    /// on iOS hosted scenes, since the system routes touches through a BackBoard region table
-    /// that bypasses UIKit hit-testing entirely.
-    ///
-    /// C2 depends on a single fragile assumption: the region table is only recomputed on
-    /// foreground transition, never on frame changes alone. If a future iOS changes this, the
-    /// whole mechanism silently stops working. We guard against that by centralising it here —
-    /// a fallback to Plan B (side windows backgrounded) is a one-line flip.
+    /// Runs once when the geometry animation has landed: the settled layout is re-applied without
+    /// animation and every window whose system touch region is stale gets it pushed to the right
+    /// spot. See runTouchRegionCommit(forceMainBlip:) for the mechanics.
     private func settleAfterAnimation() {
         isLayoutAnimating = false
         performLayout(animated: false)
@@ -502,107 +494,101 @@ class AppInfoProvider {
 
         lastSettledFullscreen = isFullscreen
         lastSettledMainUUID = apps.first?.appUUID
-        sideWindowRegistrationInFlight = true
 
-        // Cover the main window for the main-slot blip (snapshot swap, same as before).
-        coverMainWindowForGeometryCommit()
-        guard let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController else { return }
-
-        // Step 1: main window. Move its touch region to its actual on-screen frame, blip NO→YES.
-        main.appSceneVC.prepareHostedGeometryCommit()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            guard let self = self else { return }
-            self.runMainWindowBlipCompletion(mainVC: main)
-            // Step 2: side windows. AFTER the main blip finishes (so snapshots don't collide),
-            // blip each side window's scene with its container moved off-screen for the duration
-            // of the foreground transition. The window renders live at its slot frame; only the
-            // system touch region moves.
-            self.runSideWindowOffscreenRegistrations()
-        }
+        // The main window changed (fullscreen toggle, promotion, refill after a close), so its
+        // touch region has to be re-registered at its new on-screen slot; every window that just
+        // slid from the main slot into a side slot has to be re-registered off-screen.
+        runTouchRegionCommit(forceMainBlip: true)
     }
 
-    /// Main window half of settleAfterAnimation — finish the blip, reveal the cover with fade.
-    private func runMainWindowBlipCompletion(mainVC: DecoratedAppSceneViewController) {
-        mainVC.appSceneVC.finishHostedGeometryCommit()
-        guard let cover = geometryCommitCover else { return }
-        geometryCommitCover = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-            UIView.animate(withDuration: 0.15, animations: { cover.alpha = 0 }) { _ in
-                cover.removeFromSuperview()
+    /// Re-registers the system touch regions of every window whose registration is stale, all
+    /// under one snapshot cover so the foreground blips underneath never show:
+    ///
+    ///   - Main window → blipped when its geometry changed (forceMainBlip) or when its region is
+    ///     still parked off-screen (it used to be a side window). Its transition samples the
+    ///     on-screen slot, which is what keeps the window interactive.
+    ///   - Side windows → always off-screen: the window is parked outside the display for the
+    ///     duration of its transition and then put back, so the live render returns to the slot
+    ///     while the cached region stays off-screen. Taps then fall through to the host process,
+    ///     where the sendEvent hook promotes the window instead of the app inside seeing them.
+    ///
+    /// Windows whose registration already matches their role are skipped entirely, so a plain
+    /// promotion never re-blinks the untouched side windows.
+    private func runTouchRegionCommit(forceMainBlip: Bool) {
+        var mainVC: DecoratedAppSceneViewController?
+        if let vc = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController,
+           forceMainBlip || vc.appSceneVC.touchRegionOffscreen {
+            mainVC = vc
+        }
+        let sideVCs: [DecoratedAppSceneViewController] = {
+            var result: [DecoratedAppSceneViewController] = []
+            for app in apps.dropFirst() {
+                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController,
+                      !vc.appSceneVC.touchRegionOffscreen else { continue }
+                result.append(vc)
             }
-        }
-    }
-
-    /// For every side window (index > 0), re-register its system touch region at an off-screen
-    /// location. The view itself stays at its slot frame (live render keeps running), but the
-    /// system touch region moves to {screenWidth + 100} so taps land nowhere in the visible
-    /// stage and cascade into the host process where the sendEvent hook can intercept them.
-    ///
-    /// How (in AppSceneViewController.registerSceneTouchRegionAtFrame:visibleSlotFrame:):
-    ///   1. push scene frame to off-screen + foreground NO   → touch region registers here
-    ///   2. wait 50ms hard timeout (prevents stuck NO if system is slow)
-    ///   3. foreground YES + push visible slot frame         → scene renders back where it should
-    ///
-    /// The visible slot frame MUST be supplied here — we push it explicitly after YES instead of
-    /// relaying on view.frame being up-to-date at that moment. On the initial non-animated
-    /// relayout path, view.frame IS up-to-date (performLayout synchronously called applyStageFrame),
-    /// but calling register with it on YES guarantees the scene renders into the right spot
-    /// regardless of timing. This is what stopped the "zoom → shrink → side windows turn black"
-    /// regression — YES restores the scene's render target, not just its foreground state.
-    private func runSideWindowOffscreenRegistrations() {
-        // Only the real side windows (index 1+). Skip the main window — its touch region is
-        // already correct after the main blip just above. Also skip fullscreen: there are no
-        // side slots when the main window owns the whole screen.
-        guard !isFullscreen, apps.count > 1 else {
-            sideWindowRegistrationInFlight = false
+            return result
+        }()
+        guard mainVC != nil || !sideVCs.isEmpty else {
+            // Nothing is stale — no cover, no blip, nothing to wait for.
             return
         }
 
-        // Compute the per-window slot frames up-front so they can be passed into each C2 call.
-        // We compute them from MultitaskStageLayout directly — performLayout already ran with
-        // the settled `apps` array, so the frames match what's visible on screen.
-        let windowBounds = keyWindow?.bounds ?? UIScreen.main.bounds
-        let safeArea = keyWindow?.safeAreaInsets ?? UIEdgeInsets.zero
-        let count = apps.count
+        let group = DispatchGroup()
+        coverStageForTouchCommit()
 
-        // A CGRect guaranteed to be outside both x and y of the stage — we put the touch region
-        // here so taps land nowhere in the visible stage and fall through to the host process.
-        let screenBounds = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds ?? UIScreen.main.bounds
-        let offscreenFrame = CGRect(x: screenBounds.width + 100, y: 0, width: 0, height: 0)
-
-        // Serialise blips — one per side window, each ~50ms. With at most 3 side windows this
-        // takes ~150ms total, well below the 1s heartbeat timeout.
-        var delay: TimeInterval = 0
-        for i in 1..<count {
-            let app = apps[i]
-            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-            let visibleSlotFrame = MultitaskStageLayout.slotFrame(i, bounds: windowBounds, safeArea: safeArea)
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                // ObjC selector registerSceneTouchRegionAtFrame:visibleSlotFrame: bridges into
-                // Swift as registerSceneTouchRegion(atFrame:visibleSlotFrame:) — note the
-                // SwiftUI-collision workaround (no 'frame' in the Swift signature).
-                vc.appSceneVC.registerSceneTouchRegion(atFrame: offscreenFrame, visibleSlotFrame: visibleSlotFrame)
+        if let mainVC {
+            // Prepare immediately: the foreground-off half is masked by the cover, and the
+            // foreground-on half lands on the window's settled slot geometry.
+            mainVC.appSceneVC.prepareHostedGeometryCommit()
+            group.enter()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                mainVC.appSceneVC.finishHostedGeometryCommit()
+                group.leave()
             }
-            delay += 0.08
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.15) { [weak self] in
-            self?.sideWindowRegistrationInFlight = false
+        // Side windows blip in parallel — independent scenes, so serialising them would only
+        // stretch the cover for no reason.
+        for vc in sideVCs {
+            group.enter()
+            vc.appSceneVC.registerTouchRegionOffscreen {
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            self?.revealStageCover()
         }
     }
 
-    /// Snapshots the main window's current content and pins the snapshot above the live scene, so
-    /// the foreground blip underneath is never visible. A failed capture yields a transparent
-    /// view, which degrades gracefully to the uncovered behaviour.
-    private func coverMainWindowForGeometryCommit() {
-        geometryCommitCover?.removeFromSuperview()
-        geometryCommitCover = nil
-        guard let container = apps.first?.view,
-              let cover = container.snapshotView(afterScreenUpdates: false) else { return }
-        cover.frame = container.bounds
+    /// Snapshots the whole stage and pins the snapshot above every window, so the blip phase
+    /// (frozen guest content, side windows parked off-screen) is never visible. A failed capture
+    /// yields a transparent view, which degrades gracefully to the uncovered behaviour.
+    private func coverStageForTouchCommit() {
+        pendingTouchRegionCommits += 1
+        // Drop a cover that is still fading out, so the new snapshot is taken from the real stage.
+        fadingCommitCover?.removeFromSuperview()
+        fadingCommitCover = nil
+        // A commit already running owns the cover: keep its (pre-blip) snapshot instead of
+        // capturing a stage whose parked windows would show up as holes.
+        guard geometryCommitCover == nil else { return }
+        guard let cover = windowHostingView.snapshotView(afterScreenUpdates: false) else { return }
+        cover.frame = windowHostingView.bounds
         cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        container.addSubview(cover)
+        cover.isUserInteractionEnabled = false
+        windowHostingView.addSubview(cover)
         geometryCommitCover = cover
+    }
+
+    private func revealStageCover() {
+        pendingTouchRegionCommits = max(0, pendingTouchRegionCommits - 1)
+        guard pendingTouchRegionCommits == 0, let cover = geometryCommitCover else { return }
+        geometryCommitCover = nil
+        fadingCommitCover = cover
+        UIView.animate(withDuration: 0.18, animations: { cover.alpha = 0 }) { _ in
+            cover.removeFromSuperview()
+        }
     }
 
     private func dismissStage() {
@@ -637,10 +623,18 @@ class AppInfoProvider {
     }
 
     @objc private func appWillEnterForeground() {
-        for app in apps {
-            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-            _ = vc.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: true)
+        // Waking the side scenes back up (foreground = YES) is itself a touch-region transition,
+        // and it would land their regions back on-screen. The main window can take that flip
+        // directly — its slot is exactly where its region belongs — while every side window is
+        // marked stale and re-registered off-screen by the commit below.
+        if let mainVC = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
+            _ = mainVC.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: true)
         }
+        for app in apps.dropFirst() {
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            vc.appSceneVC.invalidateTouchRegionRegistration()
+        }
+        runTouchRegionCommit(forceMainBlip: false)
         // Re-layout so the stage and shields are restored to their proper positions.
         DispatchQueue.main.async {
             self.relayout(animated: false)
@@ -675,24 +669,21 @@ class AppInfoProvider {
             if first, UserDefaults.standard.bool(forKey: "LCLaunchMultitaskMaximized") {
                 self.isFullscreen = true
             }
-            // applyStageFrame pushes all view frames synchronously before this returns, so by the
-            // time we enter the next main queue frame every side window is already sitting at its
-            // correct visible slot — perfect timing for C2 offscreen touch-region registration.
+            // applyStageFrame pushes all view frames synchronously, so by the time this relayout
+            // has landed every window already sits at its final slot.
             self.relayout(animated: false)
-            if self.apps.count >= 2 && !self.isFullscreen {
-                // After a non-animated relayout (addRunningApp path above, or initial dock setup),
-                // the settleAfterAnimation completion never fires — so C2 offscreen registration
-                // never runs. Result: side window touch regions stay at their visible slots,
-                // taps fall straight into the guest app's UIKit chain (touch penetration). Fix:
-                // run side-window C2 registration here, one frame after relayout, so every side
-                // window is immediately pulled off-screen for touch while keeping live content.
-                //
-                // We do NOT touch pendingGeometryGeneration — settleAfterAnimation's generation
-                // guard is irrelevant here (no animation completion to race against), and we
-                // re-use runSideWindowOffscreenRegistrations which checks isFullscreen first.
-                DispatchQueue.main.async { [weak self] in
-                    self?.runSideWindowOffscreenRegistrations()
-                }
+            // The non-animated path never reaches settleAfterAnimation, so the commit bookkeeping
+            // happens here (keeping the arm state in sync so a later animated relayout does not
+            // re-blink for a change that already settled) and the touch regions are committed on
+            // the next runloop tick, after performLayout applied the new frames. The window that
+            // just slid from the main slot into a side slot must be parked off-screen right away,
+            // otherwise taps on it keep reaching the app inside. The main window is blipped too:
+            // its scene started before the stage laid it out, so its region still reflects the
+            // pre-layout geometry, and the blip is what pins it to the slot the user can touch.
+            self.lastSettledFullscreen = self.isFullscreen
+            self.lastSettledMainUUID = self.apps.first?.appUUID
+            DispatchQueue.main.async { [weak self] in
+                self?.runTouchRegionCommit(forceMainBlip: true)
             }
         }
     }
