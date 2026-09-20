@@ -16,8 +16,13 @@ import UIKit
     /// Main window plus three side windows.
     @objc static let maxWindows = 4
 
-    /// Blank strip above the window block that hosts the macOS style control dots.
-    static let controlsHeight: CGFloat = 30
+    /// Blank strip above the window block that hosts the main window's control. Tall enough for
+    /// the HIG minimum hit target (44pt), so the control never has to overlap a window.
+    static let controlsHeight: CGFloat = 44
+    /// Hit target of the window control, and the side of the glass circle it draws.
+    static let controlSize: CGFloat = 44
+    /// Keeps the control off the very edge of the screen, aligned with the main window's edge.
+    static let controlLeadingInset: CGFloat = 12
     /// Bottom dock, sized like the iOS dock.
     static let dockHeight: CGFloat = 90
     static let dockSideInset: CGFloat = 10
@@ -78,14 +83,16 @@ import UIKit
         return (index <= 0 ? g.unit * 3 : g.unit) / bounds.width
     }
 
-    /// Control dots sit in the blank strip right above the main window, left aligned.
+    /// The main window's control lives in the blank strip right above the window, aligned with
+    /// its leading edge. It is the control's own frame, not the strip: the control is a single
+    /// object that only moves, so it can never cross-fade or jump between two shapes.
     @objc static func controlsFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
         let g = geometry(bounds, safeArea)
         return CGRect(
-            x: g.origin.x,
-            y: safeArea.top,
-            width: g.unit * 3,
-            height: controlsHeight
+            x: g.origin.x + controlLeadingInset,
+            y: safeArea.top + (controlsHeight - controlSize) / 2,
+            width: controlSize,
+            height: controlSize
         )
     }
 
@@ -101,9 +108,11 @@ import UIKit
         )
     }
 
-    /// Floating capsule shown while the main window is fullscreen.
+    /// The same control, floating over the top leading corner while the main window is
+    /// fullscreen. The two positions are one short move apart, so the control travels with the
+    /// window instead of being replaced by a different looking one.
     @objc static func fullscreenControlsFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
-        return CGRect(x: safeArea.left + 6, y: safeArea.top + 4, width: 88, height: 34)
+        return CGRect(x: safeArea.left + 6, y: safeArea.top + 6, width: controlSize, height: controlSize)
     }
 
     @objc static func dockFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
@@ -145,162 +154,144 @@ import UIKit
     func stageControlsDidTapZoom()
 }
 
-/// macOS style traffic lights for the main window. They are never placed inside a window:
-/// in split layout they sit in the blank strip above the main window, and while the main
-/// window is fullscreen they collapse into a small floating capsule that only shrinks.
+/// The main window's window control: one neutral glass button that opens the window menu.
+///
+/// macOS puts three colored dots inside a window's title bar. On a phone that reads wrong — the
+/// dots are small, they color the stage chrome in someone else's accent color, and a title bar
+/// would steal a whole strip of the guest app's screen. So the stage keeps one HIG sized (44pt)
+/// control with a single `ellipsis` glyph, and it never lives inside a window: in split layout it
+/// sits in the blank strip above the main window's leading edge, and while the main window is
+/// fullscreen the very same control floats over the top leading corner of the screen. Both
+/// positions are one short move apart, so the control travels with the window and the hand never
+/// has to re-learn where it is.
 @objc class MultitaskStageControlsView: UIView {
     @objc weak var delegate: MultitaskStageControlsDelegate?
 
+    /// The control is one object in both modes; only the menu's first item changes.
     @objc var isFullscreen: Bool = false {
         didSet {
             guard isFullscreen != oldValue else { return }
-            applyMode()
-            setNeedsLayout()
+            rebuildMenu()
         }
     }
 
-    private let closeButton = UIButton(type: .custom)
-    private let zoomButton = UIButton(type: .custom)
-    private let closeDot = UIView()
-    private let zoomDot = UIView()
-    private let capsuleButton = UIButton(type: .custom)
-    private let capsuleBackground = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterialDark))
-    private let capsuleDot = UIView()
-    private let capsuleIcon = UIImageView()
+    /// The visible glass circle stays smaller than the hit target, so the control reads as a
+    /// light piece of chrome instead of a heavy disc.
+    private static let circleSize: CGFloat = 34
 
-    /// The visible dot stays small and macOS like, but the tappable area around it is much
-    /// larger so the controls are easy to hit on a phone.
-    private let dotSize: CGFloat = 18
-    private let hitSpacing: CGFloat = 2
-    /// Keeps the traffic lights off the very edge of the main window, like macOS does.
-    private let dotLeftInset: CGFloat = 8
-    private let capsuleSize = CGSize(width: 88, height: 34)
-    private let capsuleDotSize: CGFloat = 12
-
-    private static let closeColor = UIColor(red: 1.00, green: 0.37, blue: 0.34, alpha: 1.00)
-    private static let zoomColor = UIColor(red: 0.16, green: 0.78, blue: 0.25, alpha: 1.00)
+    private let button = UIButton(type: .custom)
+    private let glassBackground = UIVisualEffectView(effect: nil)
+    private let icon = UIImageView()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .clear
-        setupTrafficLight(closeButton, dot: closeDot, color: MultitaskStageControlsView.closeColor, action: #selector(tapClose))
-        setupTrafficLight(zoomButton, dot: zoomDot, color: MultitaskStageControlsView.zoomColor, action: #selector(tapZoom))
-        setupCapsule()
-        applyMode()
+        setupButton()
+        rebuildMenu()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    /// Builds a transparent tap target with a smaller colored dot centered inside it.
-    private func setupTrafficLight(_ button: UIButton, dot: UIView, color: UIColor, action: Selector) {
-        button.backgroundColor = .clear
-        button.addTarget(self, action: action, for: .touchUpInside)
-        addSubview(button)
-
-        dot.backgroundColor = color
-        dot.layer.cornerRadius = dotSize / 2
-        dot.layer.borderWidth = MultitaskStageLayout.hairline
-        dot.layer.borderColor = UIColor.black.withAlphaComponent(0.12).cgColor
-        dot.isUserInteractionEnabled = false
-        button.addSubview(dot)
-    }
-
-    private func setupCapsule() {
-        capsuleBackground.layer.cornerRadius = capsuleSize.height / 2
-        capsuleBackground.layer.cornerCurve = .continuous
-        capsuleBackground.clipsToBounds = true
-        capsuleBackground.isUserInteractionEnabled = false
+    private func setupButton() {
+        // Neutral material: the control belongs to the stage chrome, not to the guest app, so it
+        // must not borrow the app's accent color or compete with its content.
         if UIAccessibility.isReduceTransparencyEnabled {
-            capsuleBackground.effect = nil
-            capsuleBackground.backgroundColor = UIColor.black.withAlphaComponent(0.6)
+            glassBackground.effect = nil
+            glassBackground.backgroundColor = UIColor.secondarySystemFill
+        } else {
+            glassBackground.effect = UIBlurEffect(style: .systemUltraThinMaterial)
         }
-        addSubview(capsuleBackground)
+        glassBackground.isUserInteractionEnabled = false
+        glassBackground.clipsToBounds = true
+        glassBackground.layer.cornerCurve = .continuous
+        glassBackground.layer.borderWidth = MultitaskStageLayout.hairline
+        glassBackground.layer.borderColor = UIColor.label.withAlphaComponent(0.12).cgColor
+        button.addSubview(glassBackground)
 
-        capsuleDot.backgroundColor = MultitaskStageControlsView.zoomColor
-        capsuleDot.layer.cornerRadius = capsuleDotSize / 2
-        capsuleBackground.contentView.addSubview(capsuleDot)
-
-        capsuleIcon.image = UIImage(
-            systemName: "arrow.down.right.and.arrow.up.left",
-            withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        icon.image = UIImage(
+            systemName: "ellipsis",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
         )
-        capsuleIcon.tintColor = .white
-        capsuleIcon.contentMode = .scaleAspectFit
-        capsuleBackground.contentView.addSubview(capsuleIcon)
+        icon.tintColor = .label
+        icon.contentMode = .center
+        icon.isUserInteractionEnabled = false
+        button.addSubview(icon)
 
-        capsuleButton.layer.cornerRadius = capsuleSize.height / 2
-        capsuleButton.addTarget(self, action: #selector(tapZoom), for: .touchUpInside)
-        addSubview(capsuleButton)
+        button.accessibilityLabel = "lc.multitask.windowMenu".loc
+        // Respond on the press, not on the release: waiting for the menu to open is what made the
+        // old dots feel dead.
+        button.addTarget(self, action: #selector(pressChanged), for: [.touchDown, .touchDragEnter])
+        button.addTarget(
+            self,
+            action: #selector(releaseChanged),
+            for: [.touchUpInside, .touchUpOutside, .touchDragExit, .touchCancel]
+        )
+        addSubview(button)
     }
 
-    /// Cross-fades between the two modes so the dots do not snap out of existence while the main
-    /// window is still resizing. `.beginFromCurrentState` keeps a fast double tap from jumping.
-    private func applyMode() {
-        let showDots = !isFullscreen
-        closeButton.isUserInteractionEnabled = showDots
-        zoomButton.isUserInteractionEnabled = showDots
-        capsuleButton.isUserInteractionEnabled = !showDots
-        capsuleBackground.isUserInteractionEnabled = false
-        UIView.animate(
-            withDuration: 0.18,
-            delay: 0,
-            options: [.beginFromCurrentState, .allowUserInteraction]
-        ) {
-            self.closeButton.alpha = showDots ? 1 : 0
-            self.zoomButton.alpha = showDots ? 1 : 0
-            self.capsuleBackground.alpha = showDots ? 0 : 1
-            self.capsuleButton.alpha = showDots ? 0 : 1
+    /// One control, two items: maximize/restore the main window, or close it. The destructive
+    /// item keeps the system's own red treatment instead of a permanently red button.
+    private func rebuildMenu() {
+        let zoomTitle = (isFullscreen ? "lc.multitask.restoreWindow" : "lc.multitask.zoomWindow").loc
+        let zoomSymbol = isFullscreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"
+        let zoom = UIAction(title: zoomTitle, image: UIImage(systemName: zoomSymbol)) { [weak self] _ in
+            self?.delegate?.stageControlsDidTapZoom()
         }
+        let close = UIAction(
+            title: "lc.multitask.closeWindow".loc,
+            image: UIImage(systemName: "xmark"),
+            attributes: .destructive
+        ) { [weak self] _ in
+            self?.delegate?.stageControlsDidTapClose()
+        }
+
+        button.menu = UIMenu(children: [zoom, close])
+        button.showsMenuAsPrimaryAction = true
+    }
+
+    @objc private func pressChanged() {
+        setPressed(true)
+    }
+
+    @objc private func releaseChanged() {
+        setPressed(false)
+    }
+
+    /// The press scales the whole control and the release springs back, with the same critically
+    /// damped feel the window layout uses, so the button and the stage move as one material.
+    private func setPressed(_ pressed: Bool) {
+        let scale: CGFloat = pressed ? 0.94 : 1.0
+        let apply = { self.button.transform = CGAffineTransform(scaleX: scale, y: scale) }
+        guard !UIAccessibility.isReduceMotionEnabled else {
+            apply()
+            return
+        }
+        UIView.animate(
+            withDuration: pressed ? 0.12 : 0.32,
+            delay: 0,
+            usingSpringWithDamping: pressed ? 1.0 : 0.82,
+            initialSpringVelocity: 0,
+            options: [.beginFromCurrentState, .allowUserInteraction],
+            animations: apply
+        )
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        if isFullscreen {
-            capsuleBackground.frame = CGRect(origin: .zero, size: capsuleSize)
-            capsuleButton.frame = capsuleBackground.frame
-            capsuleDot.frame = CGRect(
-                x: 12,
-                y: (capsuleSize.height - capsuleDotSize) / 2,
-                width: capsuleDotSize,
-                height: capsuleDotSize
-            )
-            capsuleIcon.frame = CGRect(x: 34, y: (capsuleSize.height - 16) / 2, width: 42, height: 16)
-        } else {
-            // The tap target fills the whole strip vertically and is wider than the dot, so it is
-            // easy to hit without making the strip taller and stealing room from the window.
-            // The width is kept close to the dot size so the two dots keep macOS like spacing.
-            let hitWidth: CGFloat = 32
-            let hitHeight = bounds.height
-            let y: CGFloat = 0
-            closeButton.frame = CGRect(x: dotLeftInset, y: y, width: hitWidth, height: hitHeight)
-            zoomButton.frame = CGRect(
-                x: dotLeftInset + hitWidth + hitSpacing,
-                y: y,
-                width: hitWidth,
-                height: hitHeight
-            )
-            let dotFrame = CGRect(
-                x: (hitWidth - dotSize) / 2,
-                y: (hitHeight - dotSize) / 2,
-                width: dotSize,
-                height: dotSize
-            )
-            closeDot.frame = dotFrame
-            zoomDot.frame = dotFrame
-        }
+        button.frame = bounds
+        glassBackground.frame = CGRect(
+            x: (bounds.width - Self.circleSize) / 2,
+            y: (bounds.height - Self.circleSize) / 2,
+            width: Self.circleSize,
+            height: Self.circleSize
+        )
+        glassBackground.layer.cornerRadius = Self.circleSize / 2
+        icon.frame = bounds
     }
 
-    @objc private func tapClose() {
-        delegate?.stageControlsDidTapClose()
-    }
-
-    @objc private func tapZoom() {
-        delegate?.stageControlsDidTapZoom()
-    }
-
-    /// Only the dots themselves are tappable, the strip they live in stays pass-through.
+    /// Only the button itself is tappable; nothing else on the stage is covered by this view.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         let hit = super.hitTest(point, with: event)
         return hit === self ? nil : hit

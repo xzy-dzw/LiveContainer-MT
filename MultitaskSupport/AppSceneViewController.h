@@ -41,18 +41,15 @@ API_AVAILABLE(ios(16.0))
 - (void)terminate;
 - (void)openURLScheme:(NSString *)urlString;
 - (void)handleStatusBarTapAction:(UIAction *)action;
-/// Re-registers the hosted scene's system touch region after a stage geometry change, in two
-/// halves: the foreground-off phase runs when the geometry animation starts (masked by the
-/// motion), and the foreground-on phase once it has settled with the final geometry — the
-/// only reliable trigger for that re-registration on iOS 26.
-- (void)prepareHostedGeometryCommit;
-- (void)finishHostedGeometryCommit;
+/// Re-pushes the settled geometry of the hosted scene. BackBoard derives a hosted scene's touch
+/// region from the hosting view's geometry, so a fullscreen toggle or a window promotion has to
+/// end with this push or the main window stops being touchable at its new slot. The scene stays
+/// foreground the whole time: the old foreground NO→YES blip froze the guest's video and cut its
+/// audio for the length of the blip.
+- (void)commitHostedGeometry;
 /// Set foreground state on the hosted scene. Used to suspend side windows while the app is
 /// backgrounded (so iOS does not kill them for memory pressure) and to wake them back up.
 - (void)setHostedSceneForeground:(BOOL)foreground;
-/// YES until the first geometry commit finishes after launch. The stage uses it to decide
-/// whether the main window still needs a foreground blip to make its slot touchable.
-@property(nonatomic, assign) BOOL hostedGeometryNeedsCommit;
 /// Set when the guest is deliberately terminated (red close button). Used to ignore the
 /// cancellation error the extension reports on the way out.
 @property(nonatomic, assign) BOOL terminationRequested;

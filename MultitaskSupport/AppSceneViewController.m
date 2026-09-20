@@ -40,7 +40,6 @@
     self.bundleId = bundleId;
     self.scaleRatio = 1.0;
     self.isAppTerminationCleanUpCalled = false;
-    self.hostedGeometryNeedsCommit = YES;
     self.isNativeWindow = [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode" ] == 1;
     
     static dispatch_once_t onceToken;
@@ -458,33 +457,31 @@
     }];
 }
 
-/// Geometry commit for the (interactive) MAIN window only. On iOS 26 the hosting view keeps
-/// syncing its touch region continuously, but after a fullscreen/layout change a foreground
-/// NO→YES blip is still the most reliable way to make the main window's region match its new
-/// frame; MultitaskDockManager runs prepare → ~0.12s → finish while a snapshot covers the window,
-/// so the brief deactivation never flashes. Side windows never need this: their touches are
-/// quarantined inside the guest process (see LCStageIPC.h), not routed through the region table.
-- (void)prepareHostedGeometryCommit {
+/// Geometry commit for the (interactive) MAIN window only, run once the stage layout animation
+/// has landed. BackBoard derives a hosted scene's touch region from the hosting view's geometry,
+/// so the settled geometry has to be pushed into the scene again or the window stops being
+/// touchable at its new slot (that is what the old foreground NO→YES blip was for). The blip cost
+/// the guest its live state for a moment — video froze, audio glitched and the stage flashed —
+/// so the commit now only pushes settings and never takes the scene out of the foreground.
+/// Side windows never need this: their touches are quarantined inside the guest process
+/// (see LCStageIPC.h), not routed through the region table.
+- (void)commitHostedGeometry {
     if(!self.presenter || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
         return;
     }
-    [self setHostedSceneForeground:NO];
-}
+    // Flush the frame that the stage just applied synchronously: the debounced path would land
+    // after this push and leave the scene describing the previous slot for a moment.
+    self.shouldSkipDebounceOnce = YES;
+    [self updateFrameWithSettingsBlock:nil];
 
-- (void)finishHostedGeometryCommit {
-    if(!self.presenter || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
-        return;
-    }
-    self.hostedGeometryNeedsCommit = NO;
-    [self setHostedSceneForeground:YES];
-    // Belt and braces: right after the flip, re-assert the settings block and write the
-    // hosting view's current (final) geometry into it, the same way the system does internally.
     __weak typeof(self) weakSelf = self;
     [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
         __strong typeof(weakSelf) self = weakSelf;
         if(!self) return;
         settings.foreground = YES;
         settings.deactivationReasons = 0;
+        // The system's own way of writing the hosting view's on-screen geometry into the scene
+        // settings. This is the value the touch region is derived from.
         if(@available(iOS 19.0, *)) {
             if([self.contentView isKindOfClass:PrivClass(_UISceneHostingView)]) {
                 [(id)self.contentView applyViewGeometryToSettings:settings];
