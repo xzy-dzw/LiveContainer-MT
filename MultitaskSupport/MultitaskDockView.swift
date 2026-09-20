@@ -143,6 +143,13 @@ class AppInfoProvider {
 
     private var dockHost: UIHostingController<AnyView>?
     private let controls = MultitaskStageControlsView(frame: .zero)
+    /// The stage's frame-rate readout, in the strip's far corner. Like the controls it lives on the
+    /// window itself, so it is always drawn above every guest window.
+    private let fpsCounter = MultitaskStageFPSCounterView(frame: .zero)
+    /// Reused impact generators: allocating one per tap puts Taptic engine setup on the hot path,
+    /// which is exactly what a fast run of window switches does not need.
+    private lazy var switchFeedback = UIImpactFeedbackGenerator(style: .light)
+    private lazy var closeFeedback = UIImpactFeedbackGenerator(style: .rigid)
 
     /// Highest-level invisible window that routes touches for the stage. Side-window touches are
     /// captured in UIApplication.sendEvent (hooked in UIKitHooks.m), because the system-level
@@ -157,9 +164,12 @@ class AppInfoProvider {
     /// The stage is a page of its own, not a permanent overlay: it fades in when the first app
     /// launches and fades out together with the dock once the last window closes.
     private var isStagePresented = false
-    /// Re-entry guard while the stage geometry is animating, so quick repeated zoom/promote
-    /// taps cannot stack two geometry animations on top of each other.
-    private var isLayoutAnimating = false
+    /// Token of the layout animation currently in flight. Every animated layout pass bumps it and
+    /// only the newest pass may settle. Replacing the running animation instead of dropping the new
+    /// request is what makes a fast run of switches feel like one continuous motion; the token is
+    /// what keeps that safe, because a replaced animation still reports its completion and a stale
+    /// settle would re-run the whole layout pass behind the user's back.
+    private var layoutToken: UInt = 0
     /// Stage state at the moment of the last settle, so the hosted scene's touch region is only
     /// re-registered when the main window actually changed (fullscreen toggle or promotion).
     private var lastSettledFullscreen: Bool?
@@ -172,6 +182,12 @@ class AppInfoProvider {
     /// The generation that settleAfterAnimation observed last time it ran. Used to detect
     /// double-fires from overlapping animators (beginFromCurrentState + a second arm).
     private var lastSettledGeneration: UInt = 0
+    /// The role state the guests were last told about, and when. Repeated publishes of the same
+    /// state inside one refresh interval are skipped: they cost a disk write each and wake every
+    /// guest, and a fast run of switches asks for the same state three times per tap.
+    private var lastPublishedRoles: (active: Bool, uuid: String?)?
+    private var lastPublishedRolesAt = Date.distantPast
+    private static let roleRepublishInterval: TimeInterval = 1.0
     /// Last time the host entered (or was confirmed in) the foreground. Heartbeat pruning is
     /// suppressed for a grace window after that, because suspension freezes every guest timer
     /// and a fresh resume would otherwise look like all four guests died at once.
@@ -204,6 +220,9 @@ class AppInfoProvider {
         controls.delegate = self
         controls.isHidden = true
         keyWindow?.addSubview(controls)
+
+        fpsCounter.isHidden = true
+        keyWindow?.addSubview(fpsCounter)
 
         setupDockView()
 
@@ -354,7 +373,18 @@ class AppInfoProvider {
             }
             self.windowHostingView.sendSubviewToBack(self.blockShadowView)
 
-            self.blockShadowView.frame = MultitaskStageLayout.blockFrame(bounds: bounds, safeArea: safeArea)
+            let blockFrame = MultitaskStageLayout.blockFrame(bounds: bounds, safeArea: safeArea)
+            self.blockShadowView.frame = blockFrame
+            // A shadow path keeps the shadow from being re-blurred from the view's alpha on every
+            // frame of a layout animation: without it, a 22pt radius spread over the whole window
+            // block is re-rendered per frame, by far the most expensive thing on the stage while
+            // windows change places. The path itself animates, so the shadow follows the block.
+            self.blockShadowView.layer.shadowPath = CGPath(
+                roundedRect: CGRect(origin: .zero, size: blockFrame.size),
+                cornerWidth: MultitaskStageLayout.cornerRadius,
+                cornerHeight: MultitaskStageLayout.cornerRadius,
+                transform: nil
+            )
             self.blockShadowView.isHidden = self.isFullscreen
 
             self.controls.isHidden = false
@@ -362,6 +392,14 @@ class AppInfoProvider {
             self.controls.frame = self.isFullscreen
                 ? MultitaskStageLayout.fullscreenControlsFrame(bounds: bounds, safeArea: safeArea)
                 : MultitaskStageLayout.controlsFrame(bounds: bounds, safeArea: safeArea)
+
+            // The readout belongs to the split stage: fullscreen is the guest app's screen, so the
+            // counter leaves with the strip — and stops sampling, instead of ticking away on a
+            // number nobody can see.
+            self.fpsCounter.isHidden = false
+            self.fpsCounter.frame = MultitaskStageLayout.fpsFrame(bounds: bounds, safeArea: safeArea)
+            self.fpsCounter.alpha = self.isFullscreen ? 0 : 1
+            self.fpsCounter.isCounting = !self.isFullscreen
 
             if let dockView = self.dockHost?.view {
                 // Fullscreen means the guest app owns the whole screen, dock included.
@@ -373,42 +411,58 @@ class AppInfoProvider {
 
         if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
-            isLayoutAnimating = true
-            UIView.transition(with: windowHostingView, duration: 0.2, options: .transitionCrossDissolve, animations: update)
-            UIView.animate(withDuration: 0.2) { self.dockHost?.view.alpha = self.isFullscreen ? 0 : 1 }
+            layoutToken &+= 1
+            let token = layoutToken
+            UIView.transition(with: windowHostingView, duration: 0.2, options: [.transitionCrossDissolve, .allowUserInteraction], animations: update)
+            UIView.animate(withDuration: 0.2) {
+                self.dockHost?.view.alpha = self.isFullscreen ? 0 : 1
+                self.fpsCounter.alpha = self.isFullscreen ? 0 : 1
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                self?.settleAfterAnimation()
+                guard let self, self.layoutToken == token else { return }
+                self.settleAfterAnimation()
             }
         } else if animated {
             armGeometryCommitIfNeeded()
-            let animator = UIViewPropertyAnimator(
-                duration: MultitaskDockManager.layoutAnimationDuration,
-                timingParameters: UISpringTimingParameters(dampingRatio: 1.0)
-            )
-            isLayoutAnimating = true
-            animator.addAnimations(update)
-            animator.addCompletion { [weak self] _ in
-                self?.settleAfterAnimation()
+            layoutToken &+= 1
+            let token = layoutToken
+            // One spring, started from the values that are on screen at this instant. That is what
+            // lets a switch arriving mid-flight take the motion over instead of being dropped: the
+            // new pass re-targets the same cards from where they are, so a fast run of switches
+            // reads as one continuous reflow — and the layout pass itself, which is the expensive
+            // part, runs once per switch instead of once more when the animation settles.
+            UIView.animate(
+                withDuration: MultitaskDockManager.layoutAnimationDuration,
+                delay: 0,
+                usingSpringWithDamping: 1.0,
+                initialSpringVelocity: 0,
+                options: [.beginFromCurrentState, .allowUserInteraction],
+                animations: update
+            ) { [weak self] _ in
+                guard let self, self.layoutToken == token else { return }
+                self.settleAfterAnimation()
             }
-            animator.startAnimation()
         } else {
             update()
         }
 
         if entering {
             // Cross-fade the whole page in, independently of the slot layout inside it. Reset
-            // the alphas after `update` ran (it sets the dock's settled alpha) so the fade
-            // always starts from 0.
+            // the alphas after `update` ran (it sets the dock's and the readout's settled alpha)
+            // so the fade always starts from 0.
             let dockTargetAlpha: CGFloat = isFullscreen ? 0 : 1
             windowHostingView.alpha = 0
             dockHost?.view.alpha = 0
+            fpsCounter.alpha = 0
             UIView.animate(withDuration: 0.22, delay: 0, options: .allowUserInteraction) {
                 self.windowHostingView.alpha = 1
                 self.dockHost?.view.alpha = dockTargetAlpha
+                self.fpsCounter.alpha = self.isFullscreen ? 0 : 1
             }
         }
 
         window.bringSubviewToFront(controls)
+        window.bringSubviewToFront(fpsCounter)
         if let dockView = dockHost?.view {
             window.bringSubviewToFront(dockView)
         }
@@ -422,10 +476,30 @@ class AppInfoProvider {
     /// guest processes read to decide whether to quarantine their touches.
     private func publishStageRoles(active: Bool) {
         guard isDockEnabled() else {
-            LCStagePublishRoles(false, nil)
+            publishRolesIfChanged(active: false, uuid: nil)
             return
         }
-        LCStagePublishRoles(active, active ? apps.first?.appUUID : nil)
+        publishRolesIfChanged(active: active, uuid: active ? apps.first?.appUUID : nil)
+    }
+
+    /// Writes the roles out only when they actually changed, or when the last write is old enough
+    /// that the watchdog's refresh is due.
+    ///
+    /// Publishing is not free: it writes three keys into the shared defaults, synchronizes them to
+    /// disk and wakes every guest with a Darwin notification. One switch used to publish up to three
+    /// times for a single tap (the tap, the layout it starts and the settle), and at three keys plus
+    /// a disk sync each that is the kind of work that heats a phone up when the user taps quickly.
+    /// Skipping the identical ones is safe: the guest's staleness window is five seconds and the
+    /// watchdog republishes once a second, so a role change is still seen immediately and a
+    /// missed notification still heals well inside that window.
+    private func publishRolesIfChanged(active: Bool, uuid: String?) {
+        if let last = lastPublishedRoles, last.active == active, last.uuid == uuid,
+           Date().timeIntervalSince(lastPublishedRolesAt) < Self.roleRepublishInterval {
+            return
+        }
+        lastPublishedRoles = (active, uuid)
+        lastPublishedRolesAt = Date()
+        LCStagePublishRoles(active, uuid)
     }
 
     /// A window whose guest never wrote a single heartbeat once it is older than this is not
@@ -562,7 +636,6 @@ class AppInfoProvider {
     /// Runs once when the geometry animation has landed: the settled layout is re-applied without
     /// animation and the main window's geometry is pushed into its hosted scene.
     private func settleAfterAnimation() {
-        isLayoutAnimating = false
         performLayout(animated: false)
         let currentGen = pendingGeometryGeneration
         // Guard 1: generation counter. If the arm happened twice for the same settle (two
@@ -604,6 +677,9 @@ class AppInfoProvider {
         isStagePresented = false
         isFullscreen = false
         controls.isHidden = true
+        // No stage on screen: the readout goes with it, and stops sampling frames nobody can see.
+        fpsCounter.isCounting = false
+        fpsCounter.isHidden = true
         blockShadowView.isHidden = true
         // No stage on screen: every guest keeps its own touches again.
         publishStageRoles(active: false)
@@ -760,8 +836,9 @@ class AppInfoProvider {
         for index in 1..<apps.count {
             guard let view = apps[index].view else { continue }
             if view.convert(view.bounds, to: window).contains(location) {
-                // promoteToMain no-ops while a layout animation is in flight, but the touch
-                // is always swallowed so it can never leak into the side app.
+                // promoteToMain takes over any layout animation already in flight, so a quick run
+                // of taps keeps working; the touch is always swallowed so it can never leak into
+                // the side app.
                 promoteToMain(index: index)
                 return true
             }
@@ -769,8 +846,12 @@ class AppInfoProvider {
         return false
     }
 
+    /// Every window in the stage reflows at once — the card that leaves the main slot and the card
+    /// that takes it are moved by the same spring, so the two halves of a switch read as one
+    /// motion. A switch that lands while that spring is still running takes it over instead of
+    /// being ignored (see performLayout), which is what makes tapping through the windows quickly
+    /// feel like one continuous reflow as well as keep the work per tap small.
     func promoteToMain(index: Int) {
-        guard !isLayoutAnimating else { return }
         guard index >= 0, index < apps.count else { return }
         if index > 0 {
             let app = apps.remove(at: index)
@@ -780,24 +861,23 @@ class AppInfoProvider {
         // and the new main releases touches while the promotion animates.
         publishStageRoles(active: true)
         relayout(animated: true)
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        switchFeedback.impactOccurred()
     }
 
     @objc func stageControlsDidTapClose() {
         guard let vc = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController else { return }
         // Closing terminates the guest process, so acknowledge the destructive commit with the
         // hard-edged feedback that belongs to a destructive action.
-        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+        closeFeedback.impactOccurred()
         vc.closeWindow()
     }
 
     @objc func stageControlsDidTapZoom() {
-        guard !isLayoutAnimating else { return }
         isFullscreen.toggle()
         relayout(animated: true)
         // Fires on the same frame the layout animation starts, so the tap and the motion read as
         // one event.
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        switchFeedback.impactOccurred()
     }
 
     // MARK: - Dock taps
