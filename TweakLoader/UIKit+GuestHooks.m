@@ -9,9 +9,59 @@ UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
 NSMutableArray<NSString*>* LCSupportedUrlSchemes = nil;
 BOOL launchURLProcessed = NO;
 
+// MARK: - Guest-side touch hook
+
+// Per-guest touch counters exposed via App Group so host can show them on the stage build label.
+// Each LiveProcess extension runs its own copy, but they share the same App Group defaults — the
+// host reads whichever counter is non-zero to confirm touches actually reach guest sendEvent.
+static volatile int LCGuestTouchBeganCounter = 0;
+static volatile int LCGuestTouchSwallowedCounter = 0;
+static NSString *LCGuestTouchDataUUID = nil;
+
+static void hook_guest_sendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
+    if(event.type == UIEventTypeTouches) {
+        for(UITouch *touch in event.allTouches) {
+            if(touch.phase == UITouchPhaseBegan) {
+                LCGuestTouchBeganCounter++;
+                // Persist the counters so the host stage label can read them across processes.
+                NSUserDefaults *group = [NSUserDefaults lcSharedDefaults];
+                [group setInteger:LCGuestTouchBeganCounter forKey:@"LCGuestTouchBegan"];
+                [group setObject:LCGuestTouchDataUUID ?: @"" forKey:@"LCGuestTouchDataUUID"];
+                // NSLog lets the user tail the console if they ever plug the device in.
+                NSLog(@"[LCGuestTouch] sendEvent began #%d  dataUUID=%@  window=%@",
+                      LCGuestTouchBeganCounter, LCGuestTouchDataUUID, NSStringFromClass(touch.window.class));
+                break;
+            }
+        }
+    }
+    [self hook_guest_sendEvent:event];
+}
+
+@interface UIApplication (LCGuestSendEventHook)
+- (void)hook_guest_sendEvent:(UIEvent *)event;
+@end
+
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
     if(!NSUserDefaults.lcGuestAppId) return;
+
+    // Hook UIApplication.sendEvent in the guest process. Pattern mirrors the host-side hook
+    // in UIKitHooks.m — register the hook selector first, then swizzle. Touches destined for
+    // the guest's hosted scene MUST reach this hook for Plan D to work; if the counter above
+    // never increments, touches are delivered through a channel that bypasses UIKit entirely
+    // and we need a different interception point (UIWindow.sendEvent or scene-level API).
+    if(@available(iOS 16.0, *)) {
+        LCGuestTouchDataUUID = NSUserDefaults.standardUserDefaults[@"selectedContainer"] ?: @"";
+        class_addMethod(UIApplication.class,
+                        @selector(hook_guest_sendEvent:),
+                        (IMP)hook_guest_sendEvent,
+                        "v@:@");
+        swizzle(UIApplication.class,
+                @selector(sendEvent:),
+                @selector(hook_guest_sendEvent:));
+        NSLog(@"[LCGuestTouch] hook installed, dataUUID=%@", LCGuestTouchDataUUID);
+    }
+
     swizzle(UIApplication.class, @selector(_applicationOpenURLAction:payload:origin:), @selector(hook__applicationOpenURLAction:payload:origin:));
     swizzle(UIApplication.class, @selector(_connectUISceneFromFBSScene:transitionContext:), @selector(hook__connectUISceneFromFBSScene:transitionContext:));
     swizzle(UIApplication.class, @selector(openURL:options:completionHandler:), @selector(hook_openURL:options:completionHandler:));

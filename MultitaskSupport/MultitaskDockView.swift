@@ -273,7 +273,14 @@ class AppInfoProvider {
     private func updateBuildLabel() {
         let commit = Bundle.main.object(forInfoDictionaryKey: "LCBuildCommit") as? String ?? ""
         let build = commit.isEmpty ? "build ?" : "build " + commit
-        buildLabel.text = "\(build)  e\(diagBeganApp) w\(diagBeganWindow) h\(diagIntercepted) p\(diagPromoted) x\(diagExited) r\(diagRemoved)"
+        // Read guest-side counters from the shared App Group. They are written by the
+        // UIApplication.sendEvent hook installed in each LiveProcess extension. If guestBegan
+        // stays 0 while tapping a side window, the touch never entered the guest process and
+        // Plan D (intercept inside guest) will not work as-is — we'll need a different hook
+        // point (UIWindow.sendEvent or scene-level API).
+        let guestBegan = LCUtils.appGroupUserDefault.integer(forKey: "LCGuestTouchBegan")
+        let guestDataUUID = LCUtils.appGroupUserDefault.string(forKey: "LCGuestTouchDataUUID") ?? ""
+        buildLabel.text = "\(build)  e\(diagBeganApp) w\(diagBeganWindow) h\(diagIntercepted) p\(diagPromoted) x\(diagExited) r\(diagRemoved) | g\(guestBegan)[\(guestDataUUID.prefix(4))]"
     }
 
     /// Counters are bumped from the sendEvent hooks on whatever thread UIKit delivers events on,
