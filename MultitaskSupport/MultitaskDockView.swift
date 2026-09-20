@@ -174,11 +174,15 @@ class AppInfoProvider {
     private var geometryCommitCover: UIView?
     /// Number of touch-region commits currently running. The cover lives while this is above
     /// zero, so two commits in quick succession (a window restored right after another) share one
-    /// snapshot instead of re-capturing a stage that still has a window parked off-screen.
+    /// snapshot instead of re-capturing a stage that is mid-blip.
     private var pendingTouchRegionCommits: Int = 0
     /// Cover that is still fading out. Removed before the next snapshot, otherwise the snapshot
     /// would bake the half-faded image into it and leave the stage looking dimmed.
     private weak var fadingCommitCover: UIView?
+    /// Last time the host entered (or was confirmed in) the foreground. Heartbeat pruning is
+    /// suppressed for a grace window after that, because suspension freezes every guest timer
+    /// and a fresh resume would otherwise look like all four guests died at once.
+    private var lastHostWakeAt = Date()
 
     private static let layoutAnimationDuration: TimeInterval = 0.4
 
@@ -230,6 +234,16 @@ class AppInfoProvider {
             name: UIApplication.willEnterForegroundNotification,
             object: nil
         )
+
+        // One-second watchdog: (1) republishes the stage role state so guests
+        // never lock themselves into touch quarantine on a missed Darwin
+        // notification, and (2) removes dead/detached windows even when the
+        // extension exit callback was lost, so the next window refills the main
+        // slot instead of leaving a black card behind.
+        let watchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.watchdogTick()
+        }
+        watchdog.tolerance = 0.5
     }
 
     deinit {
@@ -298,6 +312,8 @@ class AppInfoProvider {
             if isStagePresented {
                 dismissStage()
             }
+            // Release every guest from side-window touch quarantine.
+            publishStageRoles(active: false)
             return
         }
 
@@ -315,43 +331,10 @@ class AppInfoProvider {
 
         let update = { [weak self] in
             guard let self else { return }
-            // MARK: Dead-window cleanup via guest heartbeat
+            // Drop crashed/detached windows before laying out, so the next app
+            // slides into the main slot on this same layout pass.
+            self.pruneDeadWindows()
 
-            // Every guest process writes a timestamp to the App Group once per second (see
-            // UIKit+GuestHooks.m). If a window's heartbeat has not moved for 10+ seconds, the
-            // guest process is dead — either it crashed, got SIGKILLed under memory pressure, or
-            // never launched in the first place. Self-heal below only drops windows whose view
-            // is detached from the window hierarchy; a dead guest still has a visible (black)
-            // view, so the heartbeat check is the only signal that catches it reliably.
-            let now = CFAbsoluteTimeGetCurrent()
-            var deadUUIDs: Set<String> = []
-            for app in self.apps {
-                // Skip self-hosted (no separate guest process). Check heartbeat from App Group.
-                let hbKey = "LCGuestHeartbeat.\(app.appUUID)"
-                if let last = LCUtils.appGroupUserDefault.object(forKey: hbKey) as? Double {
-                    // 10-second deadline — heartbeat fires every 1s so this is generous enough
-                    // for transient scheduling delays but short enough to not linger as a black
-                    // screen after the user closes or relaunches.
-                    if now - last > 10 {
-                        deadUUIDs.insert(app.appUUID)
-                    }
-                } else {
-                    // No heartbeat at all: either a guest that hasn't started yet (safe to keep
-                    // waiting) or a self-hosted window (not applicable). Leave it alone.
-                }
-            }
-            if !deadUUIDs.isEmpty {
-                self.apps.removeAll { deadUUIDs.contains($0.appUUID) }
-                NSLog("[LCStage] heartbeat: removed \(deadUUIDs.count) dead window(s): \(deadUUIDs)")
-            }
-
-            // Self-heal: a terminated window's view can be detached from the stage before its
-            // model left the array (lost removal callback). Dropping detached models here lets
-            // the next app slide into the main slot on this very layout pass instead of leaving
-            // an empty main slot behind.
-            if self.apps.contains(where: { $0.view?.window == nil }) {
-                self.apps.removeAll { $0.view?.window == nil }
-            }
             for (index, app) in self.apps.enumerated() {
                 guard let view = app.view else { continue }
                 let fullscreen = self.isFullscreen && index == 0
@@ -462,6 +445,74 @@ class AppInfoProvider {
             window.bringSubviewToFront(dockView)
         }
         window.bringSubviewToFront(buildLabel)
+
+        // Tell every guest who the main window is. Side windows quarantine
+        // their own touches; the main window keeps full interactivity.
+        publishStageRoles(active: true)
+    }
+
+    /// Publishes the stage role state (active flag + main window UUID) that the
+    /// guest processes read to decide whether to quarantine their touches.
+    private func publishStageRoles(active: Bool) {
+        guard isDockEnabled() else {
+            LCStagePublishRoles(false, nil)
+            return
+        }
+        LCStagePublishRoles(active, active ? apps.first?.appUUID : nil)
+    }
+
+    /// Removes windows whose guest process is dead (heartbeat stale) or whose
+    /// view was detached without a matching model removal (lost exit callback).
+    @discardableResult
+    private func pruneDeadWindows(allowHeartbeatPrune: Bool = true) -> Bool {
+        var changed = false
+        let now = CFAbsoluteTimeGetCurrent()
+        var deadUUIDs: Set<String> = []
+        if allowHeartbeatPrune {
+            for app in apps {
+                // Every guest writes a heartbeat once per second (UIKit+GuestHooks.m).
+                let hbKey = "LCGuestHeartbeat.\(app.appUUID)"
+                if let last = LCUtils.appGroupUserDefault.object(forKey: hbKey) as? Double {
+                    // 10-second deadline: generous for scheduling delays, short
+                    // enough to not linger as a black card after close/crash.
+                    if now - last > 10 {
+                        deadUUIDs.insert(app.appUUID)
+                    }
+                }
+                // No heartbeat at all: guest still starting (or self-hosted) — keep.
+            }
+        }
+        if !deadUUIDs.isEmpty {
+            apps.removeAll { deadUUIDs.contains($0.appUUID) }
+            if apps.isEmpty { isFullscreen = false }
+            NSLog("[LCStage] heartbeat: removed \(deadUUIDs.count) dead window(s): \(deadUUIDs)")
+            changed = true
+        }
+
+        // A terminated window's view can be detached before its model left the
+        // array (lost removal callback).
+        if apps.contains(where: { $0.view?.window == nil }) {
+            let before = apps.count
+            apps.removeAll { $0.view?.window == nil }
+            if apps.count != before { changed = true }
+        }
+        return changed
+    }
+
+    /// Runs once per second, independent of any layout trigger, so a lost exit
+    /// callback can never leave a black main window on screen.
+    @objc private func watchdogTick() {
+        guard isDockEnabled(), isStagePresented, !apps.isEmpty else { return }
+        // While suspended the shared defaults and every guest timer are frozen, so heartbeat
+        // age is meaningless in the background and for a few seconds after a resume.
+        let inGrace = Date().timeIntervalSince(lastHostWakeAt) < 5
+        let canPruneHeartbeats = UIApplication.shared.applicationState == .active && !inGrace
+        if pruneDeadWindows(allowHeartbeatPrune: canPruneHeartbeats) {
+            relayout(animated: false)
+        } else {
+            // Keep the role timestamp fresh even without layout changes.
+            publishStageRoles(active: true)
+        }
     }
 
     /// Called when an animated relayout changes the main window (fullscreen toggle, promotion
@@ -496,82 +547,47 @@ class AppInfoProvider {
         lastSettledMainUUID = apps.first?.appUUID
 
         // The main window changed (fullscreen toggle, promotion, refill after a close), so its
-        // touch region has to be re-registered at its new on-screen slot; every window that just
-        // slid from the main slot into a side slot has to be re-registered off-screen.
+        // touch region has to be re-registered at its new on-screen slot. Windows that slid into
+        // side slots need no registration work: their touches are quarantined in the guest.
         runTouchRegionCommit(forceMainBlip: true)
     }
 
-    /// Re-registers the system touch regions of every window whose registration is stale, all
-    /// under one snapshot cover so the foreground blips underneath never show:
+    /// Re-registers the MAIN window's system touch region after a stage geometry
+    /// change (fullscreen toggle, promotion, refill after a close, foreground
+    /// return). The hosted scene samples its touch region on a foreground
+    /// NO->YES transition, so the main window gets one blip under a snapshot
+    /// cover once the final geometry is in place.
     ///
-    ///   - Main window → blipped when its geometry changed (forceMainBlip) or when its region is
-    ///     still parked off-screen (it used to be a side window). Its transition samples the
-    ///     on-screen slot, which is what keeps the window interactive.
-    ///   - Side windows → always off-screen: the window is parked outside the display for the
-    ///     duration of its transition and then put back, so the live render returns to the slot
-    ///     while the cached region stays off-screen. Taps then fall through to the host process,
-    ///     where the sendEvent hook promotes the window instead of the app inside seeing them.
-    ///
-    /// Windows whose registration already matches their role are skipped entirely, so a plain
-    /// promotion never re-blinks the untouched side windows.
+    /// Side windows do NOT need any region work: their region naturally covers
+    /// their visible slot and the touch is quarantined inside the guest process
+    /// (see LCStageIPC.h), which keeps every scene foreground and live instead
+    /// of parking its view off-screen.
     private func runTouchRegionCommit(forceMainBlip: Bool) {
-        var mainVC: DecoratedAppSceneViewController?
-        if let vc = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController,
-           forceMainBlip || vc.appSceneVC.touchRegionOffscreen {
-            mainVC = vc
+        guard let mainVC = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController else {
+            return
         }
-        let sideVCs: [DecoratedAppSceneViewController] = {
-            var result: [DecoratedAppSceneViewController] = []
-            for app in apps.dropFirst() {
-                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController,
-                      !vc.appSceneVC.touchRegionOffscreen else { continue }
-                result.append(vc)
-            }
-            return result
-        }()
-        guard mainVC != nil || !sideVCs.isEmpty else {
-            // Nothing is stale — no cover, no blip, nothing to wait for.
+        guard forceMainBlip || mainVC.appSceneVC.hostedGeometryNeedsCommit else {
             return
         }
 
-        let group = DispatchGroup()
         coverStageForTouchCommit()
-
-        if let mainVC {
-            // Prepare immediately: the foreground-off half is masked by the cover, and the
-            // foreground-on half lands on the window's settled slot geometry.
-            mainVC.appSceneVC.prepareHostedGeometryCommit()
-            group.enter()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                mainVC.appSceneVC.finishHostedGeometryCommit()
-                group.leave()
-            }
-        }
-
-        // Side windows blip in parallel — independent scenes, so serialising them would only
-        // stretch the cover for no reason.
-        for vc in sideVCs {
-            group.enter()
-            vc.appSceneVC.registerTouchRegionOffscreen {
-                group.leave()
-            }
-        }
-
-        group.notify(queue: .main) { [weak self] in
+        mainVC.appSceneVC.prepareHostedGeometryCommit()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            mainVC.appSceneVC.finishHostedGeometryCommit()
             self?.revealStageCover()
         }
     }
 
-    /// Snapshots the whole stage and pins the snapshot above every window, so the blip phase
-    /// (frozen guest content, side windows parked off-screen) is never visible. A failed capture
-    /// yields a transparent view, which degrades gracefully to the uncovered behaviour.
+    /// Snapshots the whole stage and pins the snapshot above every window, so the main window's
+    /// blip phase (briefly frozen content) is never visible. A failed capture yields a transparent
+    /// view, which degrades gracefully to the uncovered behaviour.
     private func coverStageForTouchCommit() {
         pendingTouchRegionCommits += 1
         // Drop a cover that is still fading out, so the new snapshot is taken from the real stage.
         fadingCommitCover?.removeFromSuperview()
         fadingCommitCover = nil
         // A commit already running owns the cover: keep its (pre-blip) snapshot instead of
-        // capturing a stage whose parked windows would show up as holes.
+        // capturing a stage mid-blip.
         guard geometryCommitCover == nil else { return }
         guard let cover = windowHostingView.snapshotView(afterScreenUpdates: false) else { return }
         cover.frame = windowHostingView.bounds
@@ -596,6 +612,8 @@ class AppInfoProvider {
         isFullscreen = false
         controls.isHidden = true
         blockShadowView.isHidden = true
+        // No stage on screen: every guest keeps its own touches again.
+        publishStageRoles(active: false)
         UIView.animate(withDuration: 0.2, animations: {
             self.windowHostingView.alpha = 0
             self.dockHost?.view.alpha = 0
@@ -623,18 +641,16 @@ class AppInfoProvider {
     }
 
     @objc private func appWillEnterForeground() {
-        // Waking the side scenes back up (foreground = YES) is itself a touch-region transition,
-        // and it would land their regions back on-screen. The main window can take that flip
-        // directly — its slot is exactly where its region belongs — while every side window is
-        // marked stale and re-registered off-screen by the commit below.
-        if let mainVC = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController {
-            _ = mainVC.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: true)
-        }
-        for app in apps.dropFirst() {
+        lastHostWakeAt = Date()
+        // Wake every scene back up (the background handler suspended the side
+        // windows). Side touches are quarantined in the guest process, so their
+        // regions simply returning on-screen is harmless; only the main window
+        // needs a blip to re-register its region at the settled slot.
+        for app in apps {
             guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-            vc.appSceneVC.invalidateTouchRegionRegistration()
+            _ = vc.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: true)
         }
-        runTouchRegionCommit(forceMainBlip: false)
+        runTouchRegionCommit(forceMainBlip: true)
         // Re-layout so the stage and shields are restored to their proper positions.
         DispatchQueue.main.async {
             self.relayout(animated: false)
@@ -674,12 +690,11 @@ class AppInfoProvider {
             self.relayout(animated: false)
             // The non-animated path never reaches settleAfterAnimation, so the commit bookkeeping
             // happens here (keeping the arm state in sync so a later animated relayout does not
-            // re-blink for a change that already settled) and the touch regions are committed on
-            // the next runloop tick, after performLayout applied the new frames. The window that
-            // just slid from the main slot into a side slot must be parked off-screen right away,
-            // otherwise taps on it keep reaching the app inside. The main window is blipped too:
-            // its scene started before the stage laid it out, so its region still reflects the
-            // pre-layout geometry, and the blip is what pins it to the slot the user can touch.
+            // re-blink for a change that already settled) and the main window's touch region is
+            // committed on the next runloop tick, after performLayout applied the new frames. The
+            // main window is blipped: its scene started before the stage laid it out, so its
+            // region still reflects the pre-layout geometry, and the blip pins it to the slot the
+            // user can touch. Side slots need no commit (guest-side touch quarantine).
             self.lastSettledFullscreen = self.isFullscreen
             self.lastSettledMainUUID = self.apps.first?.appUUID
             DispatchQueue.main.async { [weak self] in
@@ -756,6 +771,9 @@ class AppInfoProvider {
             let app = apps.remove(at: index)
             apps.insert(app, at: 0)
         }
+        // Flip touch ownership immediately: the old main starts quarantining
+        // and the new main releases touches while the promotion animates.
+        publishStageRoles(active: true)
         relayout(animated: true)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }

@@ -2,12 +2,17 @@
 #import "LCSharedUtils.h"
 #import "UIKitPrivate.h"
 #import "../LiveContainer/utils.h"
+#import "../MultitaskSupport/LCStageIPC.h"
 #import <LocalAuthentication/LocalAuthentication.h>
 #import "Localization.h"
 
 UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
 NSMutableArray<NSString*>* LCSupportedUrlSchemes = nil;
 BOOL launchURLProcessed = NO;
+
+static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *observer,
+                                        CFStringRef name, const void *object,
+                                        CFDictionaryRef userInfo);
 
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
@@ -40,31 +45,87 @@ static void UIKitGuestHooksInit() {
             swizzle(UIWindow.class, @selector(setAutorotates:forceUpdateInterfaceOrientation:), @selector(hook_setAutorotates:forceUpdateInterfaceOrientation:));
         }
 
-        // MARK: - Guest heartbeat for dead-window cleanup
-
-        // Every guest process writes a timestamp to the shared App Group once per second. The
-        // host MultitaskDockManager reads this in performLayout: any window whose heartbeat has
-        // not moved for 10+ seconds is considered crashed/dead and gets removed from the stage
-        // immediately, instead of lingering as a black screen until the user relaunches it.
-        // This is the single most reliable cleanup signal — exit callbacks are asynchronous
-        // and silently dropped when the system SIGKILLs the extension under memory pressure.
-        NSString *dataUUID = [NSUserDefaults.standardUserDefaults objectForKey:@"selectedContainer"] ?: @"";
-        NSString *hbKey = [NSString stringWithFormat:@"LCGuestHeartbeat.%@", dataUUID.length ? dataUUID : @""];
-        __block NSTimer *heartbeatTimer = nil;
-        // Use +weak reference so the timer block doesn't retain anything — if NSTimer ever holds
-        // strong references to non-UI objects we don't care; we just want to fire every second.
-        heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
-            NSUserDefaults *group = [NSUserDefaults lcSharedDefaults];
-            // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
-            // required, unlike CACurrentMediaTime which lives in QuartzCore.
-            [group setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
-            [group synchronize];
-        }];
-        [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
-        NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", dataUUID, hbKey);
 
     }
+
+
+    // MARK: - Guest heartbeat for dead-window cleanup
+
+    // Every guest process writes a timestamp to the shared App Group once per second. The
+    // host MultitaskDockManager reads this in performLayout: any window whose heartbeat has
+    // not moved for 10+ seconds is considered crashed/dead and gets removed from the stage
+    // immediately, instead of lingering as a black screen until the user relaunches it.
+    // This is the single most reliable cleanup signal — exit callbacks are asynchronous
+    // and silently dropped when the system SIGKILLs the extension under memory pressure.
+    NSString *dataUUID = [NSUserDefaults.standardUserDefaults objectForKey:@"selectedContainer"] ?: @"";
+    NSString *hbKey = [NSString stringWithFormat:@"LCGuestHeartbeat.%@", dataUUID.length ? dataUUID : @""];
+    __block NSTimer *heartbeatTimer = nil;
+    // Use +weak reference so the timer block doesn't retain anything — if NSTimer ever holds
+    // strong references to non-UI objects we don't care; we just want to fire every second.
+    heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
+        NSUserDefaults *group = [NSUserDefaults lcSharedDefaults];
+        // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
+        // required, unlike CACurrentMediaTime which lives in QuartzCore.
+        [group setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
+        [group synchronize];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
+    NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", dataUUID, hbKey);
+
+    // MARK: - Stage side-window touch quarantine
+    //
+    // When this guest is displayed as a non-main side window on the virtual window stage,
+    // touches routed by BackBoard land directly in this process (the host can never see them).
+    // Swallow them at UIApplication.sendEvent, upstream of every UIWindow/gesture, and ask the
+    // host to promote this window to the main slot. The host publishes who the main window is
+    // through LCStageIPC (App Group defaults + Darwin notifications).
+    static dispatch_once_t stageOnce;
+    dispatch_once(&stageOnce, ^{
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        LCStageRolesChangedCallback,
+                                        (__bridge CFStringRef)LCStageRolesChangedNotificationName,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+        swizzle(UIApplication.class, @selector(sendEvent:), @selector(hook_lcStage_sendEvent:));
+    });
 }
+
+static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *observer,
+                                        CFStringRef name, const void *object,
+                                        CFDictionaryRef userInfo) {
+    // Pull the host's latest role state so the next sendEvent decision is fresh.
+    [NSUserDefaults.lcSharedDefaults synchronize];
+}
+
+@interface UIApplication (LCStageTouchHook)
+- (void)hook_lcStage_sendEvent:(UIEvent *)event;
+@end
+
+@implementation UIApplication (LCStageTouchHook)
+- (void)hook_lcStage_sendEvent:(UIEvent *)event {
+    if (event.type == UIEventTypeTouches) {
+        static NSString *quarantineUUID = nil;
+        static dispatch_once_t uuidOnce;
+        dispatch_once(&uuidOnce, ^{
+            quarantineUUID = [[NSUserDefaults.standardUserDefaults stringForKey:@"selectedContainer"] copy] ?: @"";
+        });
+        if (LCStageGuestIsSideWindow(quarantineUUID)) {
+            // A fresh touch down in a side window is a promote request. Every
+            // event of the sequence (began/moved/ended) is dropped so the app
+            // inside never reacts to it.
+            for (UITouch *touch in event.allTouches) {
+                if (touch.phase == UITouchPhaseBegan) {
+                    LCStageRequestPromote(quarantineUUID);
+                    break;
+                }
+            }
+            return;
+        }
+    }
+    [self hook_lcStage_sendEvent:event];
+}
+@end
 
 NSString* findDefaultContainerWithBundleId(NSString* bundleId) {
     // find app's default container

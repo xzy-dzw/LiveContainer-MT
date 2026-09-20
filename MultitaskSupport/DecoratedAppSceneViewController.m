@@ -11,6 +11,7 @@
 @property(nonatomic) NSString* dataUUID;
 @property(nonatomic) int pid;
 @property(nonatomic) bool isAppTerminationRequested;
+@property(nonatomic) bool didReportExit;
 @property(nonatomic) UITapGestureRecognizer* promoteGesture;
 /// Sits above the guest while this window is a side window, so the app inside never sees a touch
 /// and the tap that should promote the window is always caught here.
@@ -123,10 +124,11 @@
     _isMaximized = maximized;
 
     // Side windows are display only, but the apps inside them stay fully foreground and live
-    // (rendering, animation, audio keep running). Touches are blocked at the view layer only:
-    // the transparent tap shield sits above the guest and wins hit testing, with the interaction
-    // switch below as a backstop. Never background the side scenes here: a backgrounded hosted
-    // scene freezes on its last frame, which defeats the live-preview purpose of the stage.
+    // (rendering, animation, audio keep running). Touches are quarantined inside the guest
+    // process (see LCStageIPC.h): the guest swallows its own events and asks the host to promote
+    // this window. The transparent tap shield and the interaction switch below are backstops for
+    // cases where a touch still falls through to the host. Never background the side scenes
+    // here: a backgrounded hosted scene freezes on its last frame, defeating the live stage.
     BOOL interact = isMainWindow;
     self.appSceneVC.view.userInteractionEnabled = interact;
     self.appSceneVC.contentView.userInteractionEnabled = interact;
@@ -175,6 +177,18 @@
     _isAppTerminationRequested = true;
     if([_appSceneVC isAppRunning]) {
         [_appSceneVC terminate];
+        // Backstop: on some iOS 26 states the extension cancellation/interruption callback that
+        // drives appTerminationCleanUp is silently dropped. Without this, the dead guest left a
+        // black card in the main slot and no side window was promoted. terminate: SIGKILLs the
+        // guest at 3s anyway; if we have not been told it exited by then, remove it ourselves.
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if(!self) { return; }
+            if(self.view.window) {
+                [self appSceneVCAppDidExit:self.appSceneVC];
+            }
+        });
     } else {
         [self appSceneVCAppDidExit:self.appSceneVC];
     }
@@ -198,6 +212,12 @@
 #pragma mark - AppSceneViewControllerDelegate
 
 - (void)appSceneVCAppDidExit:(AppSceneViewController*)vc {
+    // The exit callback can arrive twice (cancellation + interruption blocks, or the close
+    // watchdog racing the real callback). Removing the window twice would corrupt stage order.
+    if(_didReportExit) {
+        return;
+    }
+    _didReportExit = true;
     BOOL skipTerminationScreen = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCSkipTerminatedScreen"];
     BOOL isManual = _isAppTerminationRequested;
     if(isManual || skipTerminationScreen) {
@@ -230,6 +250,12 @@
 - (void)appSceneVC:(AppSceneViewController*)vc didInitializeWithError:(NSError *)error {
     dispatch_async(dispatch_get_main_queue(), ^{
         if(error) {
+            if(vc.terminationRequested) {
+                // Expected: killing the guest from the red close button reports a cancellation
+                // error. The cancellation block already ran appTerminationCleanUp, which drives
+                // the window removal; don't surface it as a launch failure.
+                return;
+            }
             [vc appTerminationCleanUp];
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"lc.common.error".loc message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
             [alert addAction:[UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleCancel handler:nil]];

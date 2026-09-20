@@ -7,6 +7,7 @@
 @import ObjectiveC;
 #import "utils.h"
 #import "UIKitPrivate+MultitaskSupport.h"
+#import "LCStageIPC.h"
 #import "LiveContainerSwiftUI-Swift.h"
 
 static BOOL LCHasRemoteSheetProviderSelector;
@@ -154,7 +155,36 @@ static void hook_UIWindow_sendEvent(UIWindow *self, SEL _cmd, UIEvent *event) {
     [self hook_UIWindow_sendEvent:event];
 }
 
+#pragma mark - Stage promotion requests from guests
+
+// Side-window touches are quarantined inside the guest process (see
+// LCStageIPC.h). The guest swallows the touch and asks the host to promote its
+// window through a Darwin notification; the payload (which guest) travels in
+// the App Group defaults. Promotions always run on the main thread.
+static void LCStagePromoteRequestCallback(CFNotificationCenterRef center, void *observer,
+                                          CFStringRef name, const void *object,
+                                          CFDictionaryRef userInfo) {
+    NSString *uuid = LCStageTakePendingPromoteUUID();
+    if(uuid.length == 0) { return; }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [MultitaskDockManager.shared promoteWindowForUUID:uuid];
+    });
+}
+
+static void LCStageIPCHostInit(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        LCStagePromoteRequestCallback,
+                                        (__bridge CFStringRef)LCStagePromoteRequestNotificationName,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+    });
+}
+
 void UIKitFixesInit(void) {
+    LCStageIPCHostInit();
     if (@available(iOS 17.0, *)) {
         Class FBSceneClass = PrivClass(FBScene);
         LCHasRemoteSheetProviderSelector = [FBSceneClass instancesRespondToSelector:@selector(ui_viewServiceComponent)];

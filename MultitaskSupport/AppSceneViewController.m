@@ -15,11 +15,6 @@
 #import "utils.h"
 #import "UIKitPrivate+MultitaskSupport.h"
 
-/// Completion of a Plan C2 off-screen touch-region registration (see
-/// registerTouchRegionOffscreenWithCompletion:). Typedef'd so the pending completions can live in
-/// a typed array the compiler can check.
-typedef void (^LCTouchRegionCompletion)(void);
-
 @interface AppSceneViewController()
 @property int resizeDebounceToken;
 @property CFTimeInterval lastResizeRequestTime;
@@ -29,17 +24,10 @@ typedef void (^LCTouchRegionCompletion)(void);
 @end
 
 @interface AppSceneViewController()
-@property(nonatomic) UIWindowScene *hostScene;
+@property(nonatomic, weak) UIWindowScene *hostScene;
 @property(nonatomic) NSString *sceneID;
 @property(nonatomic) NSExtension* extension;
 @property(nonatomic) bool isAppTerminationCleanUpCalled;
-/// Plan C2 bookkeeping: the hosting view is parked off-screen while its touch region is being
-/// re-registered, so the restore must not stack two displacements on top of each other.
-@property(nonatomic) BOOL contentViewDisplaced;
-@property(nonatomic) CGPoint savedContentViewPosition;
-/// Completions of the in-flight C2 registration. Non-nil while a registration runs; extra callers
-/// chain onto it instead of starting a second blip on the same scene.
-@property(nonatomic) NSMutableArray<LCTouchRegionCompletion>* offscreenRegistrationCompletions;
 @end
 
 @implementation AppSceneViewController
@@ -52,6 +40,7 @@ typedef void (^LCTouchRegionCompletion)(void);
     self.bundleId = bundleId;
     self.scaleRatio = 1.0;
     self.isAppTerminationCleanUpCalled = false;
+    self.hostedGeometryNeedsCommit = YES;
     self.isNativeWindow = [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode" ] == 1;
     
     static dispatch_once_t onceToken;
@@ -248,10 +237,12 @@ typedef void (^LCTouchRegionCompletion)(void);
     self.contentView.layer.anchorPoint = CGPointMake(0, 0);
     self.contentView.layer.position = CGPointMake(0, 0);
     
-    [self.view.window.windowScene _registerSettingsDiffActionArray:@[self] forKey:self.sceneID];
+    self.hostScene = self.view.window.windowScene;
+    [self.hostScene _registerSettingsDiffActionArray:@[self] forKey:self.sceneID];
 }
 
 - (void)terminate {
+    self.terminationRequested = YES;
     if(self.isAppRunning) {
         [self.extension _kill:SIGTERM];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -372,8 +363,14 @@ typedef void (^LCTouchRegionCompletion)(void);
         return;
     }
     _isAppTerminationCleanUpCalled = true;
+    // Capture the delegate up front: invalidating the hosting controller can detach our view
+    // synchronously (viewDidMoveToWindow:), and the exit callback must still reach the stage even
+    // then. When it was dropped, the closed window stayed as a black main slot and no side window
+    // was promoted.
+    id<AppSceneViewControllerDelegate> exitDelegate = self.delegate;
     dispatch_async(dispatch_get_main_queue(), ^{
         if(self.sceneID) {
+            [self.hostScene _unregisterSettingsDiffActionArrayForKey:self.sceneID];
             [[PrivClass(FBSceneManager) sharedInstance] destroyScene:self.sceneID withTransitionContext:nil];
         }
         if(self.usesHostingControllerAPI) {
@@ -387,8 +384,9 @@ typedef void (^LCTouchRegionCompletion)(void);
             [self.presenter invalidate];
         }
         self.presenter = nil;
-        
-        [self.delegate appSceneVCAppDidExit:self];
+        self.contentView = nil;
+
+        [exitDelegate appSceneVCAppDidExit:self];
         [MultitaskManager unregisterMultitaskContainerWithContainer:self.dataUUID];
     });
 }
@@ -418,10 +416,12 @@ typedef void (^LCTouchRegionCompletion)(void);
 - (void)viewDidMoveToWindow:(UIWindow *)newWindow shouldAppearOrDisappear:(BOOL)appear {
     [super viewDidMoveToWindow:newWindow shouldAppearOrDisappear:appear];
     if(!newWindow) {
+        // self.view.window is already nil here, so unregister through the host scene captured at
+        // registration time. The delegate must stay alive: the asynchronous exit callback still
+        // has to reach the stage so the dead window is removed and the next one promoted.
         if(self.sceneID) {
-            [self.view.window.windowScene _unregisterSettingsDiffActionArrayForKey:self.sceneID];
+            [self.hostScene _unregisterSettingsDiffActionArrayForKey:self.sceneID];
         }
-        self.delegate = nil;
     }
 }
 
@@ -458,128 +458,16 @@ typedef void (^LCTouchRegionCompletion)(void);
     }];
 }
 
-/// Plan C2 — "register off-screen, display on-screen".
-///
-/// The system routes a hosted scene's touches through a BackBoard region table that is only
-/// recomputed on a foreground transition, sampling the hosting view's on-screen rect at that
-/// moment. A side window therefore has to make that transition while its view is parked outside
-/// the display, and only afterwards be put back: the live content returns to its slot, while the
-/// cached touch region stays off-screen — so every tap in the slot falls through to the host
-/// process, where the sendEvent hook promotes the window instead of the app inside seeing it.
-///
-/// Only the view's position is touched: never settings.frame, bounds or the transform. Writing
-/// the frame is what used to resize the hosting view (the content collapsed into a double-scaled
-/// thumbnail in the slot's corner) and it also landed the touch region back on the visible slot.
-/// Moving the view keeps the render exactly the size the stage computed for it.
-///
-/// Parameter completion: fires once the view has been restored to its slot.
-- (void)registerTouchRegionOffscreenWithCompletion:(void (^_Nullable)(void))completion {
-    if(!self.presenter || !self.contentView || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
-        if(completion) { completion(); }
-        return;
-    }
-    // A registration is already running on this scene: chain the completion so the caller still
-    // un-covers the stage at the right moment, but never run two blips on the same scene.
-    if(_offscreenRegistrationCompletions) {
-        if(completion) { [_offscreenRegistrationCompletions addObject:[completion copy]]; }
-        return;
-    }
-    _offscreenRegistrationCompletions = [NSMutableArray array];
-    if(completion) { [_offscreenRegistrationCompletions addObject:[completion copy]]; }
-    self.touchRegionOffscreen = YES;
-
-    // Step A: park the hosting view off-screen. Bounds, transform and scene settings stay
-    // untouched, so the guest keeps rendering at its original resolution.
-    [self displaceContentViewOffscreen];
-    // Step B: foreground NO — the transition that re-computes the touch region.
-    [self setHostedSceneForeground:NO];
-
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.09 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        __strong typeof(weakSelf) self = weakSelf;
-        if(!self) { return; }
-        // Re-park defensively: a layout pass in the meantime would have rewritten the frame and
-        // pulled the view back on-screen, which is the geometry the flip below must not sample.
-        [self displaceContentViewOffscreen];
-        // Step C: foreground YES while the view is still parked — this is the geometry the region
-        // table caches.
-        [self setHostedSceneForeground:YES];
-        // Step D: hold the parked position long enough for the scene host to commit the region
-        // update, then bring the live content back into its slot.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) self = weakSelf;
-            if(!self) { return; }
-            [self restoreContentViewPosition];
-            NSArray<LCTouchRegionCompletion>* completions = self->_offscreenRegistrationCompletions;
-            self->_offscreenRegistrationCompletions = nil;
-            for(LCTouchRegionCompletion block in completions) { block(); }
-        });
-    });
-}
-
-/// A window can be torn down while its registration is still in flight (app closed, stage
-/// dismissed). Draining the pending completions here keeps the stage's commit group balanced, so
-/// its snapshot cover is always revealed instead of hanging on screen forever.
-- (void)dealloc {
-    if(_offscreenRegistrationCompletions) {
-        NSArray<LCTouchRegionCompletion>* completions = _offscreenRegistrationCompletions;
-        _offscreenRegistrationCompletions = nil;
-        for(LCTouchRegionCompletion block in completions) { block(); }
-    }
-}
-
-/// Moves only the hosting view's centre so its on-screen rect leaves the display; bounds,
-/// transform and the scene settings are left alone. Idempotent on purpose: the window between
-/// parking the view and the foreground-on flip can contain a layout pass that rewrites the
-/// view's frame (and with it its position), so the flip re-parks right before it runs.
-- (void)displaceContentViewOffscreen {
-    UIView* view = self.contentView;
-    if(!view) { return; }
-    if(!_contentViewDisplaced) {
-        _savedContentViewPosition = view.layer.position;
-        _contentViewDisplaced = YES;
-    }
-    CGSize screen = UIScreen.mainScreen.bounds.size;
-    CGFloat distance = MAX(screen.width, screen.height) + 400.0;
-    // Offset on both axes so the rect stays off-screen in either interface orientation.
-    CGPoint offscreen = CGPointMake(_savedContentViewPosition.x + distance, _savedContentViewPosition.y + distance);
-    if(CGPointEqualToPoint(view.layer.position, offscreen)) { return; }
-    // Core Animation would otherwise tween the move over 0.25s, so the region could be sampled
-    // mid-flight; the same applies on the way back, where a tween would still be sliding when
-    // the stage cover fades out.
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    view.layer.position = offscreen;
-    [CATransaction commit];
-}
-
-- (void)restoreContentViewPosition {
-    if(!_contentViewDisplaced) { return; }
-    _contentViewDisplaced = NO;
-    if(!self.contentView) { return; }
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    self.contentView.layer.position = _savedContentViewPosition;
-    [CATransaction commit];
-}
-
-- (void)invalidateTouchRegionRegistration {
-    self.touchRegionOffscreen = NO;
-}
-
-/// The hosted scene's system touch region only re-registers on a foreground transition:
-/// transform and bounds changes alone never trigger it on iOS 26, which left the main window
-/// untouchable after a fullscreen toggle until the user went to the home screen and back (a
-/// real foreground cycle). MultitaskDockManager runs the NO→YES blip once the layout animation
-/// has settled (prepare → ~0.12s → finish) while a snapshot of the window covers the screen, so
-/// the brief deactivation never shows up as a flash.
+/// Geometry commit for the (interactive) MAIN window only. On iOS 26 the hosting view keeps
+/// syncing its touch region continuously, but after a fullscreen/layout change a foreground
+/// NO→YES blip is still the most reliable way to make the main window's region match its new
+/// frame; MultitaskDockManager runs prepare → ~0.12s → finish while a snapshot covers the window,
+/// so the brief deactivation never flashes. Side windows never need this: their touches are
+/// quarantined inside the guest process (see LCStageIPC.h), not routed through the region table.
 - (void)prepareHostedGeometryCommit {
     if(!self.presenter || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
         return;
     }
-    // The blip below registers the touch region at the window's on-screen slot, so this scene no
-    // longer counts as off-screen-registered even before the blip finishes.
-    self.touchRegionOffscreen = NO;
     [self setHostedSceneForeground:NO];
 }
 
@@ -587,6 +475,7 @@ typedef void (^LCTouchRegionCompletion)(void);
     if(!self.presenter || !self.usesHostingControllerAPI || _shouldIgnoreSceneUpdates) {
         return;
     }
+    self.hostedGeometryNeedsCommit = NO;
     [self setHostedSceneForeground:YES];
     // Belt and braces: right after the flip, re-assert the settings block and write the
     // hosting view's current (final) geometry into it, the same way the system does internally.
