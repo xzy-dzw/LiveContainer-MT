@@ -178,16 +178,6 @@ class AppInfoProvider {
     /// the case where a single settle tries to flip side-window foreground twice).
     private var sideWindowRegistrationInFlight = false
 
-    /// Runtime diagnostics shown in the build label: they prove on-device how far a side-window
-    /// tap travels through the interception chain (seen by the UIApplication hook / the UIWindow
-    /// hook / swallowed / promoted) and whether the close path fires (exit callback / removal).
-    @objc public var diagBeganApp = 0
-    @objc public var diagBeganWindow = 0
-    @objc public var diagIntercepted = 0
-    @objc public var diagPromoted = 0
-    @objc public var diagExited = 0
-    @objc public var diagRemoved = 0
-
     private static let layoutAnimationDuration: TimeInterval = 0.4
 
     override init() {
@@ -280,26 +270,9 @@ class AppInfoProvider {
         }
     }
 
-    /// Re-stamps the build label with the commit and the live diagnostic counters.
     private func updateBuildLabel() {
         let commit = Bundle.main.object(forInfoDictionaryKey: "LCBuildCommit") as? String ?? ""
-        let build = commit.isEmpty ? "build ?" : "build " + commit
-        // Read guest-side counters from the shared App Group. They are written by the
-        // UIApplication.sendEvent hook installed in each LiveProcess extension. If guestBegan
-        // stays 0 while tapping a side window, the touch never entered the guest process and
-        // Plan D (intercept inside guest) will not work as-is — we'll need a different hook
-        // point (UIWindow.sendEvent or scene-level API).
-        let guestBegan = LCUtils.appGroupUserDefault.integer(forKey: "LCGuestTouchBegan")
-        let guestDataUUID = LCUtils.appGroupUserDefault.string(forKey: "LCGuestTouchDataUUID") ?? ""
-        buildLabel.text = "\(build)  e\(diagBeganApp) w\(diagBeganWindow) h\(diagIntercepted) p\(diagPromoted) x\(diagExited) r\(diagRemoved) | g\(guestBegan)[\(guestDataUUID.prefix(4))]"
-    }
-
-    /// Counters are bumped from the sendEvent hooks on whatever thread UIKit delivers events on,
-    /// so the label refresh is marshalled onto the main queue.
-    @objc public func refreshDiagnosticsLabel() {
-        DispatchQueue.main.async { [weak self] in
-            self?.updateBuildLabel()
-        }
+        buildLabel.text = commit.isEmpty ? "build ?" : "build " + commit
     }
 
     // MARK: - Stage layout
@@ -597,7 +570,7 @@ class AppInfoProvider {
                 // and runs the NO→YES blip internally with a 100ms timeout. SwiftUI's View.frame
                 // modifier collides so badly with UIMutableApplicationSceneSettings.frame that
                 // even AnyObject casts and KVC fail to compile; the ObjC bridge is the only way.
-                vc.appSceneVC.registerSceneTouchRegion(at: offscreenFrame)
+                vc.appSceneVC.registerSceneTouchRegion(atFrame: offscreenFrame)
             }
             delay += 0.12
         }
@@ -698,8 +671,6 @@ class AppInfoProvider {
 
     @objc public func removeRunningApp(_ appUUID: String) {
         guard isDockEnabled() else { return }
-        diagRemoved += 1
-        refreshDiagnosticsLabel()
 
         DispatchQueue.main.async {
             if let index = self.apps.firstIndex(where: { $0.appUUID == appUUID }) {
@@ -752,8 +723,6 @@ class AppInfoProvider {
             if view.convert(view.bounds, to: window).contains(location) {
                 // promoteToMain no-ops while a layout animation is in flight, but the touch
                 // is always swallowed so it can never leak into the side app.
-                diagIntercepted += 1
-                refreshDiagnosticsLabel()
                 promoteToMain(index: index)
                 return true
             }
@@ -768,8 +737,6 @@ class AppInfoProvider {
             let app = apps.remove(at: index)
             apps.insert(app, at: 0)
         }
-        diagPromoted += 1
-        refreshDiagnosticsLabel()
         relayout(animated: true)
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }

@@ -94,9 +94,6 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
             if(touch.phase != UITouchPhaseBegan) continue;
             if(window == nil) {
                 if(touch.window == nil) continue; // not bound yet, the UIWindow hook gets it
-                // Diagnostics: a began touch with a bound window passed the UIApplication hook.
-                MultitaskDockManager.shared.diagBeganApp += 1;
-                [MultitaskDockManager.shared refreshDiagnosticsLabel];
                 CGPoint location = [touch locationInView:touch.window];
                 if([MultitaskDockManager.shared interceptTouchAtLocation:location inWindow:touch.window]) {
                     if(!LCInterceptedTouches) {
@@ -106,9 +103,6 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
                 }
             } else {
                 if(touch.window != nil && touch.window != window) continue;
-                // Diagnostics: a began touch reached the UIWindow hook of this window.
-                MultitaskDockManager.shared.diagBeganWindow += 1;
-                [MultitaskDockManager.shared refreshDiagnosticsLabel];
                 CGPoint location = [touch locationInView:window];
                 if([MultitaskDockManager.shared interceptTouchAtLocation:location inWindow:window]) {
                     if(!LCInterceptedTouches) {
