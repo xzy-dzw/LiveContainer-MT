@@ -231,12 +231,18 @@ final class MultitaskStageGlassButton: UIButton {
     /// not borrow the app's accent color or compete with its content.
     private func setupGlass() {
         glass.isUserInteractionEnabled = false
-        glass.cornerRadius = Self.circleSize / 2
+        // The layer radius is what clips the fallback materials into a circle. Liquid Glass ignores
+        // it and takes its shape from the corner configuration instead (see below).
         glass.layer.cornerRadius = Self.circleSize / 2
+        glass.layer.cornerCurve = .continuous
         glass.clipsToBounds = true
 
         if #available(iOS 26.0, *), SharedModel.isLiquidGlassEnabled {
             // The system's own Liquid Glass: what a control in a system toolbar is made of there.
+            // The glass draws itself from the corner configuration rather than the layer, so the
+            // circle has to be declared here as well — a square control asked for as a capsule is a
+            // circle.
+            glass.cornerConfiguration = .capsule()
             glass.effect = UIGlassEffect()
         } else if UIAccessibility.isReduceTransparencyEnabled {
             glass.effect = nil
