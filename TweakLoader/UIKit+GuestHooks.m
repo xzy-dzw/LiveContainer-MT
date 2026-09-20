@@ -18,6 +18,13 @@ static volatile int LCGuestTouchBeganCounter = 0;
 static volatile int LCGuestTouchSwallowedCounter = 0;
 static NSString *LCGuestTouchDataUUID = nil;
 
+// Forward-declare the category so the hook function (defined below) can call the
+// swizzled-away original implementation without the compiler complaining about an
+// invisible selector — identical in shape to the host-side hook_original_sendEvent pattern.
+@interface UIApplication (LCGuestSendEventHook)
+- (void)hook_guest_sendEvent:(UIEvent *)event;
+@end
+
 static void hook_guest_sendEvent(UIApplication *self, SEL _cmd, UIEvent *event) {
     if(event.type == UIEventTypeTouches) {
         for(UITouch *touch in event.allTouches) {
@@ -37,10 +44,6 @@ static void hook_guest_sendEvent(UIApplication *self, SEL _cmd, UIEvent *event) 
     [self hook_guest_sendEvent:event];
 }
 
-@interface UIApplication (LCGuestSendEventHook)
-- (void)hook_guest_sendEvent:(UIEvent *)event;
-@end
-
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
     if(!NSUserDefaults.lcGuestAppId) return;
@@ -51,7 +54,7 @@ static void UIKitGuestHooksInit() {
     // never increments, touches are delivered through a channel that bypasses UIKit entirely
     // and we need a different interception point (UIWindow.sendEvent or scene-level API).
     if(@available(iOS 16.0, *)) {
-        LCGuestTouchDataUUID = NSUserDefaults.standardUserDefaults[@"selectedContainer"] ?: @"";
+        LCGuestTouchDataUUID = [NSUserDefaults.standardUserDefaults objectForKey:@"selectedContainer"] ?: @"";
         class_addMethod(UIApplication.class,
                         @selector(hook_guest_sendEvent:),
                         (IMP)hook_guest_sendEvent,
