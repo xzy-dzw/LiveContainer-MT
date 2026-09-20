@@ -28,8 +28,6 @@ import UIKit
     static var controlsWidth: CGFloat { controlSize * 2 + controlSpacing }
     /// Keeps the controls off the very edge of the screen, aligned with the main window's edge.
     static let controlLeadingInset: CGFloat = 12
-    /// Inset of the controls from the safe area while the main window is fullscreen.
-    static let fullscreenControlInset: CGFloat = 6
     /// Trailing inset of the FPS readout, measured from the far edge of the strip.
     static let fpsTrailingInset: CGFloat = 12
     /// Fixed size of the FPS readout, so the right-aligned digits never reflow as the number goes
@@ -97,25 +95,17 @@ import UIKit
     }
 
     /// The two window controls live in the blank strip right above the window block, leading-aligned
-    /// with the main window's edge. It is the controls' own frame, not the strip: the pair is one
-    /// object that only moves between modes, so it can never cross-fade or jump between two shapes.
+    /// with the main window's edge.
+    ///
+    /// The frame is deliberately the same in both modes: fullscreen and the split stage differ in what
+    /// is behind the controls, never in where they are. The pair used to step six points down and left
+    /// as the main window grew, and a control that slides while its glyph stays put inside the circle
+    /// reads as the button coming apart — the window is what should move, not the chrome on top of it.
     @objc static func controlsFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
         let g = geometry(bounds, safeArea)
         return CGRect(
             x: g.origin.x + controlLeadingInset,
             y: safeArea.top + (controlsHeight - controlSize) / 2,
-            width: controlsWidth,
-            height: controlSize
-        )
-    }
-
-    /// The same pair, floating over the top leading corner while the main window is fullscreen. The
-    /// two positions are one short move apart, so the controls travel with the window instead of
-    /// being replaced by a different looking set.
-    @objc static func fullscreenControlsFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
-        return CGRect(
-            x: safeArea.left + fullscreenControlInset,
-            y: safeArea.top + fullscreenControlInset,
             width: controlsWidth,
             height: controlSize
         )
@@ -128,18 +118,6 @@ import UIKit
             y: safeArea.top + (controlsHeight - fpsHeight) / 2,
             width: fpsWidth,
             height: fpsHeight
-        )
-    }
-
-    /// The four slots tile into one rectangle, so the whole block casts a single shadow
-    /// that follows the shared outer contour instead of four overlapping ones.
-    @objc static func blockFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
-        let g = geometry(bounds, safeArea)
-        return CGRect(
-            x: g.origin.x,
-            y: g.origin.y,
-            width: g.unit * CGFloat(maxWindows),
-            height: g.sideHeight * 3
         )
     }
 
@@ -198,7 +176,10 @@ final class MultitaskStageGlassButton: UIButton {
     /// The visible circle stays smaller than the 44pt hit target, so the strip reads as light
     /// chrome instead of two heavy discs.
     private static let circleSize: CGFloat = 34
-    private static let glyphConfiguration = UIImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+    /// A 16pt semibold symbol inside a 34pt circle: the same glyph-to-circle proportion the system's
+    /// own circular controls use, so the pair carries the weight of the two glass buttons without the
+    /// symbols looking lost in them.
+    private static let glyphConfiguration = UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
 
     private let glass = UIVisualEffectView(effect: nil)
     private let tint = UIView()
@@ -329,10 +310,10 @@ final class MultitaskStageGlassButton: UIButton {
 /// macOS puts three colored dots inside a window's title bar. On a phone that reads wrong — the dots
 /// are small, they color the stage chrome in someone else's accent color, and a title bar would
 /// steal a whole strip of the guest app's screen. So the stage keeps two HIG sized (44pt) controls,
-/// and they never live inside a window: in split layout they sit in the blank strip above the main
-/// window's leading edge, and while the main window is fullscreen the very same pair floats over
-/// the top leading corner of the screen. Both positions are one short move apart, so the controls
-/// travel with the window and the hand never has to re-learn where they are.
+/// and they never live inside a window: the pair sits in the blank strip above the main window's
+/// leading edge and stays exactly there, in both layouts. The strip is the controls' home and the
+/// window grows underneath it — chrome that slides while a window resizes reads as the button coming
+/// apart under the finger, so the window is the only thing that moves.
 @objc class MultitaskStageControlsView: UIView {
     @objc weak var delegate: MultitaskStageControlsDelegate?
 
@@ -447,8 +428,9 @@ final class MultitaskStageGlassButton: UIButton {
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
-        // Monospaced digits: the readout must not twitch as the number changes.
-        label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        // Monospaced digits: the readout must not twitch as the number changes. 14pt gives the digits
+        // the same presence as the controls' glyphs, so the strip reads as one line of chrome.
+        label.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
         label.textColor = Self.counterGreen
         label.textAlignment = .right
         label.shadowColor = UIColor.black.withAlphaComponent(0.7)
@@ -477,6 +459,12 @@ final class MultitaskStageGlassButton: UIButton {
         framesInWindow = 0
         windowStart = 0
         let link = CADisplayLink(target: self, selector: #selector(sampleTick))
+        // Ask for the display's whole range instead of the default 60Hz ceiling. On a ProMotion phone
+        // this is what lets the stage — and the window animations the readout is measuring — run at up
+        // to 120Hz; without it the system keeps the process at 60 even though the app declares
+        // CADisableMinimumFrameDurationOnPhone. The 60 floor is for the stage's lifetime only, so an
+        // idle launcher is not pinned to a high refresh rate by a readout nobody is looking at.
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
         // .common so the readout keeps sampling while the dock is scrolled or a window dragged.
         link.add(to: .main, forMode: .common)
         self.link = link

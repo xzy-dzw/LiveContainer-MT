@@ -156,9 +156,20 @@ class AppInfoProvider {
     /// hosted-view touch delivery bypasses the regular UIKit hit-test chain, while the main
     /// window's touches are forwarded straight through.
 
-    /// The four slots tile into one rectangle, so a single shadow caster behind them lifts the
-    /// whole block off the desktop without drawing overlapping shadows inside the shared edges.
-    private let blockShadowView = UIView()
+    /// The stage page's own surface: a light scrim over the launcher. The stage is a page, and the gap
+    /// that opens between two cards while they trade places has to read as the desktop behind them —
+    /// dimmed, never the launcher's own brightness.
+    private let stageBackdrop = UIView()
+    /// One shadow caster per window, all of them below every card.
+    ///
+    /// The stage used to have a single black plate behind the block, casting one shadow for all four
+    /// windows. That plate painted the four tiled windows as one object instead of four cards, and the
+    /// moment two of them started moving it was the plate — a black rectangle — that showed through
+    /// the gap, which is exactly what stops the switch from reading as apps changing places. A caster
+    /// per card puts the elevation where it belongs: the shadow follows its own window, the settled
+    /// block still shows a single outer contour (each card covers the others' casters), and no caster
+    /// can ever draw on a neighbour, because every one of them sits below every card.
+    private var windowShadowCasters: [String: UIView] = [:]
 
     /// Whether the stage page (background, windows, controls, dock) is currently on screen.
     /// The stage is a page of its own, not a permanent overlay: it fades in when the first app
@@ -205,17 +216,13 @@ class AppInfoProvider {
             (rootView.subviews.first ?? rootView).addSubview(self.windowHostingView)
         }
 
-        blockShadowView.isUserInteractionEnabled = false
-        blockShadowView.isHidden = true
-        blockShadowView.backgroundColor = .black
-        blockShadowView.layer.cornerCurve = .continuous
-        blockShadowView.layer.cornerRadius = MultitaskStageLayout.cornerRadius
-        blockShadowView.layer.masksToBounds = false
-        blockShadowView.layer.shadowColor = UIColor.black.cgColor
-        blockShadowView.layer.shadowOpacity = 0.38
-        blockShadowView.layer.shadowOffset = CGSize(width: 0, height: 8)
-        blockShadowView.layer.shadowRadius = 22
-        windowHostingView.addSubview(blockShadowView)
+        // The page surface is the bottom-most layer: cards, their shadow casters and the dock all sit
+        // above it. It is a plain scrim rather than a material on purpose — a full-stage live blur
+        // would be recomputed on every frame of every switch, and a static fill costs nothing.
+        stageBackdrop.isUserInteractionEnabled = false
+        stageBackdrop.isHidden = true
+        stageBackdrop.backgroundColor = UIColor.black.withAlphaComponent(0.22)
+        windowHostingView.addSubview(stageBackdrop)
 
         controls.delegate = self
         controls.isHidden = true
@@ -324,11 +331,20 @@ class AppInfoProvider {
         let entering = !isStagePresented
         isStagePresented = true
         windowHostingView.isHidden = false
+        stageBackdrop.isHidden = false
         dockHost?.view.isHidden = false
         if entering {
             windowHostingView.alpha = 0
             dockHost?.view.alpha = 0
         }
+
+        // The shadow paths ride along with whatever motion this pass uses — the stage's own spring, or
+        // nothing at all. A path that has already reached its size while its window is still on the
+        // way reads as a halo around the card, so the two travel together; the cross-dissolve pass
+        // moves no geometry at all, so its paths snap with it.
+        let shadowPathDuration: TimeInterval = (animated && !UIAccessibility.isReduceMotionEnabled)
+            ? MultitaskDockManager.layoutAnimationDuration
+            : 0
 
         let update = { [weak self] in
             guard let self else { return }
@@ -371,27 +387,37 @@ class AppInfoProvider {
                     self.windowHostingView.bringSubviewToFront(view)
                 }
             }
-            self.windowHostingView.sendSubviewToBack(self.blockShadowView)
+            self.windowHostingView.sendSubviewToBack(self.stageBackdrop)
 
-            let blockFrame = MultitaskStageLayout.blockFrame(bounds: bounds, safeArea: safeArea)
-            self.blockShadowView.frame = blockFrame
-            // A shadow path keeps the shadow from being re-blurred from the view's alpha on every
-            // frame of a layout animation: without it, a 22pt radius spread over the whole window
-            // block is re-rendered per frame, by far the most expensive thing on the stage while
-            // windows change places. The path itself animates, so the shadow follows the block.
-            self.blockShadowView.layer.shadowPath = CGPath(
-                roundedRect: CGRect(origin: .zero, size: blockFrame.size),
-                cornerWidth: MultitaskStageLayout.cornerRadius,
-                cornerHeight: MultitaskStageLayout.cornerRadius,
-                transform: nil
-            )
-            self.blockShadowView.isHidden = self.isFullscreen
+            self.stageBackdrop.frame = bounds
+            // Fullscreen belongs to the guest app: the page surface leaves with the strip, so nothing
+            // dims the app while it owns the screen.
+            self.stageBackdrop.alpha = self.isFullscreen ? 0 : 1
+
+            // Every card carries its own shadow, laid out from the frames written just above so the
+            // casters animate in the same block as the cards: the shadow of a window that is moving
+            // stays welded to it, and the gap the two cards leave between them shows the page surface
+            // with each card's own elevation on it — the way two apps changing places should look.
+            for app in self.apps {
+                guard let view = app.view else { continue }
+                let caster = self.shadowCaster(
+                    for: app.appUUID,
+                    cardFrame: view.frame,
+                    pathDuration: shadowPathDuration
+                )
+                // Fullscreen: the main card covers the screen, so its shadow would only cost frames.
+                caster.alpha = self.isFullscreen ? 0 : 1
+            }
+            // A closed window takes its caster with it.
+            let liveUUIDs = Set(self.apps.map { $0.appUUID })
+            for staleUUID in self.windowShadowCasters.keys.filter({ !liveUUIDs.contains($0) }) {
+                self.windowShadowCasters.removeValue(forKey: staleUUID)?.removeFromSuperview()
+            }
 
             self.controls.isHidden = false
             self.controls.isFullscreen = self.isFullscreen
-            self.controls.frame = self.isFullscreen
-                ? MultitaskStageLayout.fullscreenControlsFrame(bounds: bounds, safeArea: safeArea)
-                : MultitaskStageLayout.controlsFrame(bounds: bounds, safeArea: safeArea)
+            // The same frame in both modes: the pair must not move while the main window grows.
+            self.controls.frame = MultitaskStageLayout.controlsFrame(bounds: bounds, safeArea: safeArea)
 
             // The readout belongs to the split stage: fullscreen is the guest app's screen, so the
             // counter leaves with the strip — and stops sampling, instead of ticking away on a
@@ -470,6 +496,71 @@ class AppInfoProvider {
         // Tell every guest who the main window is. Side windows quarantine
         // their own touches; the main window keeps full interactivity.
         publishStageRoles(active: true)
+    }
+
+    /// Creates or updates the shadow caster that follows one window, and returns it.
+    ///
+    /// A card cannot cast its own shadow: it clips its content to its corner radius, and clipping
+    /// takes the shadow with it. So every window gets an invisible twin — same frame, same corner
+    /// radius, nothing inside — that sits below every card and carries nothing but the elevation.
+    ///
+    /// The path is the part that has to keep up with the window. A shadowPath is a fixed shape, so
+    /// if it were simply replaced while the window animates, the promoted card would wear its old
+    /// shadow for the length of the switch: a soft halo the size the window used to be, hanging in
+    /// the very gap the switch is opening. Instead the path animates from the shape the caster is
+    /// showing at this instant (the presentation value, not the last target), which is also what
+    /// keeps a fast run of switches seamless — an interrupted caster continues from where its
+    /// shadow actually is. pathDuration 0 means this pass moves no geometry (a plain layout, or the
+    /// cross-dissolve the Reduce Motion setting uses) and the path snaps along with everything else.
+    private func shadowCaster(for appUUID: String, cardFrame: CGRect, pathDuration: TimeInterval) -> UIView {
+        let caster: UIView
+        if let existing = windowShadowCasters[appUUID] {
+            caster = existing
+        } else {
+            caster = UIView(frame: cardFrame)
+            caster.isUserInteractionEnabled = false
+            caster.backgroundColor = .clear
+            caster.layer.masksToBounds = false
+            caster.layer.shadowColor = UIColor.black.cgColor
+            caster.layer.shadowOpacity = 0.32
+            caster.layer.shadowOffset = CGSize(width: 0, height: 6)
+            caster.layer.shadowRadius = 16
+            windowShadowCasters[appUUID] = caster
+            windowHostingView.insertSubview(caster, aboveSubview: stageBackdrop)
+        }
+
+        // The path only needs work when the card it follows changed size. Position is the layer's
+        // own business, so a window that only moved keeps the path it has.
+        if caster.layer.shadowPath == nil || caster.frame.size != cardFrame.size {
+            let path = CGPath(
+                roundedRect: CGRect(origin: .zero, size: cardFrame.size),
+                cornerWidth: MultitaskStageLayout.cornerRadius,
+                cornerHeight: MultitaskStageLayout.cornerRadius,
+                transform: nil
+            )
+            let fromPath = caster.layer.presentation()?.shadowPath
+            // Write the model value without letting the transaction animate it on its own; the
+            // animation below is the one that decides where the shadow starts from.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            caster.layer.shadowPath = path
+            CATransaction.commit()
+
+            if pathDuration > 0, let fromPath {
+                let pathAnimation = CABasicAnimation(keyPath: "shadowPath")
+                pathAnimation.fromValue = fromPath
+                pathAnimation.toValue = path
+                pathAnimation.duration = pathDuration
+                // A close stand-in for the stage's spring: both start and end at rest. The shadow
+                // only has to stay the right size to the eye, and matching the size matters far more
+                // than matching the curve.
+                pathAnimation.timingFunction = CAMediaTimingFunction(controlPoints: 0.42, 0, 0.2, 1)
+                caster.layer.add(pathAnimation, forKey: "shadowPath")
+            }
+        }
+
+        caster.frame = cardFrame
+        return caster
     }
 
     /// Publishes the stage role state (active flag + main window UUID) that the
@@ -680,7 +771,6 @@ class AppInfoProvider {
         // No stage on screen: the readout goes with it, and stops sampling frames nobody can see.
         fpsCounter.isCounting = false
         fpsCounter.isHidden = true
-        blockShadowView.isHidden = true
         // No stage on screen: every guest keeps its own touches again.
         publishStageRoles(active: false)
         UIView.animate(withDuration: 0.2, animations: {
@@ -692,6 +782,9 @@ class AppInfoProvider {
             guard !self.isStagePresented else { return }
             self.windowHostingView.isHidden = true
             self.dockHost?.view.isHidden = true
+            // The page surface leaves with the page rather than lingering invisibly under the
+            // launcher: the next entry clears the flag again on its way in.
+            self.stageBackdrop.isHidden = true
         })
     }
 
