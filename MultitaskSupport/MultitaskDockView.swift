@@ -278,6 +278,7 @@ class AppInfoProvider {
             self.buildLabel.textColor = .label
             self.buildLabel.alpha = 0.55
             self.buildLabel.isHidden = true
+            self.buildLabel.numberOfLines = 0
             self.updateBuildLabel()
             self.keyWindow?.addSubview(self.buildLabel)
             // The stage only becomes a page once a window exists, so it starts out hidden.
@@ -288,7 +289,17 @@ class AppInfoProvider {
 
     private func updateBuildLabel() {
         let commit = Bundle.main.object(forInfoDictionaryKey: "LCBuildCommit") as? String ?? ""
-        buildLabel.text = commit.isEmpty ? "build ?" : "build " + commit
+        let defaults = LCUtils.appGroupUserDefault
+        // Refresh the cross-process cache so the guests' once-per-second snapshots become visible.
+        defaults.synchronize()
+        var lines = [commit.isEmpty ? "build ?" : "build " + commit]
+        for (index, app) in apps.enumerated() {
+            let uuid = app.appUUID
+            let short = uuid.count > 8 ? String(uuid.prefix(8)) : uuid
+            let snapshot = defaults.string(forKey: "LCDiag." + uuid) ?? "nodata(TweakLoader not running)"
+            lines.append("[\(index)] \(short) \(snapshot)")
+        }
+        buildLabel.text = lines.joined(separator: "\n")
     }
 
     // MARK: - Stage layout
@@ -395,9 +406,9 @@ class AppInfoProvider {
 
             self.buildLabel.frame = CGRect(
                 x: safeArea.left + 10,
-                y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20,
-                width: 300,
-                height: 14
+                y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20 - 78,
+                width: 340,
+                height: 78
             )
         }
 
@@ -513,6 +524,8 @@ class AppInfoProvider {
             // Keep the role timestamp fresh even without layout changes.
             publishStageRoles(active: true)
         }
+        // Probe build: refresh the on-stage diagnostic panel with the guests' latest snapshots.
+        updateBuildLabel()
     }
 
     /// Called when an animated relayout changes the main window (fullscreen toggle, promotion

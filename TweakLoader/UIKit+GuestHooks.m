@@ -14,6 +14,36 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
                                         CFStringRef name, const void *object,
                                         CFDictionaryRef userInfo);
 
+// MARK: - Stage touch-chain diagnostics (probe build)
+//
+// Every guest piggybacks a one-line snapshot of the touch-interception chain on its heartbeat
+// timer (once per second). The host renders that line on the stage label, so one screenshot
+// pinpoints the broken link:
+//   hook=0             -> TweakLoader never reached the swizzle (or never ran in this process)
+//   hook=1 ev=0        -> hook installed, but this process never sees a touch event at all
+//   ev>0 ntf=0         -> touches arrive, but no role-state notification ever reached us
+//   act=1 mn=<other> side=0 -> role state arrives, yet the side-window verdict says NO
+//   side>0             -> quarantine armed; a touch down should have promoted the window
+static int LCDiagHookInstalled = 0;
+static int LCDiagEventCount = 0;
+static int LCDiagBeganCount = 0;
+static int LCDiagSideCount = 0;
+static int LCDiagNotifyCount = 0;
+
+static NSString *LCDiagShortUUID(NSString *uuid) {
+    return uuid.length > 8 ? [uuid substringToIndex:8] : uuid;
+}
+
+static NSString *LCDiagSnapshot(NSString *uuid) {
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    NSInteger active = [defaults boolForKey:LCStageIPCActiveKey] ? 1 : 0;
+    NSString *mainUUID = LCDiagShortUUID([defaults stringForKey:LCStageIPCMainUUIDKey] ?: @"-");
+    NSString *selfUUID = LCDiagShortUUID(uuid.length ? uuid : @"-");
+    return [NSString stringWithFormat:@"hook=%d ev=%d beg=%d side=%d ntf=%d act=%ld mn=%@ me=%@",
+            LCDiagHookInstalled, LCDiagEventCount, LCDiagBeganCount, LCDiagSideCount,
+            LCDiagNotifyCount, (long)active, mainUUID, selfUUID];
+}
+
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
     if(!NSUserDefaults.lcGuestAppId) return;
@@ -67,6 +97,8 @@ static void UIKitGuestHooksInit() {
         // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
         // required, unlike CACurrentMediaTime which lives in QuartzCore.
         [group setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
+        // Probe build: publish the touch-chain snapshot next to the heartbeat.
+        [group setObject:LCDiagSnapshot(dataUUID) forKey:[NSString stringWithFormat:@"LCDiag.%@", dataUUID]];
         [group synchronize];
     }];
     [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
@@ -88,6 +120,7 @@ static void UIKitGuestHooksInit() {
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
         swizzle(UIApplication.class, @selector(sendEvent:), @selector(hook_lcStage_sendEvent:));
+        LCDiagHookInstalled = 1;
     });
 }
 
@@ -95,6 +128,7 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
                                         CFStringRef name, const void *object,
                                         CFDictionaryRef userInfo) {
     // Pull the host's latest role state so the next sendEvent decision is fresh.
+    LCDiagNotifyCount++;
     [NSUserDefaults.lcSharedDefaults synchronize];
 }
 
@@ -105,20 +139,29 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
 @implementation UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event {
     if (event.type == UIEventTypeTouches) {
+        LCDiagEventCount++;
         static NSString *quarantineUUID = nil;
         static dispatch_once_t uuidOnce;
         dispatch_once(&uuidOnce, ^{
             quarantineUUID = [[NSUserDefaults.standardUserDefaults stringForKey:@"selectedContainer"] copy] ?: @"";
         });
+        BOOL hasBegan = NO;
+        for (UITouch *touch in event.allTouches) {
+            if (touch.phase == UITouchPhaseBegan) {
+                hasBegan = YES;
+                break;
+            }
+        }
+        if (hasBegan) {
+            LCDiagBeganCount++;
+        }
         if (LCStageGuestIsSideWindow(quarantineUUID)) {
+            LCDiagSideCount++;
             // A fresh touch down in a side window is a promote request. Every
             // event of the sequence (began/moved/ended) is dropped so the app
             // inside never reacts to it.
-            for (UITouch *touch in event.allTouches) {
-                if (touch.phase == UITouchPhaseBegan) {
-                    LCStageRequestPromote(quarantineUUID);
-                    break;
-                }
+            if (hasBegan) {
+                LCStageRequestPromote(quarantineUUID);
             }
             return;
         }
