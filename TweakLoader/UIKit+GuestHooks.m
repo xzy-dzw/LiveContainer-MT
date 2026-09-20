@@ -92,6 +92,29 @@ static void UIKitGuestHooksInit() {
             swizzle(UIWindow.class, @selector(setAutorotates:forceUpdateInterfaceOrientation:), @selector(hook_setAutorotates:forceUpdateInterfaceOrientation:));
         }
 
+        // MARK: - Guest heartbeat for dead-window cleanup
+
+        // Every guest process writes a timestamp to the shared App Group once per second. The
+        // host MultitaskDockManager reads this in performLayout: any window whose heartbeat has
+        // not moved for 10+ seconds is considered crashed/dead and gets removed from the stage
+        // immediately, instead of lingering as a black screen until the user relaunches it.
+        // This is the single most reliable cleanup signal — exit callbacks are asynchronous
+        // and silently dropped when the system SIGKILLs the extension under memory pressure.
+        LCGuestTouchDataUUID = [NSUserDefaults.standardUserDefaults objectForKey:@"selectedContainer"] ?: @"";
+        NSString *hbKey = [NSString stringWithFormat:@"LCGuestHeartbeat.%@", LCGuestTouchDataUUID.length ? LCGuestTouchDataUUID : @""];
+        __block NSTimer *heartbeatTimer = nil;
+        // Use +weak reference so the timer block doesn't retain anything — if NSTimer ever holds
+        // strong references to non-UI objects we don't care; we just want to fire every second.
+        heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
+            NSUserDefaults *group = [NSUserDefaults lcSharedDefaults];
+            // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
+            // required, unlike CACurrentMediaTime which lives in QuartzCore.
+            [group setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
+            [group synchronize];
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
+        NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", LCGuestTouchDataUUID, hbKey);
+
     }
 }
 

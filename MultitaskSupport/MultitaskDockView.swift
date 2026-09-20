@@ -163,9 +163,20 @@ class AppInfoProvider {
     private var lastSettledFullscreen: Bool?
     private var lastSettledMainUUID: String?
     /// True between arming a geometry commit and settling it. See armGeometryCommitIfNeeded().
-    private var pendingGeometryCommit = false
+    /// Replaced the old Bool flag with a generation counter: each relayout increments it, so
+    /// a stale settle callback (from an animation that finished after a newer one was armed) can
+    /// tell it's out of date and discard itself instead of clobbering the newer commit's state.
+    private var pendingGeometryGeneration: UInt = 0
+    /// The generation that settleAfterAnimation observed last time it ran. Used to detect
+    /// double-fires from overlapping animators (beginFromCurrentState + a second arm).
+    private var lastSettledGeneration: UInt = 0
     /// Snapshot cover that hides the touch-region re-registration blip at settle.
     private var geometryCommitCover: UIView?
+    /// True once we've kicked off a C2 offscreen re-registration for the side windows in the
+    /// current settleAfterAnimation. Used to guard against double-blips when pendingGeometry
+    /// gets re-armed mid-settle (the generation counter handles this too, but the flag catches
+    /// the case where a single settle tries to flip side-window foreground twice).
+    private var sideWindowRegistrationInFlight = false
 
     /// Runtime diagnostics shown in the build label: they prove on-device how far a side-window
     /// tap travels through the interception chain (seen by the UIApplication hook / the UIWindow
@@ -329,6 +340,36 @@ class AppInfoProvider {
 
         let update = { [weak self] in
             guard let self else { return }
+            // MARK: Dead-window cleanup via guest heartbeat
+
+            // Every guest process writes a timestamp to the App Group once per second (see
+            // UIKit+GuestHooks.m). If a window's heartbeat has not moved for 10+ seconds, the
+            // guest process is dead — either it crashed, got SIGKILLed under memory pressure, or
+            // never launched in the first place. Self-heal below only drops windows whose view
+            // is detached from the window hierarchy; a dead guest still has a visible (black)
+            // view, so the heartbeat check is the only signal that catches it reliably.
+            let now = CFAbsoluteTimeGetCurrent()
+            var deadUUIDs: Set<String> = []
+            for app in self.apps {
+                // Skip self-hosted (no separate guest process). Check heartbeat from App Group.
+                let hbKey = "LCGuestHeartbeat.\(app.appUUID)"
+                if let last = LCUtils.appGroupUserDefault.object(forKey: hbKey) as? Double {
+                    // 10-second deadline — heartbeat fires every 1s so this is generous enough
+                    // for transient scheduling delays but short enough to not linger as a black
+                    // screen after the user closes or relaunches.
+                    if now - last > 10 {
+                        deadUUIDs.insert(app.appUUID)
+                    }
+                } else {
+                    // No heartbeat at all: either a guest that hasn't started yet (safe to keep
+                    // waiting) or a self-hosted window (not applicable). Leave it alone.
+                }
+            }
+            if !deadUUIDs.isEmpty {
+                self.apps.removeAll { deadUUIDs.contains($0.appUUID) }
+                NSLog("[LCStage] heartbeat: removed \(deadUUIDs.count) dead window(s): \(deadUUIDs)")
+            }
+
             // Self-heal: a terminated window's view can be detached from the stage before its
             // model left the array (lost removal callback). Dropping detached models here lets
             // the next app slide into the main slot on this very layout pass instead of leaving
@@ -452,36 +493,134 @@ class AppInfoProvider {
         let changed = lastSettledFullscreen != isFullscreen
             || lastSettledMainUUID != apps.first?.appUUID
         guard changed else { return }
-        pendingGeometryCommit = true
+        pendingGeometryGeneration += 1
     }
 
     /// Runs once when the geometry animation has landed. The settled layout is re-applied without
-    /// animation, then the main window's hosted scene re-registers its system touch region with a
-    /// short foreground NO→YES blip. The blip blanks the scene for a moment, so the window is first
-    /// covered with a snapshot of its current content; the cover leaves once the scene has had time
-    /// to render a live frame at the final geometry, which reads as a gentle crossfade instead of
-    /// a flash — the same snapshot swap the system app switcher performs.
+    /// animation, then every window gets its system touch region pushed to the right spot:
+    ///
+    ///   - Main window → re-registered at its on-screen slot (so it stays interactive).
+    ///   - Side windows → re-registered at an off-screen CGRect. The window content still
+    ///     renders live in its side slot (the view frame is real), but the system touch region
+    ///     lives at {x = screenWidth + 100} so taps land nowhere in the visible stage and
+    ///     cascade down to the host process' normal hit-test chain where they are intercepted.
+    ///
+    /// This is Plan C2 — "register offscreen, display onscreen" — and it is the only known way
+    /// to satisfy "4 windows all live + side windows tappable without touching the app inside"
+    /// on iOS hosted scenes, since the system routes touches through a BackBoard region table
+    /// that bypasses UIKit hit-testing entirely.
+    ///
+    /// C2 depends on a single fragile assumption: the region table is only recomputed on
+    /// foreground transition, never on frame changes alone. If a future iOS changes this, the
+    /// whole mechanism silently stops working. We guard against that by centralising it here —
+    /// a fallback to Plan B (side windows backgrounded) is a one-line flip.
     private func settleAfterAnimation() {
         isLayoutAnimating = false
         performLayout(animated: false)
-        guard pendingGeometryCommit else { return }
-        pendingGeometryCommit = false
+        let currentGen = pendingGeometryGeneration
+        // Guard 1: generation counter. If the arm happened twice for the same settle (two
+        // overlapping animations arming before either settles), only the first settle runs the
+        // blip chain. The second settle sees a different generation and discards itself.
+        guard currentGen != lastSettledGeneration else { return }
+        // Guard 2: no arm at all. Happens when relayout is called without a fullscreen/promotion
+        // change (e.g. dock only relayouts, or device orientation while nothing moved). Skip.
+        guard currentGen > 0 else { return }
+        lastSettledGeneration = currentGen
+
         lastSettledFullscreen = isFullscreen
         lastSettledMainUUID = apps.first?.appUUID
-        guard let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController else { return }
+        sideWindowRegistrationInFlight = true
+
+        // Cover the main window for the main-slot blip (snapshot swap, same as before).
         coverMainWindowForGeometryCommit()
+        guard let main = apps.first?.view?._viewDelegate() as? DecoratedAppSceneViewController else { return }
+
+        // Step 1: main window. Move its touch region to its actual on-screen frame, blip NO→YES.
         main.appSceneVC.prepareHostedGeometryCommit()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            main.appSceneVC.finishHostedGeometryCommit()
-            guard let cover = self?.geometryCommitCover else { return }
-            self?.geometryCommitCover = nil
-            // Keep the cover until the re-foregrounded scene has rendered at the new geometry,
-            // then reveal it with a quick fade so any residual mismatch reads as a crossfade.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                UIView.animate(withDuration: 0.15, animations: { cover.alpha = 0 }) { _ in
-                    cover.removeFromSuperview()
+            guard let self = self else { return }
+            self.runMainWindowBlipCompletion(mainVC: main)
+            // Step 2: side windows. AFTER the main blip finishes (so snapshots don't collide),
+            // blip each side window's scene with its container moved off-screen for the duration
+            // of the foreground transition. The window renders live at its slot frame; only the
+            // system touch region moves.
+            self.runSideWindowOffscreenRegistrations()
+        }
+    }
+
+    /// Main window half of settleAfterAnimation — finish the blip, reveal the cover with fade.
+    private func runMainWindowBlipCompletion(mainVC: DecoratedAppSceneViewController) {
+        mainVC.appSceneVC.finishHostedGeometryCommit()
+        guard let cover = geometryCommitCover else { return }
+        geometryCommitCover = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            UIView.animate(withDuration: 0.15, animations: { cover.alpha = 0 }) { _ in
+                cover.removeFromSuperview()
+            }
+        }
+    }
+
+    /// For every side window (index > 0), re-register its system touch region at an off-screen
+    /// location. The view itself stays at its slot frame (live render keeps running), but the
+    /// system touch region moves to {screenWidth + 100} so taps land nowhere in the visible
+    /// stage and cascade into the host process where the sendEvent hook can intercept them.
+    ///
+    /// How: push scene frame to off-screen → foreground NO → wait → foreground YES → restore frame.
+    /// Each side window's scene is independent, so blips are serialised (one at a time) to keep
+    /// the total off-time short per app. A hard 100ms timeout on each flip prevents any side
+    /// window from getting stuck in NO state if the system doesn't acknowledge the transition.
+    private func runSideWindowOffscreenRegistrations() {
+        // Only the real side windows (index 1+). Skip the main window — its touch region is
+        // already correct after the main blip just above. Also skip fullscreen: there are no
+        // side slots when the main window owns the whole screen.
+        let sideApps = apps.dropFirst().enumerated().compactMap { (indexOffset, app) -> (String, DecoratedAppSceneViewController)? in
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { return nil }
+            return (app.appUUID, vc)
+        }
+        guard !sideApps.isEmpty else {
+            sideWindowRegistrationInFlight = false
+            return
+        }
+
+        // Compute a safe off-screen frame (outside both x and y of the stage) — we use the
+        // stage bounds so the area is cleanly outside the visible stage block.
+        let screenBounds = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds ?? UIScreen.main.bounds
+        let offscreenFrame = CGRect(x: screenBounds.width + 100, y: 0, width: 0, height: 0)
+
+        // Serialise blips — one per side window, each ~100ms. With at most 3 side windows this
+        // takes ~300ms total, well below the 1s heartbeat timeout so no fake "dead" windows.
+        var delay: TimeInterval = 0
+        for (_, vc) in sideApps {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self else { return }
+                // Step A: move scene frame to off-screen, push NO.
+                vc.appSceneVC.updateSettingsWithBlock { settings in
+                    settings.frame = offscreenFrame
+                    settings.peripheryInsets = UIEdgeInsets.zero
+                    settings.safeAreaInsetsPortrait = UIEdgeInsets.zero
+                    settings.foreground = false
+                }
+                // Step B: hard 100ms timeout — don't trust the foreground transition to finish
+                // promptly. If it hangs we still flip back after the deadline.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    guard let self = self else { return }
+                    // Step C: push YES back, let the system re-register with the off-screen frame.
+                    vc.appSceneVC.updateSettingsWithBlock { settings in
+                        settings.foreground = true
+                    }
+                    // Step D: restore the scene frame — updateSettingsWithBlock:nil re-pushes the
+                    // frame derived from view.frame (which is already at the correct side slot
+                    // after performLayout). The touch region stays where it was registered (off),
+                    // so we get "displayed on-screen, touched off-screen" = C2.
+                    vc.appSceneVC.updateFrameWithSettingsBlock(nil)
                 }
             }
+            delay += 0.12
+        }
+
+        // Reset the guard flag once all serialised blips are scheduled.
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.2) { [weak self] in
+            self?.sideWindowRegistrationInFlight = false
         }
     }
 
