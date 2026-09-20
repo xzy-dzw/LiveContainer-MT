@@ -61,8 +61,8 @@
     return self;
 }
 
-// The window itself carries no controls. The traffic lights live in the blank strip above the
-// main window and are owned by MultitaskDockManager, so the guest app gets the whole slot.
+// The window itself carries no controls. The single glass window menu lives in the blank strip
+// above the main window and is owned by MultitaskDockManager, so the guest app gets the whole slot.
 - (void)setupDecoratedView {
     UIView* container = self.view;
     // The stage lays every window out itself, so the window must never auto-resize on its own.

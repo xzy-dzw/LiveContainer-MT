@@ -2,8 +2,8 @@
 //  MultitaskStage.swift
 //  LiveContainer
 //
-//  1 main + 3 side window stage layout, macOS style window controls that live
-//  outside of the windows, and the floating shrink capsule used in fullscreen.
+//  1 main + 3 side window stage layout, and the single glass window control that
+//  lives in the blank strip above the main window, identical in fullscreen.
 //
 
 import Foundation
