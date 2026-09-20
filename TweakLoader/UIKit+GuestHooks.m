@@ -47,9 +47,12 @@ static NSString *LCDiagShortUUID(NSString *uuid) {
 
 /// File channel. Only active inside a guest-holding process: LCBootstrap sets LC_HOME_PATH
 /// for every process that takes over a guest app, and this dylib is always loaded afterwards.
+/// LCSharedUtils is looked up by name like everywhere else in this file: TweakLoader.dylib
+/// does not link against the LiveContainer library, so a direct class reference would be an
+/// undefined linker symbol.
 static void LCDiagWriteFile(NSString *uuid, NSString *text) {
     if (!getenv("LC_HOME_PATH")) { return; }
-    NSString *dir = [[[LCSharedUtils appGroupPath] URLByAppendingPathComponent:@"LCDiag"] path];
+    NSString *dir = [[[NSClassFromString(@"LCSharedUtils") appGroupPath] URLByAppendingPathComponent:@"LCDiag"] path];
     if (dir.length == 0) { return; }
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *name = [NSString stringWithFormat:@"%@.txt", uuid.length ? uuid : @"unknown"];
