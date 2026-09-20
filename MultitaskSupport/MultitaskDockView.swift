@@ -538,45 +538,55 @@ class AppInfoProvider {
     /// system touch region moves to {screenWidth + 100} so taps land nowhere in the visible
     /// stage and cascade into the host process where the sendEvent hook can intercept them.
     ///
-    /// How: push scene frame to off-screen → foreground NO → wait → foreground YES → restore frame.
-    /// Each side window's scene is independent, so blips are serialised (one at a time) to keep
-    /// the total off-time short per app. A hard 100ms timeout on each flip prevents any side
-    /// window from getting stuck in NO state if the system doesn't acknowledge the transition.
+    /// How (in AppSceneViewController.registerSceneTouchRegionAtFrame:visibleSlotFrame:):
+    ///   1. push scene frame to off-screen + foreground NO   → touch region registers here
+    ///   2. wait 50ms hard timeout (prevents stuck NO if system is slow)
+    ///   3. foreground YES + push visible slot frame         → scene renders back where it should
+    ///
+    /// The visible slot frame MUST be supplied here — we push it explicitly after YES instead of
+    /// relaying on view.frame being up-to-date at that moment. On the initial non-animated
+    /// relayout path, view.frame IS up-to-date (performLayout synchronously called applyStageFrame),
+    /// but calling register with it on YES guarantees the scene renders into the right spot
+    /// regardless of timing. This is what stopped the "zoom → shrink → side windows turn black"
+    /// regression — YES restores the scene's render target, not just its foreground state.
     private func runSideWindowOffscreenRegistrations() {
         // Only the real side windows (index 1+). Skip the main window — its touch region is
         // already correct after the main blip just above. Also skip fullscreen: there are no
         // side slots when the main window owns the whole screen.
-        let sideApps = apps.dropFirst().enumerated().compactMap { (indexOffset, app) -> (String, DecoratedAppSceneViewController)? in
-            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { return nil }
-            return (app.appUUID, vc)
-        }
-        guard !sideApps.isEmpty else {
+        guard !isFullscreen, apps.count > 1 else {
             sideWindowRegistrationInFlight = false
             return
         }
 
-        // Compute a safe off-screen frame (outside both x and y of the stage) — we use the
-        // stage bounds so the area is cleanly outside the visible stage block.
+        // Compute the per-window slot frames up-front so they can be passed into each C2 call.
+        // We compute them from MultitaskStageLayout directly — performLayout already ran with
+        // the settled `apps` array, so the frames match what's visible on screen.
+        let windowBounds = keyWindow?.bounds ?? UIScreen.main.bounds
+        let safeArea = keyWindow?.safeAreaInsets ?? UIEdgeInsets.zero
+        let count = apps.count
+
+        // A CGRect guaranteed to be outside both x and y of the stage — we put the touch region
+        // here so taps land nowhere in the visible stage and fall through to the host process.
         let screenBounds = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds ?? UIScreen.main.bounds
         let offscreenFrame = CGRect(x: screenBounds.width + 100, y: 0, width: 0, height: 0)
 
-        // Serialise blips — one per side window, each ~100ms. With at most 3 side windows this
-        // takes ~300ms total, well below the 1s heartbeat timeout so no fake "dead" windows.
+        // Serialise blips — one per side window, each ~50ms. With at most 3 side windows this
+        // takes ~150ms total, well below the 1s heartbeat timeout.
         var delay: TimeInterval = 0
-        for (_, vc) in sideApps {
+        for i in 1..<count {
+            guard let app = apps[i],
+                  let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            let visibleSlotFrame = MultitaskStageLayout.slotFrame(i, bounds: windowBounds, safeArea: safeArea)
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                // registerSceneTouchRegionAtFrame: is an ObjC helper that writes
-                // settings.frame directly (unaffected by SwiftUI's View.frame() collision)
-                // and runs the NO→YES blip internally with a 100ms timeout. SwiftUI's View.frame
-                // modifier collides so badly with UIMutableApplicationSceneSettings.frame that
-                // even AnyObject casts and KVC fail to compile; the ObjC bridge is the only way.
-                vc.appSceneVC.registerSceneTouchRegion(atFrame: offscreenFrame)
+                // ObjC selector registerSceneTouchRegionAtFrame:visibleSlotFrame: bridges into
+                // Swift as registerSceneTouchRegion(atFrame:visibleSlotFrame:) — note the
+                // SwiftUI-collision workaround (no 'frame' in the Swift signature).
+                vc.appSceneVC.registerSceneTouchRegion(atFrame: offscreenFrame, visibleSlotFrame: visibleSlotFrame)
             }
-            delay += 0.12
+            delay += 0.08
         }
 
-        // Reset the guard flag once all serialised blips are scheduled.
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.2) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + 0.15) { [weak self] in
             self?.sideWindowRegistrationInFlight = false
         }
     }
@@ -665,7 +675,25 @@ class AppInfoProvider {
             if first, UserDefaults.standard.bool(forKey: "LCLaunchMultitaskMaximized") {
                 self.isFullscreen = true
             }
+            // applyStageFrame pushes all view frames synchronously before this returns, so by the
+            // time we enter the next main queue frame every side window is already sitting at its
+            // correct visible slot — perfect timing for C2 offscreen touch-region registration.
             self.relayout(animated: false)
+            if self.apps.count >= 2 && !self.isFullscreen {
+                // After a non-animated relayout (addRunningApp path above, or initial dock setup),
+                // the settleAfterAnimation completion never fires — so C2 offscreen registration
+                // never runs. Result: side window touch regions stay at their visible slots,
+                // taps fall straight into the guest app's UIKit chain (touch penetration). Fix:
+                // run side-window C2 registration here, one frame after relayout, so every side
+                // window is immediately pulled off-screen for touch while keeping live content.
+                //
+                // We do NOT touch pendingGeometryGeneration — settleAfterAnimation's generation
+                // guard is irrelevant here (no animation completion to race against), and we
+                // re-use runSideWindowOffscreenRegistrations which checks isFullscreen first.
+                DispatchQueue.main.async { [weak self] in
+                    self?.runSideWindowOffscreenRegistrations()
+                }
+            }
         }
     }
 

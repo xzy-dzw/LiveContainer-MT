@@ -50,11 +50,11 @@ API_AVAILABLE(ios(16.0))
 /// Set foreground state on the hosted scene. Used to suspend side windows while the app is
 /// backgrounded (so iOS does not kill them for memory pressure) and to wake them back up.
 - (void)setHostedSceneForeground:(BOOL)foreground;
-/// Plan C2 helper: relocate the hosted scene's system touch region to the target CGRect via a
-/// frame push + NO→YES blip. The entire frame write lives in ObjC because SwiftUI's View.frame()
-/// modifier collides with UIMutableApplicationSceneSettings.frame in Swift even with explicit
-/// AnyObject casts. Swift-side MultitaskDockView calls this instead of touching settings.frame.
-- (void)registerSceneTouchRegionAtFrame:(CGRect)targetFrame;
+/// Plan C2 helper: relocate the hosted scene's system touch region to an off-screen CGRect
+/// (targetFrame) via a frame push + NO→YES blip, then restore it into visibleSlotFrame for
+/// rendering. The targetFrame is where the system touch region stays after registration, and
+/// visibleSlotFrame is where the scene actually renders live content.
+- (void)registerSceneTouchRegionAtFrame:(CGRect)targetFrame visibleSlotFrame:(CGRect)visibleSlotFrame;
 - (BOOL)usesHostingControllerAPI;
 @end
 

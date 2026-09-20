@@ -445,33 +445,44 @@
     }];
 }
 
-/// Plan C2 helper: push the hosted scene's system touch region to an arbitrary CGRect by
-/// relocating the scene frame and running a foreground NO→YES blip. Used from Swift-side
-/// MultitaskDockView.swift with an off-screen CGRect for side-window touch-region registration
-/// — SwiftUI's View.frame() modifier collides with UIMutableApplicationSceneSettings.frame so
-/// badly that we cannot write `settings.frame = value` from Swift at all. Doing the frame write
-/// in ObjC avoids the collision entirely.
+/// Plan C2 helper: relocate the hosted scene's system touch region to an arbitrary off-screen
+/// rect by relocating the scene frame and running a foreground NO→YES blip, then restore the
+/// scene frame to its real visible slot.
 ///
-/// Sequence (all on the main thread, serialised by the caller):
-///   1. pushSceneFrame:foreground=NO — registers the system touch region at the target rect
-///   2. wait 100ms hard timeout (prevents stuck NO if the system is slow)
-///   3. foreground=YES — restores activity
-///   4. nil settings block — re-pushes the view.frame-derived frame (the view is already at the
-///      correct side-slot frame from performLayout; we only care about the system touch region
-///      which stays registered where step 1 put it = off-screen = C2)
-- (void)registerSceneTouchRegionAtFrame:(CGRect)targetFrame {
+/// Parameter targetFrame: off-screen CGRect where we want the system touch region registered
+///   (e.g. {x = screenWidth + 100, y = 0}).
+/// Parameter visibleSlotFrame: on-screen CGRect the scene must render into after the blip
+///   (e.g. the side slot from MultitaskStageLayout). We push this frame explicitly after YES
+///   instead of relying on view.frame — the view.frame might not be up to date when C2 runs from
+///   a synchronous relayout (initial enter case), and the previous nil-block path silently
+///   re-pushed an old frame which left the scene black.
+///
+/// The NO→YES blip is the only reliable trigger for BackBoard to re-compute the hosted-scene
+/// touch region table. Keeping foreground=YES throughout and just moving the frame does NOT
+/// trigger that re-registration — so we MUST do the blip, but we recover the scene into the
+/// correct visible frame immediately after, which is what stops the black screen.
+- (void)registerSceneTouchRegionAtFrame:(CGRect)targetFrame visibleSlotFrame:(CGRect)visibleSlotFrame {
     if (!self.presenter || _shouldIgnoreSceneUpdates) { return; }
+    // Step A: push scene frame to off-screen + foreground NO. Touch region registers here.
     [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
         settings.frame = targetFrame;
         settings.peripheryInsets = UIEdgeInsetsZero;
         settings.safeAreaInsetsPortrait = UIEdgeInsetsZero;
         settings.foreground = NO;
     }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Step B: 50ms (down from 100ms) — shorter than before, so NO freezes the render pipeline
+    // for less time. If the system acknowledges NO promptly, step C runs right after; if not,
+    // the hard 50ms deadline still flips YES before the guest gets killed under memory pressure.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Step C: foreground YES + immediately push visible frame. YES lets the system know the
+        // scene is active again; the visible frame makes the render pipeline start drawing into
+        // the right spot instead of relying on view.frame being up-to-date at this moment.
         [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+            settings.frame = visibleSlotFrame;
+            settings.peripheryInsets = UIEdgeInsetsZero;
+            settings.safeAreaInsetsPortrait = UIEdgeInsetsZero;
             settings.foreground = YES;
         }];
-        [self updateFrameWithSettingsBlock:nil];
     });
 }
 
