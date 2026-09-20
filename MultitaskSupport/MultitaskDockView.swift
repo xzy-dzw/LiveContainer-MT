@@ -594,13 +594,15 @@ class AppInfoProvider {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self = self else { return }
                 // Step A: move scene frame to off-screen, push NO.
-                // Explicit (UIMutableApplicationSceneSettings) type annotation is mandatory
+                // Explicit (UIMutableApplicationSceneSettings?) type annotation is mandatory
                 // here: SwiftUI's View.frame() collides with UIMutableApplicationSceneSettings.frame,
                 // and without the annotation the compiler picks SwiftUI's View modifier and then
                 // complains "cannot assign CGRect to () -> some View". All other properties
                 // (peripheryInsets, safeAreaInsetsPortrait, foreground) have no SwiftUI twin so
                 // they are fine with type inference — only frame needs the disambiguation.
-                vc.appSceneVC.updateSettingsWithBlock { (settings: UIMutableApplicationSceneSettings) in
+                // The block parameter is Optional because ObjC id * bridges to Swift Optional.
+                vc.appSceneVC.updateSettingsWithBlock { (settings: UIMutableApplicationSceneSettings?) in
+                    guard let settings else { return }
                     settings.frame = offscreenFrame
                     settings.peripheryInsets = .zero
                     settings.safeAreaInsetsPortrait = .zero
