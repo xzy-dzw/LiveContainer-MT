@@ -248,6 +248,14 @@ class LCAppModel: ObservableObject, Hashable {
 //            throw "lc.container.inUse".loc + "\n MultiTask"
 //        }
         
+        // A leftover guest process of this app (its window was dropped without terminating the
+        // process) keeps the container registered, and LCBootstrap refuses to run an app whose
+        // container is already held: the new guest bails out and the window stays black while the
+        // leftover keeps playing audio. Reap it here, before the guest is spawned below.
+        if let fn = uiSelectedContainer?.folderName {
+            _ = MultitaskManager.reapOrphanedGuest(holdingContainer: fn)
+        }
+        
         // if the selected container is in use (either other lc or multitask), open the host lc associated with it
         if
             let fn = uiSelectedContainer?.folderName,

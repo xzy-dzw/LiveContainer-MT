@@ -448,6 +448,13 @@
     return _hostingController != nil;
 }
 
+- (NSString *)stageDiagnostics {
+    CGSize size = self.contentView ? self.contentView.bounds.size : CGSizeZero;
+    BOOL hasContentSize = size.width > 1 && size.height > 1;
+    return [NSString stringWithFormat:@"hp%d pv%d cv%d %@", self.pid, self.presenter != nil ? 1 : 0,
+            hasContentSize ? 1 : 0, self.isAppRunning ? @"live" : @"dead"];
+}
+
 - (void)setHostedSceneForeground:(BOOL)foreground {
     if(!self.presenter || _shouldIgnoreSceneUpdates) { return; }
     [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {

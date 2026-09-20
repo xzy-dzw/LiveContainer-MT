@@ -57,5 +57,11 @@ API_AVAILABLE(ios(16.0))
 /// cancellation error the extension reports on the way out.
 @property(nonatomic, assign) BOOL terminationRequested;
 - (BOOL)usesHostingControllerAPI;
+/// Compact one-line state of the hosted scene, rendered on the stage's diagnostic label next to
+/// the guest's own snapshot. "hp<pid>" is the pid this scene was created for; comparing it with
+/// the guest's own "p<pid>" proves whether the scene really hosts the process that runs the app,
+/// and "pv/cv" tell whether the scene and its content view survived (a black window with a live
+/// guest is either pv0 or cv0).
+- (NSString *)stageDiagnostics;
 @end
 

@@ -116,6 +116,10 @@ class AppInfoProvider {
     @objc let appUUID: String
     let appInfo: LCAppInfo?
     let view: UIView?
+    /// When this window entered the stage. The watchdog never judges a window that is still
+    /// inside the guest-start grace window (see pruneDeadWindows(allowHeartbeatPrune:)): a
+    /// freshly launched guest needs a moment before it writes its first heartbeat.
+    let addedAt = Date()
     
     init(appName: String, appUUID: String, appInfo: LCAppInfo? = nil, view: UIView?) {
         self.appName = appName
@@ -274,7 +278,7 @@ class AppInfoProvider {
 
             // Build marker: shows the stamped commit so the package on device is unmistakable,
             // plus the live diagnostic counters that trace the touch interception chain.
-            self.buildLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            self.buildLabel.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
             self.buildLabel.textColor = .label
             self.buildLabel.alpha = 0.55
             self.buildLabel.isHidden = true
@@ -312,6 +316,14 @@ class AppInfoProvider {
         for (index, app) in apps.enumerated() {
             let uuid = app.appUUID
             let short = uuid.count > 8 ? String(uuid.prefix(8)) : uuid
+            // Host side of the chain: hp = the pid the host launched the guest scene with,
+            // pv = the scene presenter exists, cv = contentView has a usable size. A black
+            // window without audio is pv0/cv0; a black window whose guest is a *different*
+            // process shows hp different from the guest's own p.
+            var hostDiag = "no-view"
+            if let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController {
+                hostDiag = vc.appSceneVC.stageDiagnostics()
+            }
             var parts: [String] = []
             if let file = readDiagFile(uuid + ".txt") {
                 parts.append(file)
@@ -319,7 +331,7 @@ class AppInfoProvider {
             if let ud = defaults.string(forKey: "LCDiag." + uuid) {
                 parts.append(parts.isEmpty ? "ud:" + ud : "ud✓")
             }
-            lines.append("[\(index)] \(short) \(parts.isEmpty ? "nodata" : parts.joined(separator: " "))")
+            lines.append("[\(index)] \(short) \(hostDiag) | \(parts.isEmpty ? "nodata" : parts.joined(separator: " "))")
         }
 
         // A diag file not claimed by any window means the guest resolved a different UUID
@@ -347,6 +359,10 @@ class AppInfoProvider {
         let bounds = window.bounds
         let safeArea = window.safeAreaInsets
         let count = apps.count
+
+        // Whatever a previous teardown left in the hierarchy must never cover the windows that
+        // are live right now — this also runs on the way out, when the last window closed.
+        removeOrphanWindowViews()
 
         guard count > 0 else {
             // Last window closed: leave the stage page and go back to the launcher. The dock,
@@ -438,9 +454,9 @@ class AppInfoProvider {
 
             self.buildLabel.frame = CGRect(
                 x: safeArea.left + 10,
-                y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20 - 92,
-                width: 340,
-                height: 92
+                y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20 - 110,
+                width: 400,
+                height: 110
             )
         }
 
@@ -504,42 +520,112 @@ class AppInfoProvider {
         LCStagePublishRoles(active, active ? apps.first?.appUUID : nil)
     }
 
-    /// Removes windows whose guest process is dead (heartbeat stale) or whose
-    /// view was detached without a matching model removal (lost exit callback).
+    /// A window whose guest never wrote a single heartbeat once it is older than this is not
+    /// "still starting" any more: TweakLoader (the only writer of the heartbeat) loads as part
+    /// of the guest's own dlopen, i.e. well before the app's main() runs. No heartbeat therefore
+    /// means either the guest bailed out in LCBootstrap (another process still held its
+    /// container) or it died on the way up — both leave a black window that only a teardown can
+    /// clear, and an orphan process that still holds the container.
+    private static let guestStartGrace: TimeInterval = 20
+
+    /// Removes windows whose guest process is dead (heartbeat stale), whose guest never came up
+    /// at all, or whose view was detached without a matching model removal (lost exit callback).
+    ///
+    /// Every removal goes through tearDownWindow(_:reason:): dropping the model alone used to
+    /// leave a live guest behind, which then kept playing audio, kept its view in the hierarchy
+    /// (a black card on top of the other windows) and kept the app's container lock — making the
+    /// next launch of that app bail out into another black window.
     @discardableResult
     private func pruneDeadWindows(allowHeartbeatPrune: Bool = true) -> Bool {
-        var changed = false
-        let now = CFAbsoluteTimeGetCurrent()
+        let now = Date()
         var deadUUIDs: Set<String> = []
         if allowHeartbeatPrune {
+            let absoluteNow = CFAbsoluteTimeGetCurrent()
             for app in apps {
+                // A window that just entered the stage is never pruned: its guest still has to
+                // boot, and the heartbeat key may hold a previous run's timestamp until the new
+                // guest writes its own (write-addressed keys survive in the App Group).
+                guard now.timeIntervalSince(app.addedAt) > Self.guestStartGrace else { continue }
+
                 // Every guest writes a heartbeat once per second (UIKit+GuestHooks.m).
                 let hbKey = "LCGuestHeartbeat.\(app.appUUID)"
                 if let last = LCUtils.appGroupUserDefault.object(forKey: hbKey) as? Double {
                     // 10-second deadline: generous for scheduling delays, short
                     // enough to not linger as a black card after close/crash.
-                    if now - last > 10 {
+                    if absoluteNow - last > 10 {
                         deadUUIDs.insert(app.appUUID)
                     }
+                } else if app.appInfo?.dontInjectTweakLoader != true {
+                    // No heartbeat at all after the grace window: the guest never ran the app.
+                    deadUUIDs.insert(app.appUUID)
                 }
-                // No heartbeat at all: guest still starting (or self-hosted) — keep.
             }
-        }
-        if !deadUUIDs.isEmpty {
-            apps.removeAll { deadUUIDs.contains($0.appUUID) }
-            if apps.isEmpty { isFullscreen = false }
-            NSLog("[LCStage] heartbeat: removed \(deadUUIDs.count) dead window(s): \(deadUUIDs)")
-            changed = true
         }
 
         // A terminated window's view can be detached before its model left the
         // array (lost removal callback).
-        if apps.contains(where: { $0.view?.window == nil }) {
-            let before = apps.count
-            apps.removeAll { $0.view?.window == nil }
-            if apps.count != before { changed = true }
+        for app in apps where app.view?.window == nil {
+            deadUUIDs.insert(app.appUUID)
         }
-        return changed
+
+        guard !deadUUIDs.isEmpty else { return false }
+        NSLog("[LCStage] pruning \(deadUUIDs.count) window(s): \(deadUUIDs)")
+        for uuid in deadUUIDs {
+            tearDownWindow(uuid, reason: "unresponsive guest")
+        }
+        return true
+    }
+
+    /// Removes a window completely: terminates the guest process (which also destroys its hosted
+    /// scene and clears the container lock), detaches its view from the stage and drops the
+    /// model. The window removal callback is idempotent, so it is harmless when the extension
+    /// reports the exit as well — and it is the only thing that runs when that callback is lost.
+    private func tearDownWindow(_ appUUID: String, reason: String) {
+        guard let index = apps.firstIndex(where: { $0.appUUID == appUUID }) else { return }
+        let app = apps[index]
+        NSLog("[LCStage] tearing down window \(appUUID) (\(reason))")
+        apps.remove(at: index)
+        if index == 0, !apps.isEmpty {
+            isFullscreen = false
+        }
+        if let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController {
+            // Terminate the guest process, then tear its scene down unconditionally: the
+            // extension's cancellation/interruption callbacks are dropped by the system now and
+            // then, and a guest that survives without a window is exactly the orphan that makes
+            // every later launch of this app come up black.
+            vc.closeWindow()
+            vc.appSceneVC.appTerminationCleanUp()
+        }
+        app.view?.removeFromSuperview()
+        // The guest is gone (or going): its heartbeat must not survive or the next window of the
+        // same app would be pruned by a stale timestamp as soon as the grace window ends.
+        clearStaleGuestState(appUUID)
+    }
+
+    /// Drops every per-guest trace of a previous run of this container, so a brand-new window
+    /// can never be judged by an earlier process's heartbeat or diagnostics.
+    private func clearStaleGuestState(_ appUUID: String) {
+        guard !appUUID.isEmpty else { return }
+        let defaults = LCUtils.appGroupUserDefault
+        defaults.removeObject(forKey: "LCGuestHeartbeat.\(appUUID)")
+        defaults.removeObject(forKey: "LCDiag.\(appUUID)")
+        defaults.synchronize()
+        if let dir = LCSharedUtils.appGroupPath()?.appendingPathComponent("LCDiag").path {
+            try? FileManager.default.removeItem(atPath: (dir as NSString).appendingPathComponent(appUUID + ".txt"))
+        }
+    }
+
+    /// Window views that no longer belong to a running app are leftovers of a teardown that did
+    /// not detach them (or of the probe builds' model-only pruning). Left in place they sit on
+    /// top of the live windows as black cards, so they are dropped with every layout pass.
+    private func removeOrphanWindowViews() {
+        for subview in windowHostingView.subviews {
+            guard subview._viewDelegate() != nil else { continue }
+            if !apps.contains(where: { $0.view === subview }) {
+                NSLog("[LCStage] dropping orphan window view \(type(of: subview))")
+                subview.removeFromSuperview()
+            }
+        }
     }
 
     /// Runs once per second, independent of any layout trigger, so a lost exit
@@ -719,7 +805,16 @@ class AppInfoProvider {
         let appName = appInfo?.displayName() ?? "Unknown App"
         let appModel = DockAppModel(appName: appName, appUUID: appUUID, appInfo: appInfo, view: view)
 
-        DispatchQueue.main.async {
+        // The model has to land in `apps` in the same runloop turn as the window view: the view is
+        // already added to the hosting hierarchy by the time this is called
+        // (DecoratedAppSceneViewController.init), and a layout pass racing in between would see a
+        // window view without a model and drop it as an orphan. Callers are on the main thread,
+        // so the insertion normally happens inline; the dispatch is only a fallback.
+        let insertWindow = {
+            // A window that enters the stage must never inherit the previous run's traces of the
+            // same container: a leftover heartbeat timestamp used to prune the fresh window in
+            // the very first watchdog tick, long before its guest could write its own.
+            self.clearStaleGuestState(appUUID)
             // New apps always enter the main slot (head of the array); any previous main window
             // slides down to a side slot. This matches the "open on the main slot" behaviour
             // users expect from a dock, instead of every new app landing as a side card.
@@ -745,6 +840,11 @@ class AppInfoProvider {
             DispatchQueue.main.async { [weak self] in
                 self?.runTouchRegionCommit(forceMainBlip: true)
             }
+        }
+        if Thread.isMainThread {
+            insertWindow()
+        } else {
+            DispatchQueue.main.async(execute: insertWindow)
         }
     }
 

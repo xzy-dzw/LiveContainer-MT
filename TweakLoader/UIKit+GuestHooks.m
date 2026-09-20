@@ -4,6 +4,7 @@
 #import "../LiveContainer/utils.h"
 #import "../MultitaskSupport/LCStageIPC.h"
 #import <LocalAuthentication/LocalAuthentication.h>
+#import <unistd.h>
 #import "Localization.h"
 
 UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
@@ -21,7 +22,12 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
 // pinpoints the broken link. Compact legend:
 //   h = sendEvent hook installed   e = touch events seen   b = began-phase events
 //   s = swallows (verdict said YES)   n = role notifications received
-//   a = LCStageActive as *this guest* reads it   M = main UUID (8)   S = self UUID (8)
+//   a = LCStageActive as *this guest* reads it   p = this process's pid
+//   M = main UUID (8)   S = self UUID (8)
+//   The host prints its own "hp<pid> pv<scene> cv<contentview>" in front of this line, so a
+//   black window can be told apart: hp != p means the scene hosts a different process than the
+//   one running the app (the guest bailed out in LCBootstrap), pv0/cv0 means the scene or its
+//   content view is gone.
 //   no data / "boot" only -> TweakLoader never loaded into this guest
 //   "ctor bail"          -> dylib loaded, but lcGuestAppId was nil (hooks skipped entirely)
 //   h1 e0                -> hook installed, yet no touch event ever reaches this process
@@ -80,9 +86,9 @@ static NSString *LCDiagSnapshot(void) {
     NSInteger active = [defaults boolForKey:LCStageIPCActiveKey] ? 1 : 0;
     NSString *mainUUID = LCDiagShortUUID([defaults stringForKey:LCStageIPCMainUUIDKey] ?: @"-");
     NSString *selfUUID = LCDiagShortUUID(LCDiagDataUUID.length ? LCDiagDataUUID : @"-");
-    return [NSString stringWithFormat:@"h%d e%d b%d s%d n%d a%ld M%@ S%@",
+    return [NSString stringWithFormat:@"h%d e%d b%d s%d n%d a%ld p%d M%@ S%@",
             LCDiagHookInstalled, LCDiagEventCount, LCDiagBeganCount, LCDiagSideCount,
-            LCDiagNotifyCount, (long)active, mainUUID, selfUUID];
+            LCDiagNotifyCount, (long)active, getpid(), mainUUID, selfUUID];
 }
 
 __attribute__((constructor))
@@ -138,6 +144,12 @@ static void UIKitGuestHooksInit() {
     // and silently dropped when the system SIGKILLs the extension under memory pressure.
     NSString *dataUUID = LCDiagDataUUID;
     NSString *hbKey = [NSString stringWithFormat:@"LCGuestHeartbeat.%@", dataUUID.length ? dataUUID : @""];
+    // Beat once right now, before the timer: loading this dylib is itself the proof that the
+    // guest really launched the app (a guest that bailed out in LCBootstrap never gets here), and
+    // the host's watchdog must not have to wait a whole timer period to see that liveness.
+    NSUserDefaults *groupDefaults = [NSUserDefaults lcSharedDefaults];
+    [groupDefaults setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
+    [groupDefaults synchronize];
     __block NSTimer *heartbeatTimer = nil;
     // Use +weak reference so the timer block doesn't retain anything — if NSTimer ever holds
     // strong references to non-UI objects we don't care; we just want to fire every second.
