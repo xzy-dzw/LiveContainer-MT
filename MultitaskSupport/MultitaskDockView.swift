@@ -591,38 +591,13 @@ class AppInfoProvider {
         // takes ~300ms total, well below the 1s heartbeat timeout so no fake "dead" windows.
         var delay: TimeInterval = 0
         for (_, vc) in sideApps {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self = self else { return }
-                // Step A: move scene frame to off-screen, push NO.
-                // SwiftUI's View.frame() collides with UIMutableApplicationSceneSettings.frame
-                // so badly that even an explicit Optional type annotation cannot convince the
-                // compiler to pick the ObjC property — it still resolves 'frame' on Optional to
-                // SwiftUI's View.frame() conditional-conformance method. Casting to AnyObject
-                // routes through ObjC runtime but Swift only knows NSObject.frame as read-only.
-                // KVC setValue(_:forKey:) is the final escape hatch — it invokes the ObjC setter
-                // via objc_msgSend('setFrame:', offscreenFrame) at runtime, bypassing all
-                // compile-time type checks.
-                vc.appSceneVC.updateSettingsWithBlock { (settings: UIMutableApplicationSceneSettings?) in
-                    guard let settings else { return }
-                    (settings as AnyObject).setValue(NSValue(cgRect: offscreenFrame), forKey: "frame")
-                    settings.peripheryInsets = .zero
-                    settings.safeAreaInsetsPortrait = .zero
-                    settings.foreground = false
-                }
-                // Step B: hard 100ms timeout — don't trust the foreground transition to finish
-                // promptly. If it hangs we still flip back after the deadline.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                    guard let self = self else { return }
-                    // Step C: push YES back, let the system re-register with the off-screen frame.
-                    vc.appSceneVC.updateSettingsWithBlock { settings in
-                        settings.foreground = true
-                    }
-                    // Step D: restore the scene frame — updateSettingsWithBlock:nil re-pushes the
-                    // frame derived from view.frame (which is already at the correct side slot
-                    // after performLayout). The touch region stays where it was registered (off),
-                    // so we get "displayed on-screen, touched off-screen" = C2.
-                    vc.appSceneVC.updateFrameWithSettingsBlock(nil)
-                }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                // registerSceneTouchRegionAtFrame: is an ObjC helper that writes
+                // settings.frame directly (unaffected by SwiftUI's View.frame() collision)
+                // and runs the NO→YES blip internally with a 100ms timeout. SwiftUI's View.frame
+                // modifier collides so badly with UIMutableApplicationSceneSettings.frame that
+                // even AnyObject casts and KVC fail to compile; the ObjC bridge is the only way.
+                vc.appSceneVC.registerSceneTouchRegion(at: offscreenFrame)
             }
             delay += 0.12
         }

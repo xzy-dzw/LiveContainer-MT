@@ -445,6 +445,36 @@
     }];
 }
 
+/// Plan C2 helper: push the hosted scene's system touch region to an arbitrary CGRect by
+/// relocating the scene frame and running a foreground NO→YES blip. Used from Swift-side
+/// MultitaskDockView.swift with an off-screen CGRect for side-window touch-region registration
+/// — SwiftUI's View.frame() modifier collides with UIMutableApplicationSceneSettings.frame so
+/// badly that we cannot write `settings.frame = value` from Swift at all. Doing the frame write
+/// in ObjC avoids the collision entirely.
+///
+/// Sequence (all on the main thread, serialised by the caller):
+///   1. pushSceneFrame:foreground=NO — registers the system touch region at the target rect
+///   2. wait 100ms hard timeout (prevents stuck NO if the system is slow)
+///   3. foreground=YES — restores activity
+///   4. nil settings block — re-pushes the view.frame-derived frame (the view is already at the
+///      correct side-slot frame from performLayout; we only care about the system touch region
+///      which stays registered where step 1 put it = off-screen = C2)
+- (void)registerSceneTouchRegionAtFrame:(CGRect)targetFrame {
+    if (!self.presenter || _shouldIgnoreSceneUpdates) { return; }
+    [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+        settings.frame = targetFrame;
+        settings.peripheryInsets = UIEdgeInsetsZero;
+        settings.safeAreaInsetsPortrait = UIEdgeInsetsZero;
+        settings.foreground = NO;
+    }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+            settings.foreground = YES;
+        }];
+        [self updateFrameWithSettingsBlock:nil];
+    });
+}
+
 /// The hosted scene's system touch region only re-registers on a foreground transition:
 /// transform and bounds changes alone never trigger it on iOS 26, which left the main window
 /// untouchable after a fullscreen toggle until the user went to the home screen and back (a
