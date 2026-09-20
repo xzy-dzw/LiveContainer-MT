@@ -293,11 +293,43 @@ class AppInfoProvider {
         // Refresh the cross-process cache so the guests' once-per-second snapshots become visible.
         defaults.synchronize()
         var lines = [commit.isEmpty ? "build ?" : "build " + commit]
+
+        // Each window is probed through two channels: a file in the App Group container
+        // (`LCDiag/<uuid>.txt`, immune to CFPreferences quirks) and the defaults key
+        // `LCDiag.<uuid>` — the very channel the quarantine IPC uses. Showing both makes it
+        // obvious which one breaks: "boot ... only" means TweakLoader never loaded,
+        // "ctor bail" means it loaded but bailed, "ud✓" confirms the defaults channel works.
+        let diagDir = LCSharedUtils.appGroupPath()?.appendingPathComponent("LCDiag").path
+        var matchedFiles = Set<String>()
+        func readDiagFile(_ name: String) -> String? {
+            guard let diagDir,
+                  let data = FileManager.default.contents(atPath: (diagDir as NSString).appendingPathComponent(name)),
+                  let text = String(data: data, encoding: .utf8) else { return nil }
+            matchedFiles.insert(name)
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
         for (index, app) in apps.enumerated() {
             let uuid = app.appUUID
             let short = uuid.count > 8 ? String(uuid.prefix(8)) : uuid
-            let snapshot = defaults.string(forKey: "LCDiag." + uuid) ?? "nodata(TweakLoader not running)"
-            lines.append("[\(index)] \(short) \(snapshot)")
+            var parts: [String] = []
+            if let file = readDiagFile(uuid + ".txt") {
+                parts.append(file)
+            }
+            if let ud = defaults.string(forKey: "LCDiag." + uuid) {
+                parts.append(parts.isEmpty ? "ud:" + ud : "ud✓")
+            }
+            lines.append("[\(index)] \(short) \(parts.isEmpty ? "nodata" : parts.joined(separator: " "))")
+        }
+
+        // A diag file not claimed by any window means the guest resolved a different UUID
+        // than the host registered the window with, so the mismatch stays visible.
+        if let diagDir, let files = try? FileManager.default.contentsOfDirectory(atPath: diagDir) {
+            for file in files.sorted() where file.hasSuffix(".txt") && !matchedFiles.contains(file) {
+                if lines.count >= 7 { break }
+                let text = (readDiagFile(file) ?? "?")
+                lines.append("[?] \(file) \(text)")
+            }
         }
         buildLabel.text = lines.joined(separator: "\n")
     }
@@ -406,9 +438,9 @@ class AppInfoProvider {
 
             self.buildLabel.frame = CGRect(
                 x: safeArea.left + 10,
-                y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20 - 78,
+                y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20 - 92,
                 width: 340,
-                height: 78
+                height: 92
             )
         }
 

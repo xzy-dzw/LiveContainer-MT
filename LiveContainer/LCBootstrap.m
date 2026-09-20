@@ -484,6 +484,18 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     NSString* containerInfoPath = [newHomePath stringByAppendingPathComponent:@"LCContainerInfo.plist"];
     guestContainerInfo = [NSDictionary dictionaryWithContentsOfFile:containerInfoPath];
     
+    // Probe (multitask touch chain): ground-truth stamp proving this guest process booted for
+    // this container. It lives in a file inside the App Group so it stays readable even if the
+    // dylib never loads, and even though the guest's CFPreferences domain gets redirected.
+    // TweakLoader overwrites it with a live snapshot once per second.
+    {
+        NSString *diagDir = [[[LCSharedUtils appGroupPath] URLByAppendingPathComponent:@"LCDiag"] path];
+        [[NSFileManager defaultManager] createDirectoryAtPath:diagDir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSString *stamp = [NSString stringWithFormat:@"boot pid=%d", getpid()];
+        [stamp writeToFile:[diagDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.txt", dataUUID]]
+                atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    
     [LCSharedUtils setContainerUsingByLC:lcAppUrlScheme folderName:dataUUID auditToken:0];
 
     // Overwrite NSBundle
