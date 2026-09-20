@@ -143,8 +143,6 @@ class AppInfoProvider {
 
     private var dockHost: UIHostingController<AnyView>?
     private let controls = MultitaskStageControlsView(frame: .zero)
-    /// Tiny build marker shown on the stage so the exact commit running on device is obvious.
-    private let buildLabel = UILabel()
 
     /// Highest-level invisible window that routes touches for the stage. Side-window touches are
     /// captured in UIApplication.sendEvent (hooked in UIKitHooks.m), because the system-level
@@ -276,74 +274,10 @@ class AppInfoProvider {
             self.keyWindow?.addSubview(host.view)
             self.dockHost = host
 
-            // Build marker: shows the stamped commit so the package on device is unmistakable,
-            // plus the live diagnostic counters that trace the touch interception chain.
-            self.buildLabel.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
-            self.buildLabel.textColor = .label
-            self.buildLabel.alpha = 0.55
-            self.buildLabel.isHidden = true
-            self.buildLabel.numberOfLines = 0
-            self.updateBuildLabel()
-            self.keyWindow?.addSubview(self.buildLabel)
             // The stage only becomes a page once a window exists, so it starts out hidden.
             self.windowHostingView.isHidden = true
             self.performLayout(animated: false)
         }
-    }
-
-    private func updateBuildLabel() {
-        let commit = Bundle.main.object(forInfoDictionaryKey: "LCBuildCommit") as? String ?? ""
-        let defaults = LCUtils.appGroupUserDefault
-        // Refresh the cross-process cache so the guests' once-per-second snapshots become visible.
-        defaults.synchronize()
-        var lines = [commit.isEmpty ? "build ?" : "build " + commit]
-
-        // Each window is probed through two channels: a file in the App Group container
-        // (`LCDiag/<uuid>.txt`, immune to CFPreferences quirks) and the defaults key
-        // `LCDiag.<uuid>` — the very channel the quarantine IPC uses. Showing both makes it
-        // obvious which one breaks: "boot ... only" means TweakLoader never loaded,
-        // "ctor bail" means it loaded but bailed, "ud✓" confirms the defaults channel works.
-        let diagDir = LCSharedUtils.appGroupPath()?.appendingPathComponent("LCDiag").path
-        var matchedFiles = Set<String>()
-        func readDiagFile(_ name: String) -> String? {
-            guard let diagDir,
-                  let data = FileManager.default.contents(atPath: (diagDir as NSString).appendingPathComponent(name)),
-                  let text = String(data: data, encoding: .utf8) else { return nil }
-            matchedFiles.insert(name)
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        for (index, app) in apps.enumerated() {
-            let uuid = app.appUUID
-            let short = uuid.count > 8 ? String(uuid.prefix(8)) : uuid
-            // Host side of the chain: hp = the pid the host launched the guest scene with,
-            // pv = the scene presenter exists, cv = contentView has a usable size. A black
-            // window without audio is pv0/cv0; a black window whose guest is a *different*
-            // process shows hp different from the guest's own p.
-            var hostDiag = "no-view"
-            if let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController {
-                hostDiag = vc.appSceneVC.stageDiagnostics()
-            }
-            var parts: [String] = []
-            if let file = readDiagFile(uuid + ".txt") {
-                parts.append(file)
-            }
-            if let ud = defaults.string(forKey: "LCDiag." + uuid) {
-                parts.append(parts.isEmpty ? "ud:" + ud : "ud✓")
-            }
-            lines.append("[\(index)] \(short) \(hostDiag) | \(parts.isEmpty ? "nodata" : parts.joined(separator: " "))")
-        }
-
-        // A diag file not claimed by any window means the guest resolved a different UUID
-        // than the host registered the window with, so the mismatch stays visible.
-        if let diagDir, let files = try? FileManager.default.contentsOfDirectory(atPath: diagDir) {
-            for file in files.sorted() where file.hasSuffix(".txt") && !matchedFiles.contains(file) {
-                if lines.count >= 7 { break }
-                let text = (readDiagFile(file) ?? "?")
-                lines.append("[?] \(file) \(text)")
-            }
-        }
-        buildLabel.text = lines.joined(separator: "\n")
     }
 
     // MARK: - Stage layout
@@ -381,10 +315,8 @@ class AppInfoProvider {
         isStagePresented = true
         windowHostingView.isHidden = false
         dockHost?.view.isHidden = false
-        buildLabel.isHidden = false
         if entering {
             windowHostingView.alpha = 0
-            buildLabel.alpha = 0
             dockHost?.view.alpha = 0
         }
 
@@ -451,13 +383,6 @@ class AppInfoProvider {
                 dockView.alpha = self.isFullscreen ? 0 : 1
                 dockView.frame = MultitaskStageLayout.dockFrame(bounds: bounds, safeArea: safeArea)
             }
-
-            self.buildLabel.frame = CGRect(
-                x: safeArea.left + 10,
-                y: bounds.height - safeArea.bottom - MultitaskStageLayout.dockHeight - 20 - 110,
-                width: 400,
-                height: 110
-            )
         }
 
         if animated && UIAccessibility.isReduceMotionEnabled {
@@ -490,11 +415,9 @@ class AppInfoProvider {
             // always starts from 0.
             let dockTargetAlpha: CGFloat = isFullscreen ? 0 : 1
             windowHostingView.alpha = 0
-            buildLabel.alpha = 0
             dockHost?.view.alpha = 0
             UIView.animate(withDuration: 0.22, delay: 0, options: .allowUserInteraction) {
                 self.windowHostingView.alpha = 1
-                self.buildLabel.alpha = 0.55
                 self.dockHost?.view.alpha = dockTargetAlpha
             }
         }
@@ -503,7 +426,6 @@ class AppInfoProvider {
         if let dockView = dockHost?.view {
             window.bringSubviewToFront(dockView)
         }
-        window.bringSubviewToFront(buildLabel)
 
         // Tell every guest who the main window is. Side windows quarantine
         // their own touches; the main window keeps full interactivity.
@@ -602,17 +524,13 @@ class AppInfoProvider {
         clearStaleGuestState(appUUID)
     }
 
-    /// Drops every per-guest trace of a previous run of this container, so a brand-new window
-    /// can never be judged by an earlier process's heartbeat or diagnostics.
+    /// Drops the previous run's heartbeat of a container, so a brand-new window can never be
+    /// judged by an earlier process's timestamp.
     private func clearStaleGuestState(_ appUUID: String) {
         guard !appUUID.isEmpty else { return }
         let defaults = LCUtils.appGroupUserDefault
         defaults.removeObject(forKey: "LCGuestHeartbeat.\(appUUID)")
-        defaults.removeObject(forKey: "LCDiag.\(appUUID)")
         defaults.synchronize()
-        if let dir = LCSharedUtils.appGroupPath()?.appendingPathComponent("LCDiag").path {
-            try? FileManager.default.removeItem(atPath: (dir as NSString).appendingPathComponent(appUUID + ".txt"))
-        }
     }
 
     /// Window views that no longer belong to a running app are leftovers of a teardown that did
@@ -642,8 +560,6 @@ class AppInfoProvider {
             // Keep the role timestamp fresh even without layout changes.
             publishStageRoles(active: true)
         }
-        // Probe build: refresh the on-stage diagnostic panel with the guests' latest snapshots.
-        updateBuildLabel()
     }
 
     /// Called when an animated relayout changes the main window (fullscreen toggle, promotion
@@ -748,14 +664,12 @@ class AppInfoProvider {
         UIView.animate(withDuration: 0.2, animations: {
             self.windowHostingView.alpha = 0
             self.dockHost?.view.alpha = 0
-            self.buildLabel.alpha = 0
         }, completion: { _ in
             // A new app may have entered the stage while the fade-out was running; in that case
             // the entry path already showed everything again, so don't hide it here.
             guard !self.isStagePresented else { return }
             self.windowHostingView.isHidden = true
             self.dockHost?.view.isHidden = true
-            self.buildLabel.isHidden = true
         })
     }
 
@@ -1061,6 +975,13 @@ struct MultitaskStageDockIcon: View {
 
     @State private var icon: UIImage?
 
+    /// Same edge length as a home-screen dock icon (60pt).
+    private static let iconSize: CGFloat = 60
+    /// The iOS 26 app-icon mask: a continuous-corner squircle whose radius is 26.67% of the
+    /// icon edge (the ratio the rest of the app already uses for icon masks). Without it the
+    /// raw artwork would show its own square corners, which reads as "not an iOS 26 icon".
+    private static let iconShape = RoundedRectangle(cornerRadius: iconSize * 0.2667, style: .continuous)
+
     var body: some View {
         // A plain Button keeps SwiftUI's native gesture arbitration with the horizontal
         // ScrollView, so the dock can still be scrolled while a press still highlights.
@@ -1071,11 +992,11 @@ struct MultitaskStageDockIcon: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                 } else {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(Color.gray.opacity(0.3))
+                    Color.gray.opacity(0.3)
                 }
             }
-            .frame(width: 60, height: 60)
+            .frame(width: Self.iconSize, height: Self.iconSize)
+            .clipShape(Self.iconShape)
             .contentShape(Rectangle())
         }
         .buttonStyle(StagePressButtonStyle())

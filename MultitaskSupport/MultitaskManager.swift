@@ -73,18 +73,16 @@ enum MultitaskMode : Int {
             lock.write(toFile: lockPath, atomically: true)
         }
 
-        var buffer = [CChar](repeating: 0, count: 4096)
-        let length = pid > 0 ? proc_pidpath(pid, &buffer, UInt32(buffer.count)) : 0
-        guard length > 0 else {
-            // Nothing alive behind the entry any more (or no pid recorded): drop it so the next
-            // launch is not redirected into a dead instance.
+        guard let path = executablePath(pid: pid) else {
+            // Nothing alive behind the entry any more (or its pid is unreadable): drop the entry
+            // so the next launch is not redirected into a dead instance. Never kill on a guess.
             releaseLock()
             return true
         }
 
         // The pid may have been recycled since the lock was written, so only a path that is
         // unmistakably this app's LiveProcess appex may be killed.
-        guard isLiveProcessExecutable(executablePath: String(cString: buffer)) else { return false }
+        guard isLiveProcessExecutable(executablePath: path) else { return false }
 
         // SIGTERM first: the orphan is still a running app that should get the chance to flush
         // its data before the new guest takes over the very same container.
@@ -102,13 +100,35 @@ enum MultitaskMode : Int {
     /// YES when the pid still points at a LiveProcess appex inside *this* app bundle. Guards the
     /// reaper against pid reuse and against guests of another LiveContainer install.
     private class func isLiveProcessExecutable(pid: pid_t) -> Bool {
-        var buffer = [CChar](repeating: 0, count: 4096)
-        guard pid > 0, proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return false }
-        return isLiveProcessExecutable(executablePath: String(cString: buffer))
+        guard let path = executablePath(pid: pid) else { return false }
+        return isLiveProcessExecutable(executablePath: path)
     }
 
     private class func isLiveProcessExecutable(executablePath: String) -> Bool {
         return executablePath.contains("/LiveProcess.appex/")
             && executablePath.hasPrefix(Bundle.main.bundlePath)
+    }
+
+    /// `proc_pidpath` lives in libproc, which the Darwin module does not re-export, so the symbol
+    /// is resolved once at runtime instead of pulling a private header into the bridging header.
+    /// If it cannot be resolved, nothing is ever killed (the lock is only released).
+    private typealias ProcPidPathFn = @convention(c) (Int32, UnsafeMutableRawPointer?, UInt32) -> Int32
+    private static let procPidPathFn: ProcPidPathFn? = {
+        // RTLD_DEFAULT searches the images already loaded into this process; libproc is not linked
+        // by the app, so if that misses, ask dyld for the library itself.
+        if let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "proc_pidpath") {
+            return unsafeBitCast(symbol, to: ProcPidPathFn.self)
+        }
+        guard let handle = dlopen("/usr/lib/libproc.dylib", RTLD_LAZY),
+              let symbol = dlsym(handle, "proc_pidpath") else { return nil }
+        return unsafeBitCast(symbol, to: ProcPidPathFn.self)
+    }()
+
+    /// Executable path of a process, or nil when it no longer exists.
+    private class func executablePath(pid: pid_t) -> String? {
+        guard pid > 0, let procPidPath = Self.procPidPathFn else { return nil }
+        var buffer = [CChar](repeating: 0, count: 4096)
+        guard procPidPath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return String(cString: buffer)
     }
 }

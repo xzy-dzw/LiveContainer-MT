@@ -4,7 +4,6 @@
 #import "../LiveContainer/utils.h"
 #import "../MultitaskSupport/LCStageIPC.h"
 #import <LocalAuthentication/LocalAuthentication.h>
-#import <unistd.h>
 #import "Localization.h"
 
 UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
@@ -15,55 +14,9 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
                                         CFStringRef name, const void *object,
                                         CFDictionaryRef userInfo);
 
-// MARK: - Stage touch-chain diagnostics (probe build)
-//
-// Every guest piggybacks a one-line snapshot of the touch-interception chain on its heartbeat
-// timer (once per second). The host renders that line on the stage label, so one screenshot
-// pinpoints the broken link. Compact legend:
-//   h = sendEvent hook installed   e = touch events seen   b = began-phase events
-//   s = swallows (verdict said YES)   n = role notifications received
-//   a = LCStageActive as *this guest* reads it   p = this process's pid
-//   M = main UUID (8)   S = self UUID (8)
-//   The host prints its own "hp<pid> pv<scene> cv<contentview>" in front of this line, so a
-//   black window can be told apart: hp != p means the scene hosts a different process than the
-//   one running the app (the guest bailed out in LCBootstrap), pv0/cv0 means the scene or its
-//   content view is gone.
-//   no data / "boot" only -> TweakLoader never loaded into this guest
-//   "ctor bail"          -> dylib loaded, but lcGuestAppId was nil (hooks skipped entirely)
-//   h1 e0                -> hook installed, yet no touch event ever reaches this process
-//   e>0 n0               -> touches arrive, but no role-state notification ever reached us
-//   a0 / s0              -> role state unreadable (IPC write/read broken) or verdict says NO
-//   s>0                  -> quarantine armed; a touch down should have promoted the window
-//
-// The snapshot is published through TWO channels: the App Group defaults (the very channel
-// the quarantine IPC uses) and a file inside the App Group container. The file channel does
-// not go through CFPreferences at all, so "no data" can never be blamed on a key mismatch.
-static int LCDiagHookInstalled = 0;
-static int LCDiagEventCount = 0;
-static int LCDiagBeganCount = 0;
-static int LCDiagSideCount = 0;
-static int LCDiagNotifyCount = 0;
-
-/// Resolved once in the constructor: the data container UUID this guest runs with.
-static NSString *LCDiagDataUUID = nil;
-
-static NSString *LCDiagShortUUID(NSString *uuid) {
-    return uuid.length > 8 ? [uuid substringToIndex:8] : uuid;
-}
-
-/// File channel. Only active inside a guest-holding process: LCBootstrap sets LC_HOME_PATH
-/// for every process that takes over a guest app, and this dylib is always loaded afterwards.
-/// LCSharedUtils is looked up by name like everywhere else in this file: TweakLoader.dylib
-/// does not link against the LiveContainer library, so a direct class reference would be an
-/// undefined linker symbol.
-static void LCDiagWriteFile(NSString *uuid, NSString *text) {
-    if (!getenv("LC_HOME_PATH")) { return; }
-    NSString *dir = [[[NSClassFromString(@"LCSharedUtils") appGroupPath] URLByAppendingPathComponent:@"LCDiag"] path];
-    if (dir.length == 0) { return; }
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *name = [NSString stringWithFormat:@"%@.txt", uuid.length ? uuid : @"unknown"];
-    [text writeToFile:[dir stringByAppendingPathComponent:name] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
+/// Resolved once in the constructor: the data container UUID this guest runs with. Drives the
+/// heartbeat key and the side-window quarantine verdict.
+static NSString *LCGuestDataUUID = nil;
 
 /// The launch handoff key "selectedContainer" is NOT readable inside a guest: before this
 /// dylib is dlopen'd, LCBootstrap calls NUDGuestHooksInit, which redirects
@@ -81,27 +34,12 @@ static NSString *LCGuestResolveDataUUID(void) {
     return handoff.length ? handoff : @"";
 }
 
-static NSString *LCDiagSnapshot(void) {
-    NSUserDefaults *defaults = LCStageSharedDefaults();
-    NSInteger active = [defaults boolForKey:LCStageIPCActiveKey] ? 1 : 0;
-    NSString *mainUUID = LCDiagShortUUID([defaults stringForKey:LCStageIPCMainUUIDKey] ?: @"-");
-    NSString *selfUUID = LCDiagShortUUID(LCDiagDataUUID.length ? LCDiagDataUUID : @"-");
-    return [NSString stringWithFormat:@"h%d e%d b%d s%d n%d a%ld p%d M%@ S%@",
-            LCDiagHookInstalled, LCDiagEventCount, LCDiagBeganCount, LCDiagSideCount,
-            LCDiagNotifyCount, (long)active, getpid(), mainUUID, selfUUID];
-}
-
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
-    // Probe ladder, written before any early return: the host can tell "dylib never loaded"
-    // (no stamp at all, or only the bootstrap's "boot" stamp) from "dylib loaded but bailed".
-    LCDiagDataUUID = LCGuestResolveDataUUID();
-    LCDiagWriteFile(LCDiagDataUUID, @"ctor");
+    LCGuestDataUUID = LCGuestResolveDataUUID();
     if(!NSUserDefaults.lcGuestAppId) {
-        LCDiagWriteFile(LCDiagDataUUID, @"ctor bail: lcGuestAppId=nil");
         return;
     }
-    LCDiagWriteFile(LCDiagDataUUID, @"ctor ok: installing hooks");
 
     swizzle(UIApplication.class, @selector(_applicationOpenURLAction:payload:origin:), @selector(hook__applicationOpenURLAction:payload:origin:));
     swizzle(UIApplication.class, @selector(_connectUISceneFromFBSScene:transitionContext:), @selector(hook__connectUISceneFromFBSScene:transitionContext:));
@@ -142,7 +80,7 @@ static void UIKitGuestHooksInit() {
     // immediately, instead of lingering as a black screen until the user relaunches it.
     // This is the single most reliable cleanup signal — exit callbacks are asynchronous
     // and silently dropped when the system SIGKILLs the extension under memory pressure.
-    NSString *dataUUID = LCDiagDataUUID;
+    NSString *dataUUID = LCGuestDataUUID;
     NSString *hbKey = [NSString stringWithFormat:@"LCGuestHeartbeat.%@", dataUUID.length ? dataUUID : @""];
     // Beat once right now, before the timer: loading this dylib is itself the proof that the
     // guest really launched the app (a guest that bailed out in LCBootstrap never gets here), and
@@ -158,12 +96,7 @@ static void UIKitGuestHooksInit() {
         // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
         // required, unlike CACurrentMediaTime which lives in QuartzCore.
         [group setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
-        // Probe build: publish the touch-chain snapshot next to the heartbeat, through both
-        // channels (defaults = the real IPC channel, file = ground truth).
-        NSString *snapshot = LCDiagSnapshot();
-        [group setObject:snapshot forKey:[NSString stringWithFormat:@"LCDiag.%@", dataUUID]];
         [group synchronize];
-        LCDiagWriteFile(dataUUID, snapshot);
     }];
     [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
     NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", dataUUID, hbKey);
@@ -184,7 +117,6 @@ static void UIKitGuestHooksInit() {
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
         swizzle(UIApplication.class, @selector(sendEvent:), @selector(hook_lcStage_sendEvent:));
-        LCDiagHookInstalled = 1;
     });
 }
 
@@ -192,7 +124,6 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
                                         CFStringRef name, const void *object,
                                         CFDictionaryRef userInfo) {
     // Pull the host's latest role state so the next sendEvent decision is fresh.
-    LCDiagNotifyCount++;
     [NSUserDefaults.lcSharedDefaults synchronize];
 }
 
@@ -203,7 +134,6 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
 @implementation UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event {
     if (event.type == UIEventTypeTouches) {
-        LCDiagEventCount++;
         BOOL hasBegan = NO;
         for (UITouch *touch in event.allTouches) {
             if (touch.phase == UITouchPhaseBegan) {
@@ -211,16 +141,12 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
                 break;
             }
         }
-        if (hasBegan) {
-            LCDiagBeganCount++;
-        }
-        if (LCStageGuestIsSideWindow(LCDiagDataUUID)) {
-            LCDiagSideCount++;
+        if (LCStageGuestIsSideWindow(LCGuestDataUUID)) {
             // A fresh touch down in a side window is a promote request. Every
             // event of the sequence (began/moved/ended) is dropped so the app
             // inside never reacts to it.
             if (hasBegan) {
-                LCStageRequestPromote(LCDiagDataUUID);
+                LCStageRequestPromote(LCGuestDataUUID);
             }
             return;
         }
