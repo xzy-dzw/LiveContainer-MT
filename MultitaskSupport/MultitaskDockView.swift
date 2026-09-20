@@ -574,8 +574,8 @@ class AppInfoProvider {
         // takes ~150ms total, well below the 1s heartbeat timeout.
         var delay: TimeInterval = 0
         for i in 1..<count {
-            guard let app = apps[i],
-                  let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            let app = apps[i]
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
             let visibleSlotFrame = MultitaskStageLayout.slotFrame(i, bounds: windowBounds, safeArea: safeArea)
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 // ObjC selector registerSceneTouchRegionAtFrame:visibleSlotFrame: bridges into
