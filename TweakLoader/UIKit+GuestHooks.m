@@ -94,7 +94,7 @@ static void UIKitGuestHooksInit() {
     // scheduledTimerWithTimeInterval:), so there is exactly one add — below, in common modes.
     // This also stays correct if this constructor ever runs off the main thread.
     heartbeatTimer = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
-        NSUserDefaults *group = [NSUserDefaults.lcSharedDefaults];
+        NSUserDefaults *group = [NSUserDefaults lcSharedDefaults];
         // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
         // required, unlike CACurrentMediaTime which lives in QuartzCore.
         [group setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
