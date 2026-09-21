@@ -47,6 +47,14 @@ static NSString * const LCStageRolesChangedNotificationName =
     @"com.kdt.livecontainer.stage.rolesChanged";
 static NSString * const LCStagePromoteRequestNotificationName =
     @"com.kdt.livecontainer.stage.promoteRequest";
+/// Posted by a guest after it rendered real frames following an activation
+/// (cold start AND every foreground return). The host then fades its launch
+/// placeholder / frozen-frame cover out. Payload: LCGuestFrameReady.<uuid>.
+static NSString * const LCStageFrameReadyNotificationName =
+    @"com.kdt.livecontainer.stage.frameReady";
+
+/// Guest-written timestamp keys, one per data container.
+static NSString * const LCStageIPCFrameReadyKeyPrefix = @"LCGuestFrameReady.";
 
 /// Role state older than this many seconds is treated as missing. The host
 /// republishes roughly once per second while the stage is on screen, so a
@@ -123,6 +131,38 @@ static inline NSString *_Nullable LCStageTakePendingPromoteUUID(void) {
         return nil;
     }
     return uuid;
+}
+
+/// Guest: records that this guest has real frames on screen and wakes the
+/// host so it can reveal the card.
+static inline void LCStageGuestMarkFrameReady(NSString *guestUUID) {
+    if (guestUUID.length == 0) { return; }
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    [defaults setDouble:CFAbsoluteTimeGetCurrent()
+                 forKey:[LCStageIPCFrameReadyKeyPrefix stringByAppendingString:guestUUID]];
+    [defaults synchronize];
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         (__bridge CFStringRef)LCStageFrameReadyNotificationName,
+                                         NULL, NULL, TRUE);
+}
+
+/// Host: reads a guest's frame-ready timestamp (0 when never reported).
+/// Callers synchronize first so the guest's write is visible.
+static inline CFAbsoluteTime LCStageHostFrameReadyAt(NSString *guestUUID) {
+    if (guestUUID.length == 0) { return 0; }
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    [defaults synchronize];
+    return [defaults doubleForKey:[LCStageIPCFrameReadyKeyPrefix stringByAppendingString:guestUUID]];
+}
+
+/// Path of the frozen-frame JPEG one guest stores right before resigning
+/// active, and the host shows while its hosted scene recovers after unlock.
+static inline NSString *LCStageFrozenFramePath(NSString *guestUUID) {
+    NSString *directory = [[[NSUserDefaults lcAppGroupPath]
+                            stringByAppendingPathComponent:@"LiveContainer"]
+                           stringByAppendingPathComponent:@"StageFrozenFrames"];
+    return [directory stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%@.jpg", guestUUID]];
 }
 
 NS_ASSUME_NONNULL_END

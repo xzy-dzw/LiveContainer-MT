@@ -171,6 +171,18 @@ static void LCStagePromoteRequestCallback(CFNotificationCenterRef center, void *
     });
 }
 
+// A guest rendered real frames after cold start or a foreground return. The manager compares
+// every staged window's frame-ready timestamp and reveals the matching card(s).
+static void LCStageFrameReadyCallback(CFNotificationCenterRef center, void *observer,
+                                      CFStringRef name, const void *object,
+                                      CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if(@available(iOS 16.0, *)) {
+            [MultitaskDockManager.shared handleGuestFrameReady];
+        }
+    });
+}
+
 static void LCStageIPCHostInit(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -178,6 +190,12 @@ static void LCStageIPCHostInit(void) {
                                         NULL,
                                         LCStagePromoteRequestCallback,
                                         (__bridge CFStringRef)LCStagePromoteRequestNotificationName,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        LCStageFrameReadyCallback,
+                                        (__bridge CFStringRef)LCStageFrameReadyNotificationName,
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
     });

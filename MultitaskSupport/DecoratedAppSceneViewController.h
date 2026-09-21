@@ -22,4 +22,17 @@ API_AVAILABLE(ios(16.0))
 - (void)minimizeWindowPiP;
 - (void)unminimizeWindowPiP;
 - (void)updateVerticalConstraints;
+
+/// Launch placeholder shown until the guest reports its first real frame
+/// (icon + name + spinner over black), so a cold-starting heavy app reads as
+/// "launching" instead of an empty black card.
+- (void)configureLaunchPlaceholderWithIcon:(nullable UIImage *)icon appName:(NSString *)appName;
+
+/// Shows the guest's frozen last frame (JPEG path) over the recovering scene.
+/// No-op when the file is missing or unreadable.
+- (void)showFrozenFrameAtPath:(NSString *)path;
+
+/// Fades (or instantly removes) every content cover — launch placeholder and
+/// frozen frame alike. Idempotent: safe to call as a periodic backstop.
+- (void)hideContentCoversAnimated:(BOOL)animated;
 @end

@@ -16,6 +16,13 @@
 /// Sits above the guest while this window is a side window, so the app inside never sees a touch
 /// and the tap that should promote the window is always caught here.
 @property(nonatomic) UIView* tapShield;
+/// Black launch cover (icon + name + spinner) until the guest's first frame arrives.
+@property(nonatomic, strong) UIView* launchPlaceholder;
+@property(nonatomic, strong) UIImageView* placeholderIcon;
+@property(nonatomic, strong) UILabel* placeholderName;
+@property(nonatomic, strong) UIActivityIndicatorView* placeholderSpinner;
+/// The guest's last frame, shown over the scene while it recovers after unlock.
+@property(nonatomic, strong) UIImageView* frozenFrameView;
 @end
 
 /// The remote hosting view behind this window delivers touches through a system-level channel,
@@ -106,6 +113,129 @@
     // Hand the shield to the container's hitTest override so a side-window touch is forced to
     // the shield regardless of what the system-level remote view would otherwise deliver.
     ((DecoratedStageContainerView*)container).tapShield = _tapShield;
+
+    [self setupContentCovers];
+}
+
+#pragma mark - Content covers (launch placeholder + frozen frame)
+
+- (void)setupContentCovers {
+    UIView* container = self.view;
+
+    // Frozen frame sits directly above the guest content.
+    UIImageView* frozen = [[UIImageView alloc] initWithFrame:CGRectZero];
+    frozen.translatesAutoresizingMaskIntoConstraints = NO;
+    frozen.hidden = YES;
+    frozen.userInteractionEnabled = NO;
+    frozen.contentMode = UIViewContentModeScaleAspectFill;
+    frozen.clipsToBounds = YES;
+    [container insertSubview:frozen belowSubview:_tapShield];
+    [NSLayoutConstraint activateConstraints:@[
+        [frozen.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [frozen.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [frozen.topAnchor constraintEqualToAnchor:container.topAnchor],
+        [frozen.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
+    ]];
+    _frozenFrameView = frozen;
+
+    // Launch placeholder: black cover with the app's icon, name and a spinner —
+    // what the home screen shows while an app launches, instead of a black void.
+    UIView* placeholder = [[UIView alloc] initWithFrame:CGRectZero];
+    placeholder.translatesAutoresizingMaskIntoConstraints = NO;
+    placeholder.userInteractionEnabled = NO;
+    placeholder.backgroundColor = UIColor.blackColor;
+    [container insertSubview:placeholder belowSubview:_tapShield];
+    [NSLayoutConstraint activateConstraints:@[
+        [placeholder.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [placeholder.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [placeholder.topAnchor constraintEqualToAnchor:container.topAnchor],
+        [placeholder.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
+    ]];
+    _launchPlaceholder = placeholder;
+
+    UIImageView* icon = [[UIImageView alloc] initWithFrame:CGRectZero];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.contentMode = UIViewContentModeScaleAspectFit;
+    icon.layer.cornerRadius = 12;
+    icon.layer.cornerCurve = kCACornerCurveContinuous;
+    icon.clipsToBounds = YES;
+    [placeholder addSubview:icon];
+    _placeholderIcon = icon;
+
+    UILabel* name = [[UILabel alloc] initWithFrame:CGRectZero];
+    name.translatesAutoresizingMaskIntoConstraints = NO;
+    name.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    name.textColor = [UIColor colorWithWhite:1 alpha:0.92];
+    name.textAlignment = NSTextAlignmentCenter;
+    name.adjustsFontSizeToFitWidth = YES;
+    name.minimumScaleFactor = 0.7;
+    [placeholder addSubview:name];
+    _placeholderName = name;
+
+    UIActivityIndicatorView* spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    spinner.color = [UIColor colorWithWhite:1 alpha:0.75];
+    [placeholder addSubview:spinner];
+    [spinner startAnimating];
+    _placeholderSpinner = spinner;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.centerXAnchor constraintEqualToAnchor:placeholder.centerXAnchor],
+        [icon.centerYAnchor constraintEqualToAnchor:placeholder.centerYAnchor constant:-34],
+        [icon.widthAnchor constraintEqualToConstant:54],
+        [icon.heightAnchor constraintEqualToConstant:54],
+        [name.topAnchor constraintEqualToAnchor:icon.bottomAnchor constant:12],
+        [name.centerXAnchor constraintEqualToAnchor:placeholder.centerXAnchor],
+        [name.leadingAnchor constraintGreaterThanOrEqualToAnchor:placeholder.leadingAnchor constant:16],
+        [name.trailingAnchor constraintLessThanOrEqualToAnchor:placeholder.trailingAnchor constant:-16],
+        [spinner.topAnchor constraintEqualToAnchor:name.bottomAnchor constant:14],
+        [spinner.centerXAnchor constraintEqualToAnchor:placeholder.centerXAnchor],
+    ]];
+}
+
+- (void)configureLaunchPlaceholderWithIcon:(UIImage*)icon appName:(NSString*)appName {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.placeholderIcon.image = icon;
+        self.placeholderName.text = appName;
+        // Re-arm the cover for a fresh launch even if a previous one was hidden.
+        self.launchPlaceholder.hidden = NO;
+        self.launchPlaceholder.alpha = 1;
+        [self.placeholderSpinner startAnimating];
+    });
+}
+
+- (void)showFrozenFrameAtPath:(NSString*)path {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIImage* image = [[UIImage alloc] initWithContentsOfFile:path];
+        if(!image) { return; }
+        self.frozenFrameView.image = image;
+        self.frozenFrameView.hidden = NO;
+        self.frozenFrameView.alpha = 1;
+    });
+}
+
+- (void)hideContentCoversAnimated:(BOOL)animated {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if(self.launchPlaceholder.hidden && self.frozenFrameView.hidden) { return; }
+        void (^changes)(void) = ^{
+            self.launchPlaceholder.alpha = 0;
+            self.frozenFrameView.alpha = 0;
+        };
+        void (^done)(BOOL) = ^(BOOL finished) {
+            self.launchPlaceholder.hidden = YES;
+            self.frozenFrameView.hidden = YES;
+            self.frozenFrameView.image = nil;
+            [self.placeholderSpinner stopAnimating];
+        };
+        if(animated) {
+            [UIView animateWithDuration:0.25 delay:0
+                                options:UIViewAnimationOptionBeginFromCurrentState
+                             animations:changes completion:done];
+        } else {
+            changes();
+            done(YES);
+        }
+    });
 }
 
 - (void)tapPromoteWindow {

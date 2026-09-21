@@ -10,6 +10,7 @@ import SwiftUI
 import UIKit
 import Combine
 import ObjectiveC.runtime
+import AVFoundation
 
 // MARK: - App Info Provider
 class AppInfoProvider {
@@ -224,6 +225,11 @@ class AppInfoProvider {
     private var lastPublishedRoles: (active: Bool, uuid: String?)?
     private var lastPublishedRolesAt = Date.distantPast
     private static let roleRepublishInterval: TimeInterval = 1.0
+    /// Last frame-ready timestamp handled per window, so a re-delivered Darwin notification
+    /// never re-runs the reveal animation.
+    private var lastFrameReadyAt: [String: Double] = [:]
+    /// Whether the stage currently keeps the screen on and the host alive in the background.
+    private var isKeepAliveActive = false
     /// Last time the host entered (or was confirmed in) the foreground. Heartbeat pruning is
     /// suppressed for a grace window after that, because suspension freezes every guest timer
     /// and a fresh resume would otherwise look like all four guests died at once.
@@ -263,14 +269,6 @@ class AppInfoProvider {
             self,
             selector: #selector(deviceOrientationDidChange),
             name: UIDevice.orientationDidChangeNotification,
-            object: nil
-        )
-        // Memory management while the device is locked: suspend side-window scenes so the
-        // system does not kill them under background memory pressure. Restore on unlock.
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(appDidEnterBackground),
-            name: UIApplication.didEnterBackgroundNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
@@ -368,6 +366,9 @@ class AppInfoProvider {
             if isStagePresented {
                 dismissStage()
             }
+            // No guests on stage any more: release the screen-on lock and the background
+            // audio session so the phone behaves normally again.
+            updateStageKeepAlive(active: false)
             // Release every guest from side-window touch quarantine.
             publishStageRoles(active: false)
             return
@@ -375,6 +376,12 @@ class AppInfoProvider {
 
         // First window: the stage page enters as a whole on top of the launcher.
         let entering = !isStagePresented
+        if entering {
+            // Keep the screen on and the host (and therefore every guest process) alive in the
+            // background while the stage exists: auto-lock is what suspended and killed guests
+            // in the middle of a session.
+            updateStageKeepAlive(active: true)
+        }
         isStagePresented = true
         windowHostingView.isHidden = false
         stageBackdrop.isHidden = false
@@ -647,6 +654,10 @@ class AppInfoProvider {
     /// clear, and an orphan process that still holds the container.
     private static let guestStartGrace: TimeInterval = 20
 
+    /// A window whose launch placeholder is still up after this long loses the cover even
+    /// without a frame-ready report — guests built without TweakLoader never send one.
+    private static let coverBackstopInterval: TimeInterval = 8
+
     /// Removes windows whose guest process is dead (heartbeat stale), whose guest never came up
     /// at all, or whose view was detached without a matching model removal (lost exit callback).
     ///
@@ -772,6 +783,13 @@ class AppInfoProvider {
             // Keep the role timestamp fresh even without layout changes.
             publishStageRoles(active: true)
         }
+        // Cover backstop: a guest that does not inject TweakLoader never sends frame-ready,
+        // so its launch placeholder would otherwise stay up forever. This deadline is beyond
+        // any real cold start while still hiding the whole launch black gap.
+        for app in apps where Date().timeIntervalSince(app.addedAt) > Self.coverBackstopInterval {
+            (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
+                .hideContentCovers(animated: true)
+        }
     }
 
     /// Called when an animated relayout changes the main window (fullscreen toggle, promotion
@@ -849,40 +867,85 @@ class AppInfoProvider {
         })
     }
 
-    // MARK: - Background memory management
-    // Four simultaneously-active hosted scenes put a lot of pressure on iOS memory when the
-    // device is locked. Suspend the side windows' scenes (foreground = NO) while the app is
-    // backgrounded so they don't get killed outright; wake them back up on foreground.
+    // MARK: - Stage keep-alive
+    //
+    // While the virtual-window stage exists we (1) disable the idle timer so the screen never
+    // auto-locks in the middle of a session, and (2) hold a playback audio session that mixes
+    // with other audio. The app already declares the `audio` background mode: a mixing
+    // playback session keeps the host runnable in the background without making a sound, and
+    // while the host runnable the extension requests — and therefore the guest processes —
+    // are not suspended, which is what used to get guests jetsam'd while the device was locked.
 
-    @objc private func appDidEnterBackground() {
-        for app in apps.dropFirst() { // skip index 0 = main window (still foregrounded by system)
-            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-            _ = vc.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: false)
+    private func updateStageKeepAlive(active: Bool) {
+        guard isKeepAliveActive != active else { return }
+        isKeepAliveActive = active
+        UIApplication.shared.isIdleTimerDisabled = active
+        let session = AVAudioSession.sharedInstance()
+        if active {
+            do {
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                try session.setActive(true)
+            } catch {
+                NSLog("[LCStage] failed to activate keep-alive audio session: \(error)")
+            }
+        } else {
+            try? session.setActive(false, options: [.notifyOthersOnDeactivation])
         }
     }
 
+    /// Darwin callback from a guest that just rendered real frames. Reveals every staged card
+    /// whose guest reported a newer frame-ready timestamp.
+    @objc func handleGuestFrameReady() {
+        for app in apps {
+            let readyAt = LCStageHostFrameReadyAt(app.appUUID)
+            guard readyAt > (lastFrameReadyAt[app.appUUID] ?? 0) else { continue }
+            lastFrameReadyAt[app.appUUID] = readyAt
+            (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
+                .hideContentCovers(animated: true)
+        }
+    }
+
+    // MARK: - Foreground recovery
+    //
+    // Scenes are deliberately NOT suspended when the host backgrounds (no foreground=NO pass):
+    // with the keep-alive audio session the host stays runnable and the guests keep their
+    // foreground state, so coming back is instant with no black flash. As a defence in depth
+    // every guest snapshots its last frame on resign-active; on foreground return the host
+    // covers each card with that still until the guest reports fresh frames, so even if the
+    // system did reclaim a surface the user sees the app's real last picture, never black.
+
     @objc private func appWillEnterForeground() {
         lastHostWakeAt = Date()
-        // Wake every scene back up (the background handler suspended the side
-        // windows). Side touches are quarantined in the guest process, so their
-        // regions simply returning on-screen is harmless; the main window gets
-        // its settled geometry pushed again so its region covers its slot.
+        let basePath = (LCSharedUtils.appGroupPath()?.path ?? "")
+            + "/LiveContainer/StageFrozenFrames"
+        for app in apps {
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            vc.showFrozenFrame(atPath: "\(basePath)/\(app.appUUID).jpg")
+        }
+        // Re-wake every scene explicitly (covers the case the keep-alive session was unavailable
+        // and the host really got suspended).
         for app in apps {
             guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
             _ = vc.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: true)
         }
-        // Layout FIRST, then commit. The old code committed the (still stale) frame before
-        // the non-animated relayout wrote the post-foreground frame, and that relayout never
-        // goes through settleAfterAnimation, so the fresh frame was never pushed to the scene
-        // — the main window's touch region sat one layout pass behind after unlock.
-        // performLayout directly (instead of relayout, which only re-dispatches async) so the
-        // commit below is guaranteed to read the new frame.
+        // Layout FIRST, then commit the main window geometry, so its touch region covers the
+        // post-foreground slot.
         DispatchQueue.main.async { [weak self] in
-            self?.performLayout(animated: false)
-            self?.lastSettledFullscreen = self?.isFullscreen ?? false
-            self?.lastSettledMainUUID = self?.apps.first?.appUUID
-            self?.lastSettledGeneration = self?.pendingGeometryGeneration ?? 0
-            self?.commitMainWindowGeometry()
+            guard let self else { return }
+            self.performLayout(animated: false)
+            self.lastSettledFullscreen = self.isFullscreen
+            self.lastSettledMainUUID = self.apps.first?.appUUID
+            self.lastSettledGeneration = self.pendingGeometryGeneration
+            self.commitMainWindowGeometry()
+        }
+        // Backstop: a guest without TweakLoader never reports frame-ready; never leave a card
+        // covered forever.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self else { return }
+            for app in self.apps {
+                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
+                    .hideContentCovers(animated: true)
+            }
         }
     }
 
@@ -913,6 +976,15 @@ class AppInfoProvider {
             // same container: a leftover heartbeat timestamp used to prune the fresh window in
             // the very first watchdog tick, long before its guest could write its own.
             self.clearStaleGuestState(appUUID)
+            // Cover the black gap while the guest process cold-starts: the host cannot speed up
+            // the guest's dyld + app launch, but it can show the app's icon and name instead of
+            // an empty black card. The cover fades on the guest's frame-ready report.
+            if let decorated = appModel.view?._viewDelegate() as? DecoratedAppSceneViewController {
+                decorated.configureLaunchPlaceholder(
+                    withIcon: appInfo?.iconIsDarkIcon(false),
+                    appName: appModel.appName
+                )
+            }
             // New apps always enter the main slot (head of the array); any previous main window
             // slides down to a side slot. This matches the "open on the main slot" behaviour
             // users expect from a dock, instead of every new app landing as a side card.

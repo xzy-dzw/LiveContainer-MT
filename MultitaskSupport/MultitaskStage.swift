@@ -30,10 +30,10 @@ import UIKit
     static let controlLeadingInset: CGFloat = 12
     /// Trailing inset of the FPS readout, measured from the far edge of the strip.
     static let fpsTrailingInset: CGFloat = 12
-    /// Fixed size of the FPS readout, so the right-aligned digits never reflow as the number goes
-    /// from two digits to three.
-    static let fpsWidth: CGFloat = 78
-    static let fpsHeight: CGFloat = 20
+    /// Fixed size of the FPS readout: a 120fps readout in SF Mono 11pt plus the chip padding
+    /// never reflows as the count changes.
+    static let fpsWidth: CGFloat = 58
+    static let fpsHeight: CGFloat = 22
     /// Bottom dock, sized like the iOS dock.
     static let dockHeight: CGFloat = 90
     static let dockSideInset: CGFloat = 10
@@ -398,9 +398,10 @@ final class MultitaskStageGlassButton: UIButton {
 ///
 /// It exists to make performance visible while the user switches between windows, so it only ticks
 /// while the multitask stage is on screen — fullscreen belongs to the guest app, and the readout
-/// leaves with the strip. The look is the one players already know from their GPU overlay: green
-/// monospaced digits over a hard dark shadow, which stays legible on top of any window without a
-/// chip sitting on the stage.
+/// leaves with the strip. The look is the gaming OSD players already know from GPU overlays:
+/// SF Mono bold tabular digits with wide tracking, a phosphor-green glow, inside a dark glass
+/// chip. SF Mono is the system monospaced face — the digits never twitch as the number changes,
+/// and no custom font has to ship with the app.
 @objc class MultitaskStageFPSCounterView: UIView {
     private let label = UILabel()
     private var link: CADisplayLink?
@@ -409,8 +410,8 @@ final class MultitaskStageGlassButton: UIButton {
 
     /// Longer than a frame, short enough to show a stutter as it happens.
     private static let sampleInterval: CFTimeInterval = 0.5
-    /// The green of the GPU overlay players compare against.
-    private static let counterGreen = UIColor(red: 0.463, green: 0.725, blue: 0, alpha: 1)
+    /// Phosphor green of the in-game performance overlays players compare against.
+    private static let counterGreen = UIColor(red: 0.188, green: 0.820, blue: 0.345, alpha: 1)
 
     /// Whether the readout should tick. Driven by the stage: on while the split layout is on
     /// screen, off in fullscreen and once the stage is gone.
@@ -428,19 +429,38 @@ final class MultitaskStageGlassButton: UIButton {
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
-        // Monospaced digits: the readout must not twitch as the number changes. 14pt gives the digits
-        // the same presence as the controls' glyphs, so the strip reads as one line of chrome.
-        label.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+        backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        layer.cornerRadius = 6
+        layer.cornerCurve = .continuous
+        // No masksToBounds: the label's green glow would be clipped at the chip edge.
+        layer.borderWidth = MultitaskStageLayout.hairline
+        layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
+
+        label.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
         label.textColor = Self.counterGreen
-        label.textAlignment = .right
-        label.shadowColor = UIColor.black.withAlphaComponent(0.7)
-        label.shadowOffset = CGSize(width: 0, height: 1)
-        label.text = "-- FPS"
+        label.textAlignment = .center
+        // A soft green halo is what makes the digits read as an OSD readout rather than plain
+        // text stamped on the strip.
+        label.layer.shadowColor = Self.counterGreen.cgColor
+        label.layer.shadowOpacity = 0.45
+        label.layer.shadowRadius = 3
+        label.layer.shadowOffset = .zero
+        label.attributedText = readoutText("-- FPS")
         addSubview(label)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    /// Wide letter spacing (positive tracking is correct at small sizes) keeps the chip reading
+    /// as instrument typography instead of a sentence.
+    private func readoutText(_ text: String) -> NSAttributedString {
+        NSAttributedString(string: text, attributes: [
+            .font: UIFont.monospacedSystemFont(ofSize: 11, weight: .bold),
+            .kern: 0.6,
+            .foregroundColor: Self.counterGreen,
+        ])
     }
 
     override func layoutSubviews() {
@@ -498,7 +518,7 @@ final class MultitaskStageGlassButton: UIButton {
         // Frames in the window over the time the window actually took, so a dropped frame pulls the
         // number down instead of being averaged away.
         let rate = Double(framesInWindow) / elapsed
-        label.text = "\(Int(rate.rounded())) FPS"
+        label.attributedText = readoutText("\(Int(rate.rounded())) FPS")
         windowStart = link.timestamp
         framesInWindow = 0
     }

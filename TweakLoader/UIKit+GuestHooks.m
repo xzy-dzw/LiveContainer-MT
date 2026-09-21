@@ -34,6 +34,86 @@ static NSString *LCGuestResolveDataUUID(void) {
     return handoff.length ? handoff : @"";
 }
 
+#pragma mark - Frozen frame + frame-ready signalling
+
+/// The foreground-active key window of this guest, regardless of whether the
+/// app adopted UIScene already (old apps only have -[UIApplication keyWindow]).
+static UIWindow *LCGuestKeyWindow(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:UIWindowScene.class]) { continue; }
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        if (windowScene.activationState == UISceneActivationStateForegroundActive
+            && windowScene.keyWindow) {
+            return windowScene.keyWindow;
+        }
+    }
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if ([scene isKindOfClass:UIWindowScene.class] && ((UIWindowScene *)scene).keyWindow) {
+            return ((UIWindowScene *)scene).keyWindow;
+        }
+    }
+    return UIApplication.sharedApplication.keyWindow;
+}
+
+/// Snapshots the guest's last visible frame into the App Group. Runs on
+/// willResignActive while the frame is still on screen; afterScreenUpdates:NO
+/// keeps it synchronous and cheap.
+static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
+    if (dataUUID.length == 0) { return; }
+    UIWindow *window = LCGuestKeyWindow();
+    CGRect bounds = window.bounds;
+    if (bounds.size.width < 2 || bounds.size.height < 2) { return; }
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithBounds:bounds];
+    UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        [window drawViewHierarchyInRect:bounds afterScreenUpdates:NO];
+    }];
+    NSData *jpeg = UIImageJPEGRepresentation(image, 0.7);
+    if (jpeg.length == 0) { return; }
+    NSString *path = LCStageFrozenFramePath(dataUUID);
+    [NSFileManager.defaultManager createDirectoryAtPath:path.stringByDeletingLastPathComponent
+                            withIntermediateDirectories:YES attributes:nil error:nil];
+    [jpeg writeToFile:path atomically:YES];
+}
+
+/// Counts a few display ticks after activation before reporting "frame ready":
+/// the first callback frame alone can still be the system's blank buffer.
+@interface LCFrameReadySignaler : NSObject
+@property(nonatomic, strong) CADisplayLink *link;
+@property(nonatomic, assign) NSInteger ticks;
++ (instancetype)shared;
+- (void)arm;
+@end
+
+@implementation LCFrameReadySignaler
+
++ (instancetype)shared {
+    static LCFrameReadySignaler *instance;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ instance = [LCFrameReadySignaler new]; });
+    return instance;
+}
+
+- (void)arm {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self arm]; });
+        return;
+    }
+    [self.link invalidate];
+    self.ticks = 0;
+    self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+    [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+}
+
+- (void)tick:(CADisplayLink *)link {
+    self.ticks += 1;
+    if (self.ticks < 5) { return; }
+    [self.link invalidate];
+    self.link = nil;
+    LCStageGuestMarkFrameReady(LCGuestDataUUID);
+}
+
+@end
+
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
     LCGuestDataUUID = LCGuestResolveDataUUID();
@@ -105,6 +185,27 @@ static void UIKitGuestHooksInit() {
     heartbeatTimer.tolerance = 0.2;
     [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
     NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", dataUUID, hbKey);
+
+    // MARK: - First-frame report + frozen-frame capture
+    //
+    // A hosted scene shows a black card until the guest's first frame reaches
+    // the host. The guest therefore (1) tells the host when real frames are on
+    // screen after every activation, and (2) snapshots its last frame before
+    // resigning active, so after unlock the host can cover the recovering
+    // scene with a still of THIS app instead of a black flash.
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
+                                                    object:nil queue:nil
+                                                usingBlock:^(NSNotification *note) {
+        LCGuestCaptureFrozenFrame(LCGuestDataUUID);
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                    object:nil queue:nil
+                                                usingBlock:^(NSNotification *note) {
+        [LCFrameReadySignaler.shared arm];
+    }];
+    // Cold launch: the notification above usually fires right after this constructor,
+    // arm once as well in case the app is already active when TweakLoader loads.
+    [LCFrameReadySignaler.shared arm];
 
     // MARK: - Stage side-window touch quarantine
     //
