@@ -185,12 +185,15 @@
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) self = weakSelf;
             if(!self) { return; }
-            if(self.view.window) {
-                [self appSceneVCAppDidExit:self.appSceneVC];
-            }
+            // Full teardown, not just UI removal: destroying the hosted scene/controller and
+            // unregistering the container is exactly what a dropped cancellation/interruption
+            // callback would otherwise skip forever (scene leak + the container stuck as
+            // "multitasking", rerouting later launches). Idempotent; drives appSceneVCAppDidExit:
+            // itself on the main queue.
+            [self.appSceneVC appTerminationCleanUp];
         });
     } else {
-        [self appSceneVCAppDidExit:self.appSceneVC];
+        [self.appSceneVC appTerminationCleanUp];
     }
 }
 

@@ -14,26 +14,33 @@ enum MultitaskMode : Int {
 }
 
 @objc class MultitaskManager : NSObject {
-    static private var usingMultitaskContainers : [String] = []
-    
+    // Registered from an extension-request completion block (background queue), unregistered
+    // from the main queue, and read from async launch paths — every access goes through the lock.
+    static private var usingMultitaskContainers: Set<String> = []
+    static private let containersLock = NSLock()
+
     @objc class func registerMultitaskContainer(container: String) {
-        usingMultitaskContainers.append(container)
+        containersLock.lock()
+        defer { containersLock.unlock() }
+        usingMultitaskContainers.insert(container)
     }
-    
+
     @objc class func unregisterMultitaskContainer(container: String) {
-        usingMultitaskContainers.removeAll(where: { c in
-            return c == container
-        })
+        containersLock.lock()
+        defer { containersLock.unlock() }
+        usingMultitaskContainers.remove(container)
     }
-    
+
     @objc class func isUsing(container: String) -> Bool {
-        return usingMultitaskContainers.contains { c in
-            return c == container
-        }
+        containersLock.lock()
+        defer { containersLock.unlock() }
+        return usingMultitaskContainers.contains(container)
     }
-    
+
     @objc class func isMultitasking() -> Bool {
-        return usingMultitaskContainers.count > 0
+        containersLock.lock()
+        defer { containersLock.unlock() }
+        return !usingMultitaskContainers.isEmpty
     }
 
     /// Reaps a leftover guest process of *this* app that still holds `container`'s lock while no
@@ -58,7 +65,7 @@ enum MultitaskMode : Int {
         guard runningLC.hasSuffix("liveprocess") else { return false }
         // A window of ours owns the container legitimately, whenever it is on the stage.
         if #available(iOS 16.0, *),
-           MultitaskDockManager.shared.apps.contains(where: { $0.appUUID == container }) {
+           MultitaskDockManager.isWindowOnStage(container) {
             return false
         }
 

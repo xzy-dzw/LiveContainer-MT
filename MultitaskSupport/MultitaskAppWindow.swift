@@ -32,13 +32,11 @@ struct MultitaskAppInfo {
     }
     
     @objc class func openExistingAppWindow(dataUUID: String) -> Bool {
-        for a in appDict {
-            if a.value.dataUUID == dataUUID {
-                openWindow(id: "appView", value: a.key)
-                return true
-            }
-        }
-        return false
+        // The dictionary key IS the data UUID — look it up directly instead of scanning every
+        // entry and comparing the value's dataUUID.
+        guard appDict[dataUUID] != nil else { return false }
+        openWindow(id: "appView", value: dataUUID)
+        return true
     }
 }
 

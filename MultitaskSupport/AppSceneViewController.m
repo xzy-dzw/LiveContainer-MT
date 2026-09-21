@@ -17,8 +17,6 @@
 
 @interface AppSceneViewController()
 @property int resizeDebounceToken;
-@property CFTimeInterval lastResizeRequestTime;
-@property CGPoint normalizedOrigin;
 @property bool isNativeWindow;
 @property NSUUID* identifier;
 @end
@@ -73,9 +71,28 @@
     }
     
     NSURL *docURL = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].lastObject;
+    // bookmarkDataWithOptions: can return nil (missing URL, denied scope). Adding nil used to
+    // crash launch with NSInvalidArgumentException, so every result is checked; the error is
+    // captured instead of being silently discarded.
+    NSData* (^securityBookmark)(NSURL *) = ^NSData *(NSURL *url) {
+        NSError *bookmarkError = nil;
+        NSData *data = [url bookmarkDataWithOptions:(1 << 11)
+                     includingResourceValuesForKeys:nil
+                                      relativeToURL:nil
+                                              error:&bookmarkError];
+        if (!data) {
+            NSLog(@"[LiveContainer] bookmark creation failed for %@: %@", url, bookmarkError);
+        }
+        return data;
+    };
+    void (^addBookmarkIfPresent)(NSURL *) = ^(NSURL *url) {
+        NSData *data = securityBookmark(url);
+        if (data) {
+            [bookmarks addObject:data];
+        }
+    };
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"LCSharePrivateDataWithLiveProcess"]) {
-        NSData* bookmarkData = [docURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
-        [bookmarks addObject:bookmarkData];
+        addBookmarkIfPresent(docURL);
     } else {
         bool isSharedApp = false;
         NSBundle* bundle = [LCSharedUtils findBundleWithBundleId:bundleId isSharedAppOut:&isSharedApp];
@@ -83,12 +100,9 @@
         if (!isSharedApp) {
             NSURL *dataURL = [docURL URLByAppendingPathComponent:[NSString stringWithFormat:@"Data/Application/%@", dataUUID]];
             NSURL *tweaksURL = [docURL URLByAppendingPathComponent:@"Tweaks"];
-            [bookmarks addObject:[bundle.bundleURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0]];
-            NSData* containerBookmark = [dataURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0];
-            if(containerBookmark) {
-                [bookmarks addObject:containerBookmark];
-            }
-            [bookmarks addObject:[tweaksURL bookmarkDataWithOptions:(1<<11) includingResourceValuesForKeys:0 relativeToURL:0 error:0]];
+            addBookmarkIfPresent(bundle.bundleURL);
+            addBookmarkIfPresent(dataURL);
+            addBookmarkIfPresent(tweaksURL);
         }
     }
     item.userInfo = userInfo;

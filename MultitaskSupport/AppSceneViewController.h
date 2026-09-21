@@ -27,7 +27,9 @@ API_AVAILABLE(ios(16.0))
 @property(nonatomic) NSString* dataUUID;
 @property(nonatomic) int pid;
 @property(nonatomic, weak) id<AppSceneViewControllerDelegate> delegate;
-@property(nonatomic) BOOL isAppRunning;
+/// Derived live from the guest pid (getpgid); there is no stored value to set, so this is
+/// intentionally readonly.
+@property(nonatomic, readonly) BOOL isAppRunning;
 @property(nonatomic) BOOL shouldIgnoreSceneUpdates, shouldSkipDebounceOnce;
 @property(nonatomic) CGFloat scaleRatio;
 @property(nonatomic) UIView* contentView;

@@ -15,29 +15,20 @@
     // The stage is its own page rather than an overlay on the app list, so it paints an opaque
     // neutral background and swallows touches that land on empty space.
     self.backgroundColor = UIColor.systemGray5Color;
-    self.shouldForwardTapAction = YES;
     return self;
 }
+
 - (BOOL)handleStatusBarTapAction:(UIAction *)action {
-    if(!self.shouldForwardTapAction) return NO;
-    // grab the frontmost app window, if it's visible pass this event to it
+    // Resolve the frontmost window at call time. The previous version gated this on a flag left
+    // over from the last ordinary hit-test — status bar taps never run hitTest on this view, so
+    // the flag was stale — and an empty stage read !nil.hidden as YES, reporting "handled" with
+    // no window behind it, which swallowed the host's own status bar tap (e.g. scroll to top).
     UIView *frontmostView = self.subviews.lastObject;
-    if(!frontmostView.hidden) {
-        DecoratedAppSceneViewController *decoratedVC = (id)frontmostView._viewDelegate;
-        [decoratedVC.appSceneVC handleStatusBarTapAction:action];
+    DecoratedAppSceneViewController *decoratedVC = (id)frontmostView._viewDelegate;
+    if (frontmostView.hidden || decoratedVC == nil) {
+        return NO;
     }
-    return !frontmostView.hidden;
-}
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView* hitView = [super hitTest:point withEvent:event];
-    if(hitView == self) {
-        // Keep the touch instead of forwarding it to the launcher underneath, so the empty
-        // areas of the stage behave like a real page background.
-        self.shouldForwardTapAction = NO;
-        return self;
-    } else {
-        self.shouldForwardTapAction = YES;
-        return hitView;
-    }
+    [decoratedVC.appSceneVC handleStatusBarTapAction:action];
+    return YES;
 }
 @end

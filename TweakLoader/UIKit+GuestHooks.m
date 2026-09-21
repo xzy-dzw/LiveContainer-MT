@@ -61,7 +61,6 @@ static void UIKitGuestHooksInit() {
                 break;
         }
         if(!NSUserDefaults.isLiveProcess && LCOrientationLock != UIInterfaceOrientationUnknown) {
-//            swizzle(UIApplication.class, @selector(_handleDelegateCallbacksWithOptions:isSuspended:restoreState:), @selector(hook__handleDelegateCallbacksWithOptions:isSuspended:restoreState:));
             swizzle(FBSSceneParameters.class, @selector(initWithXPCDictionary:), @selector(hook_initWithXPCDictionary:));
             swizzle(UIViewController.class, @selector(__supportedInterfaceOrientations), @selector(hook___supportedInterfaceOrientations));
             swizzle(UIViewController.class, @selector(shouldAutorotateToInterfaceOrientation:), @selector(hook_shouldAutorotateToInterfaceOrientation:));
@@ -95,12 +94,15 @@ static void UIKitGuestHooksInit() {
     // scheduledTimerWithTimeInterval:), so there is exactly one add — below, in common modes.
     // This also stays correct if this constructor ever runs off the main thread.
     heartbeatTimer = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
-        NSUserDefaults *group = [NSUserDefaults lcSharedDefaults];
+        NSUserDefaults *group = [NSUserDefaults.lcSharedDefaults];
         // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
         // required, unlike CACurrentMediaTime which lives in QuartzCore.
         [group setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
         [group synchronize];
     }];
+    // The host allows 10s of silence before pruning, so the 1s cadence does not need to be exact:
+    // tolerance lets the system coalesce this wake-up with other timers and save battery.
+    heartbeatTimer.tolerance = 0.2;
     [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
     NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", dataUUID, hbKey);
 
@@ -156,23 +158,20 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
 
 @implementation UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event {
-    if (event.type == UIEventTypeTouches) {
-        BOOL hasBegan = NO;
+    // Cheap cached verdict first: allTouches enumeration runs only for guests currently staged
+    // as a side window — on the main window, and when multitasking is never used, every single
+    // touch event used to build and walk the touch set for nothing.
+    if (event.type == UIEventTypeTouches && LCStageGuestCachedIsSideWindow(LCGuestDataUUID)) {
+        // A fresh touch down in a side window is a promote request. Every
+        // event of the sequence (began/moved/ended) is dropped so the app
+        // inside never reacts to it.
         for (UITouch *touch in event.allTouches) {
             if (touch.phase == UITouchPhaseBegan) {
-                hasBegan = YES;
+                LCStageRequestPromote(LCGuestDataUUID);
                 break;
             }
         }
-        if (LCStageGuestCachedIsSideWindow(LCGuestDataUUID)) {
-            // A fresh touch down in a side window is a promote request. Every
-            // event of the sequence (began/moved/ended) is dropped so the app
-            // inside never reacts to it.
-            if (hasBegan) {
-                LCStageRequestPromote(LCGuestDataUUID);
-            }
-            return;
-        }
+        return;
     }
     [self hook_lcStage_sendEvent:event];
 }
@@ -382,6 +381,9 @@ void LCOpenSideStoreURL(NSURL* sidestoreUrl) {
         [NSUserDefaults.lcUserDefaults setObject:sidestoreUrl.absoluteString forKey:@"launchAppUrlScheme"];
         [NSUserDefaults.lcUserDefaults setObject:@"builtinSideStore" forKey:@"selected"];
         [NSClassFromString(@"LCSharedUtils") launchToGuestAppWithClassicMode:0];
+        // Already launching: fall through used to build and show the confirmation alert as well,
+        // and tapping OK there wrote the launch parameters a second time (double launch).
+        return;
     }
     NSString *message = [@"lc.guestTweak.appSwitchTip %@" localizeWithFormat:@"SideStore"];
     UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
@@ -731,23 +733,6 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
     [self hook__connectUISceneFromFBSScene:scene transitionContext:context];
 }
 
--(BOOL)hook__handleDelegateCallbacksWithOptions:(id)arg1 isSuspended:(BOOL)arg2 restoreState:(BOOL)arg3 {
-    BOOL ans = [self hook__handleDelegateCallbacksWithOptions:arg1 isSuspended:arg2 restoreState:arg3];
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-//        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            LSApplicationWorkspace* workspace = [objc_lookUpClass("LSApplicationWorkspace") defaultWorkspace];
-            [workspace openApplicationWithBundleID:@"com.apple.springboard"];
-            [workspace openApplicationWithBundleID:NSUserDefaults.lcMainBundle.bundleIdentifier];
-        });
-
-    });
-
-
-    return ans;
-}
-
 - (void)hook_openURL:(NSURL *)url options:(NSDictionary<NSString *,id> *)options completionHandler:(void (^)(_Bool))completion {
     if(NSUserDefaults.isSideStore && ![url.scheme isEqualToString:@"livecontainer"]) {
         [self hook_openURL:url options:options completionHandler:completion];
@@ -772,14 +757,20 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
 }
 
 - (void)hook_setDelegate:(id<UIApplicationDelegate>)delegate {
-    if(![delegate respondsToSelector:@selector(application:configurationForConnectingSceneSession:options:)]) {
-        // Fix old apps black screen when UIApplicationSupportsMultipleScenes is YES
-        swizzle(UIWindow.class, @selector(makeKeyAndVisible), @selector(hook_makeKeyAndVisible));
-        swizzle(UIWindow.class, @selector(makeKeyWindow), @selector(hook_makeKeyWindow));
-        swizzle(UIWindow.class, @selector(setHidden:), @selector(hook_setHidden:));
-        // Fix apps that do not support UISceneDelegate getting 0 status bar frame
-        swizzle(UIApplication.class, @selector(statusBarFrame), @selector(hook_statusBarFrame));
-    }
+    // setDelegate: can run more than once; method swizzling is self-inverse, so re-swapping on
+    // every call would silently restore the system implementations on even-numbered calls. Do it
+    // at most once, decided by the first delegate that is installed.
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        if(![delegate respondsToSelector:@selector(application:configurationForConnectingSceneSession:options:)]) {
+            // Fix old apps black screen when UIApplicationSupportsMultipleScenes is YES
+            swizzle(UIWindow.class, @selector(makeKeyAndVisible), @selector(hook_makeKeyAndVisible));
+            swizzle(UIWindow.class, @selector(makeKeyWindow), @selector(hook_makeKeyWindow));
+            swizzle(UIWindow.class, @selector(setHidden:), @selector(hook_setHidden:));
+            // Fix apps that do not support UISceneDelegate getting 0 status bar frame
+            swizzle(UIApplication.class, @selector(statusBarFrame), @selector(hook_statusBarFrame));
+        }
+    });
     [self hook_setDelegate:delegate];
 }
 
@@ -895,10 +886,6 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
 - (void)hook_makeKeyWindow {
     [self updateWindowScene];
     [self hook_makeKeyWindow];
-}
-- (void)hook_resignKeyWindow {
-    [self updateWindowScene];
-    [self hook_resignKeyWindow];
 }
 - (void)hook_setHidden:(BOOL)hidden {
     [self updateWindowScene];

@@ -100,17 +100,19 @@ class AppInfoProvider {
     }
 
     private func findAppInfoFromSharedModel(appName: String, dataUUID: String) -> LCAppInfo? {
-        let allApps = DataManager.shared.model.apps + DataManager.shared.model.hiddenApps
-        
-        for appModel in allApps {
-            if appModel.appInfo.containers.contains(where: { $0.folderName == dataUUID }) {
-                return appModel.appInfo
+        // Walk both model lists in place; `apps + hiddenApps` allocated a merged copy on every
+        // window entry.
+        let appLists = [DataManager.shared.model.apps, DataManager.shared.model.hiddenApps]
+        for list in appLists {
+            if let appInfo = list.first(where: {
+                $0.appInfo.containers.contains { $0.folderName == dataUUID }
+            })?.appInfo {
+                return appInfo
             }
         }
-        
-        for appModel in allApps {
-            if appModel.appInfo.displayName() == appName {
-                return appModel.appInfo
+        for list in appLists {
+            if let appInfo = list.first(where: { $0.appInfo.displayName() == appName })?.appInfo {
+                return appInfo
             }
         }
         return nil
@@ -153,6 +155,14 @@ class AppInfoProvider {
     /// Running apps in stage order: index 0 is the main window, 1...3 are the side windows.
     @Published var apps: [DockAppModel] = []
     @Published var isFullscreen: Bool = false
+
+    /// Thread-safe stage membership check for background callers (the orphan reaper runs on a
+    /// background async context). Hopping to the main thread also guarantees the UI-heavy
+    /// `shared` singleton is never first initialised off the main thread.
+    @objc public static func isWindowOnStage(_ appUUID: String) -> Bool {
+        let check = { shared.apps.contains { $0.appUUID == appUUID } }
+        return Thread.isMainThread ? check() : DispatchQueue.main.sync(execute: check)
+    }
 
     @objc public var windowHostingView = VirtualWindowsHostView()
 
@@ -286,6 +296,9 @@ class AppInfoProvider {
     }
 
     @objc private func deviceOrientationDidChange() {
+        // faceUp/faceDown fire this notification too, but the geometry does not change for them:
+        // don't run a spring + settle layout pass when the user merely lays the phone flat.
+        guard UIDevice.current.orientation.isValidInterfaceOrientation else { return }
         relayout(animated: true)
     }
 
@@ -693,6 +706,10 @@ class AppInfoProvider {
         apps.remove(at: index)
         if index == 0, !apps.isEmpty {
             isFullscreen = false
+            // A side window is about to inherit the main slot. The next animated settle must
+            // re-push its geometry, or BackBoard keeps the promoted scene's touch region at the
+            // old side-slot rect and the main app looks "untouchable" until the next switch.
+            pendingGeometryGeneration += 1
         }
         if let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController {
             // Terminate the guest process, then tear its scene down unconditionally: the
@@ -739,7 +756,18 @@ class AppInfoProvider {
         let inGrace = Date().timeIntervalSince(lastHostWakeAt) < 5
         let canPruneHeartbeats = UIApplication.shared.applicationState == .active && !inGrace
         if pruneDeadWindows(allowHeartbeatPrune: canPruneHeartbeats) {
-            relayout(animated: false)
+            // Non-animated prune never reaches settleAfterAnimation, and a promoted side window
+            // needs its geometry committed (tearDownWindow armed the generation when the old main
+            // slot died). Layout first, then commit on the next runloop tick — same pattern as
+            // appWillEnterForeground.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.performLayout(animated: false)
+                self.lastSettledFullscreen = self.isFullscreen
+                self.lastSettledMainUUID = self.apps.first?.appUUID
+                self.lastSettledGeneration = self.pendingGeometryGeneration
+                self.commitMainWindowGeometry()
+            }
         } else {
             // Keep the role timestamp fresh even without layout changes.
             publishStageRoles(active: true)
@@ -851,6 +879,9 @@ class AppInfoProvider {
         // commit below is guaranteed to read the new frame.
         DispatchQueue.main.async { [weak self] in
             self?.performLayout(animated: false)
+            self?.lastSettledFullscreen = self?.isFullscreen ?? false
+            self?.lastSettledMainUUID = self?.apps.first?.appUUID
+            self?.lastSettledGeneration = self?.pendingGeometryGeneration ?? 0
             self?.commitMainWindowGeometry()
         }
     }
@@ -905,7 +936,11 @@ class AppInfoProvider {
             self.lastSettledFullscreen = self.isFullscreen
             self.lastSettledMainUUID = self.apps.first?.appUUID
             DispatchQueue.main.async { [weak self] in
-                self?.commitMainWindowGeometry()
+                guard let self else { return }
+                // Reconcile after the relayout above actually ran: it may have pruned a dead
+                // main window and armed a fresh generation.
+                self.lastSettledGeneration = self.pendingGeometryGeneration
+                self.commitMainWindowGeometry()
             }
         }
         if Thread.isMainThread {
@@ -1200,26 +1235,25 @@ struct StagePressButtonStyle: ButtonStyle {
 // MARK: - Icon Cache Manager
 class IconCacheManager {
     static let shared = IconCacheManager()
-    private var cache: [String: UIImage] = [:]
-    private let cacheQueue = DispatchQueue(label: "icon.cache.queue", attributes: .concurrent)
-    
+    // NSCache is thread-safe on its own, evicts images under memory pressure, and caps how many
+    // icons stay resident — the hand-rolled concurrent queue + unbounded dictionary did neither.
+    private let cache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 64
+        return cache
+    }()
+
     private init() {}
-    
+
     func getIcon(for key: String) -> UIImage? {
-        return cacheQueue.sync {
-            return cache[key]
-        }
+        cache.object(forKey: key as NSString)
     }
-    
+
     func setIcon(_ icon: UIImage, for key: String) {
-        cacheQueue.async(flags: .barrier) {
-            self.cache[key] = icon
-        }
+        cache.setObject(icon, forKey: key as NSString)
     }
-    
+
     func clearCache() {
-        cacheQueue.async(flags: .barrier) {
-            self.cache.removeAll()
-        }
+        cache.removeAllObjects()
     }
 }

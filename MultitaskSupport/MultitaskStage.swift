@@ -450,8 +450,15 @@ final class MultitaskStageGlassButton: UIButton {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        // A detached readout must never leave a display link behind.
-        if window == nil { stopCounting() }
+        if window == nil {
+            // A detached readout must never leave a display link behind.
+            stopCounting()
+        } else if isCounting && link == nil {
+            // Reattached to a new key window while still expected to tick. Detach invalidated the
+            // link, and isCounting's didSet would not re-fire because its value never changed —
+            // without this the readout froze on the last number forever.
+            startCounting()
+        }
     }
 
     private func startCounting() {
