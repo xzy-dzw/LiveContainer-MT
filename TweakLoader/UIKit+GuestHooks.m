@@ -91,7 +91,10 @@ static void UIKitGuestHooksInit() {
     __block NSTimer *heartbeatTimer = nil;
     // Use +weak reference so the timer block doesn't retain anything — if NSTimer ever holds
     // strong references to non-UI objects we don't care; we just want to fire every second.
-    heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
+    // timerWithTimeInterval: does NOT schedule itself on a runloop (unlike
+    // scheduledTimerWithTimeInterval:), so there is exactly one add — below, in common modes.
+    // This also stays correct if this constructor ever runs off the main thread.
+    heartbeatTimer = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
         NSUserDefaults *group = [NSUserDefaults lcSharedDefaults];
         // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
         // required, unlike CACurrentMediaTime which lives in QuartzCore.
@@ -120,11 +123,31 @@ static void UIKitGuestHooksInit() {
     });
 }
 
+// Cached side-window verdict. LCStageGuestIsSideWindow() hits App Group defaults on every
+// call, and a fast scroll produces hundreds of touch events per second. Roles only change on
+// a host publish, which always arrives with the Darwin notification above; so cache for 0.5s
+// and invalidate the moment roles change. Both touch delivery and Darwin callbacks land on
+// the main thread.
+static BOOL lc_cachedIsSideWindow = NO;
+static NSTimeInterval lc_sideWindowCacheValidUntil = 0;
+
+static BOOL LCStageGuestCachedIsSideWindow(NSString *guestUUID) {
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now < lc_sideWindowCacheValidUntil) {
+        return lc_cachedIsSideWindow;
+    }
+    lc_cachedIsSideWindow = LCStageGuestIsSideWindow(guestUUID);
+    lc_sideWindowCacheValidUntil = now + 0.5;
+    return lc_cachedIsSideWindow;
+}
+
 static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *observer,
                                         CFStringRef name, const void *object,
                                         CFDictionaryRef userInfo) {
-    // Pull the host's latest role state so the next sendEvent decision is fresh.
+    // Pull the host's latest role state so the next sendEvent decision is fresh, and force
+    // the cached verdict to be recomputed on the next event.
     [NSUserDefaults.lcSharedDefaults synchronize];
+    lc_sideWindowCacheValidUntil = 0;
 }
 
 @interface UIApplication (LCStageTouchHook)
@@ -141,7 +164,7 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
                 break;
             }
         }
-        if (LCStageGuestIsSideWindow(LCGuestDataUUID)) {
+        if (LCStageGuestCachedIsSideWindow(LCGuestDataUUID)) {
             // A fresh touch down in a side window is a promote request. Every
             // event of the sequence (began/moved/ended) is dropped so the app
             // inside never reacts to it.

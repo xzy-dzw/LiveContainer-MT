@@ -229,10 +229,8 @@
         [self openURLScheme:launchUrl];
     }
     
-    __weak typeof(self) weakSelf = self;
-    [self.extension setRequestInterruptionBlock:^(NSUUID *uuid) {
-        [weakSelf appTerminationCleanUp];
-    }];
+    // The request interruption block is already installed once, right after the extension
+    // request begins (above). Re-installing the identical block here was dead code.
     self.contentView.layer.anchorPoint = CGPointMake(0, 0);
     self.contentView.layer.position = CGPointMake(0, 0);
     
@@ -358,10 +356,15 @@
 }
 
 - (void)appTerminationCleanUp {
-    if(_isAppTerminationCleanUpCalled) {
-        return;
+    // Cancellation/interruption blocks, _performActionsForUIScene and tearDownWindow can all
+    // enter on different threads. Serialize the check-and-set so two callers can't both pass
+    // the guard and both enqueue cleanup (idempotent, but still a race).
+    @synchronized(self) {
+        if(_isAppTerminationCleanUpCalled) {
+            return;
+        }
+        _isAppTerminationCleanUpCalled = true;
     }
-    _isAppTerminationCleanUpCalled = true;
     // Capture the delegate up front: invalidating the hosting controller can detach our view
     // synchronously (viewDidMoveToWindow:), and the exit callback must still reach the stage even
     // then. When it was dropped, the closed window stayed as a black main slot and no side window

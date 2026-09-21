@@ -19,7 +19,12 @@ class AppInfoProvider {
     private var infoCacheByUUID = [String: LCAppInfo]()
     private var infoCacheByName = [String: LCAppInfo]()
     private let cacheQueue = DispatchQueue(label: "com.livecontainer.appinfoprovider.cachequeue", attributes: .concurrent)
-    
+
+    /// Coarse upper bound on each cache dictionary. Entries otherwise accumulate forever as
+    /// apps are installed/removed. On overflow we drop the whole dictionary (it rebuilds
+    /// lazily from disk on the next lookup) instead of maintaining a real LRU list.
+    private static let maxCacheCount = 64
+
     private init() {}
     
     public func findAppInfo(appName: String, dataUUID: String) -> LCAppInfo? {
@@ -51,7 +56,12 @@ class AppInfoProvider {
                let bundlePath = appInfoDict["bundlePath"] as? String,
                let appInfo = LCAppInfo(bundlePath: bundlePath) {
                 
-                cacheQueue.async(flags: .barrier) { self.infoCacheByUUID[dataUUID] = appInfo }
+                cacheQueue.async(flags: .barrier) {
+                    if self.infoCacheByUUID[dataUUID] == nil && self.infoCacheByUUID.count >= Self.maxCacheCount {
+                        self.infoCacheByUUID.removeAll()
+                    }
+                    self.infoCacheByUUID[dataUUID] = appInfo
+                }
                 return appInfo
             }
         }
@@ -76,7 +86,12 @@ class AppInfoProvider {
             
             for appDir in appDirs where appDir.hasSuffix(".app") {
                 if let appInfo = LCAppInfo(bundlePath: "\(appsPath)/\(appDir)"), appInfo.displayName() == appName {
-                    cacheQueue.async(flags: .barrier) { self.infoCacheByName[appName] = appInfo }
+                    cacheQueue.async(flags: .barrier) {
+                        if self.infoCacheByName[appName] == nil && self.infoCacheByName.count >= Self.maxCacheCount {
+                            self.infoCacheByName.removeAll()
+                        }
+                        self.infoCacheByName[appName] = appInfo
+                    }
                     return appInfo
                 }
             }
@@ -226,10 +241,11 @@ class AppInfoProvider {
 
         controls.delegate = self
         controls.isHidden = true
-        keyWindow?.addSubview(controls)
+        // controls/fpsCounter are NOT attached here: the manager can be created before any
+        // key window exists, in which case these would be orphaned forever. performLayout
+        // mounts them idempotently once a window is available.
 
         fpsCounter.isHidden = true
-        keyWindow?.addSubview(fpsCounter)
 
         setupDockView()
 
@@ -288,7 +304,7 @@ class AppInfoProvider {
             ))
             host.view.backgroundColor = .clear
             host.view.isHidden = true
-            self.keyWindow?.addSubview(host.view)
+            // Attached by performLayout (idempotent mounting) — the key window can differ here.
             self.dockHost = host
 
             // The stage only becomes a page once a window exists, so it starts out hidden.
@@ -307,6 +323,23 @@ class AppInfoProvider {
 
     private func performLayout(animated: Bool) {
         guard let window = keyWindow else { return }
+
+        // Idempotent (re)mounting of the always-on-top views. The manager may have been born
+        // before any window existed, or the key window may have changed since; attach only
+        // when the view isn't already hosted by the current window.
+        if controls.superview !== window {
+            controls.removeFromSuperview()
+            window.addSubview(controls)
+        }
+        if fpsCounter.superview !== window {
+            fpsCounter.removeFromSuperview()
+            window.addSubview(fpsCounter)
+        }
+        if let dockView = dockHost?.view, dockView.superview !== window {
+            dockView.removeFromSuperview()
+            window.addSubview(dockView)
+        }
+
         let bounds = window.bounds
         let safeArea = window.safeAreaInsets
         let count = apps.count
@@ -810,10 +843,15 @@ class AppInfoProvider {
             guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
             _ = vc.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: true)
         }
-        commitMainWindowGeometry()
-        // Re-layout so the stage and shields are restored to their proper positions.
-        DispatchQueue.main.async {
-            self.relayout(animated: false)
+        // Layout FIRST, then commit. The old code committed the (still stale) frame before
+        // the non-animated relayout wrote the post-foreground frame, and that relayout never
+        // goes through settleAfterAnimation, so the fresh frame was never pushed to the scene
+        // — the main window's touch region sat one layout pass behind after unlock.
+        // performLayout directly (instead of relayout, which only re-dispatches async) so the
+        // commit below is guaranteed to read the new frame.
+        DispatchQueue.main.async { [weak self] in
+            self?.performLayout(animated: false)
+            self?.commitMainWindowGeometry()
         }
     }
 
