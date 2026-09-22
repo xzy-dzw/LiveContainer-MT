@@ -93,12 +93,18 @@ enum MultitaskMode : Int {
 
         // SIGTERM first: the orphan is still a running app that should get the chance to flush
         // its data before the new guest takes over the very same container.
-        if kill(pid, SIGTERM) == 0 {
-            NSLog("[LCStage] reaping orphaned guest pid=%d holding container %@", pid, container)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                guard isLiveProcessExecutable(pid: pid) else { return }
-                kill(pid, SIGKILL)
-            }
+        guard kill(pid, SIGTERM) == 0 else {
+            // The signal was rejected (e.g. sandbox denial). The lock MUST stay: releasing it
+            // while the old guest is still alive would let the next launch mount the same data
+            // container twice, causing 0xdead10cc jetsams or data corruption. Let the caller
+            // surface the failure instead of double-opening the container.
+            NSLog("[LCStage] 无法向孤儿 guest 进程 pid=%d 发送信号（errno=%d），保留容器锁以防双开", pid, errno)
+            return false
+        }
+        NSLog("[LCStage] reaping orphaned guest pid=%d holding container %@", pid, container)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            guard isLiveProcessExecutable(pid: pid) else { return }
+            kill(pid, SIGKILL)
         }
         releaseLock()
         return true

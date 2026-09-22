@@ -35,4 +35,8 @@ API_AVAILABLE(ios(16.0))
 /// Fades (or instantly removes) every content cover — launch placeholder and
 /// frozen frame alike. Idempotent: safe to call as a periodic backstop.
 - (void)hideContentCoversAnimated:(BOOL)animated;
+
+/// Lifts only the frozen last-frame cover, leaving a launch placeholder (cold start
+/// still in progress) untouched. Used as the foreground-recovery backstop.
+- (void)hideFrozenFrameAnimated:(BOOL)animated;
 @end

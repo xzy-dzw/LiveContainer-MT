@@ -60,6 +60,13 @@
     // sides disagree and the first layout flips between fullscreen and the split stage.
     _isMaximized = NO;
     _appSceneVC = [[AppSceneViewController alloc] initWithBundleId:bundleId dataUUID:dataUUID delegate:self];
+    if (!_appSceneVC) {
+        // The LiveProcess appex could not be resolved/launched. The view was already added to
+        // the hosting view above — detach it so it cannot linger as an orphan black card, and
+        // return nil. The initialization error has already been reported through the delegate.
+        [self.view removeFromSuperview];
+        return nil;
+    }
     self.title = windowName;
     [self setupDecoratedView];
 
@@ -226,6 +233,25 @@
             self.frozenFrameView.hidden = YES;
             self.frozenFrameView.image = nil;
             [self.placeholderSpinner stopAnimating];
+        };
+        if(animated) {
+            [UIView animateWithDuration:0.25 delay:0
+                                options:UIViewAnimationOptionBeginFromCurrentState
+                             animations:changes completion:done];
+        } else {
+            changes();
+            done(YES);
+        }
+    });
+}
+
+- (void)hideFrozenFrameAnimated:(BOOL)animated {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if(self.frozenFrameView.hidden) { return; }
+        void (^changes)(void) = ^{ self.frozenFrameView.alpha = 0; };
+        void (^done)(BOOL) = ^(BOOL finished) {
+            self.frozenFrameView.hidden = YES;
+            self.frozenFrameView.image = nil;
         };
         if(animated) {
             [UIView animateWithDuration:0.25 delay:0

@@ -6,6 +6,7 @@
 #import <IOKit/IOKitLib.h>
 
 #import "LCUtils.h"
+#import "../../LiveContainer/Localization.h"
 #import "../../LiveContainer/LCSharedUtils.h"
 #import "LCAppInfo.h"
 #import "../../MultitaskSupport/DecoratedAppSceneViewController.h"
@@ -57,7 +58,7 @@
 
 + (void)launchMultitaskGuestApp:(NSString *)displayName completionHandler:(void (^)(NSNumber *pid, NSError *error))completionHandler {
     if(!self.liveProcessBundleIdentifier) {
-        NSError *error = [NSError errorWithDomain:displayName code:2 userInfo:@{NSLocalizedDescriptionKey: @"LiveProcess extension not found. Please reinstall LiveContainer and select Keep Extensions"}];
+        NSError *error = [NSError errorWithDomain:displayName code:2 userInfo:@{NSLocalizedDescriptionKey: @"lc.multitask.error.liveProcessMissing".loc}];
         if (completionHandler) completionHandler(nil, error);
         return;
     }
@@ -80,7 +81,36 @@
         }
         
         UIViewController *rootVC = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).keyWindow.rootViewController;
+
+        // Virtual-window stage path: enforce the capacity/duplicate guard BEFORE the guest
+        // process is spawned. The guard inside addRunningApp used to run only after the
+        // extension request had already launched a guest, which then held the container lock
+        // with no stage model — an unkillable orphan plus a floating black card.
+        if (@available(iOS 16.0, *)) {
+            NSString *blockedReason = [MultitaskDockManager blockedReasonForNewStageWindowUUID:dataUUID];
+            if (blockedReason != nil) {
+                if (blockedReason.length > 0) {
+                    NSError *error = [NSError errorWithDomain:displayName code:2
+                                                     userInfo:@{NSLocalizedDescriptionKey: blockedReason}];
+                    if (completionHandler) completionHandler(nil, error);
+                } else {
+                    // Empty reason: the same container already has a window and was just promoted
+                    // to the main slot — swallow the duplicate launch silently.
+                    if (completionHandler) completionHandler(nil, nil);
+                }
+                return;
+            }
+        }
+
         DecoratedAppSceneViewController *launcherView = [[DecoratedAppSceneViewController alloc] initWindowName:displayName bundleId:bundleId dataUUID:dataUUID rootVC:rootVC];
+        if (!launcherView) {
+            // The stage controller failed to create (error already reported via its delegate):
+            // fail the launch explicitly instead of dereferencing nil.
+            NSError *error = [NSError errorWithDomain:displayName code:2
+                                             userInfo:@{NSLocalizedDescriptionKey: @"lc.multitask.error.childCrashed".loc}];
+            if (completionHandler) completionHandler(nil, error);
+            return;
+        }
         // Wire PID callback
         launcherView.pidAvailableHandler = completionHandler;
     });

@@ -656,7 +656,9 @@ class AppInfoProvider {
 
     /// A window whose launch placeholder is still up after this long loses the cover even
     /// without a frame-ready report — guests built without TweakLoader never send one.
-    private static let coverBackstopInterval: TimeInterval = 8
+    /// 15 seconds (not 8): a heavy game's first real frame can take longer than that on a
+    /// cold start, and revealing the cover onto a still-black guest card buys nothing.
+    private static let coverBackstopInterval: TimeInterval = 15
 
     /// Removes windows whose guest process is dead (heartbeat stale), whose guest never came up
     /// at all, or whose view was detached without a matching model removal (lost exit callback).
@@ -679,14 +681,26 @@ class AppInfoProvider {
 
                 // Every guest writes a heartbeat once per second (UIKit+GuestHooks.m).
                 let hbKey = "LCGuestHeartbeat.\(app.appUUID)"
+                // The heartbeat timer runs on the guest's MAIN run loop, so a stale timestamp
+                // does not prove the process is dead: a heavy game blocking its main thread,
+                // a debugger pause or the system throttling a side appex all freeze the timer
+                // while the process is very much alive. SIGTERM-ing that process would destroy
+                // unsaved user data. getpgid is the ground truth — only collect a window whose
+                // pid is actually gone; alive-but-quiet windows stay on the stage.
+                let processAlive = (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
+                    .appSceneVC.isAppRunning ?? false
                 if let last = LCUtils.appGroupUserDefault.object(forKey: hbKey) as? Double {
                     // 10-second deadline: generous for scheduling delays, short
                     // enough to not linger as a black card after close/crash.
-                    if absoluteNow - last > 10 {
+                    if absoluteNow - last > 10, !processAlive {
                         deadUUIDs.insert(app.appUUID)
                     }
-                } else if app.appInfo?.dontInjectTweakLoader != true {
-                    // No heartbeat at all after the grace window: the guest never ran the app.
+                } else if app.appInfo != nil,
+                          app.appInfo?.dontInjectTweakLoader != true,
+                          !processAlive {
+                    // No heartbeat at all after the grace window AND no live process: the guest
+                    // never ran the app. When metadata is missing (appInfo == nil) this branch
+                    // must not fire — missing metadata must never be read as "guest crashed".
                     deadUUIDs.insert(app.appUUID)
                 }
             }
@@ -737,12 +751,21 @@ class AppInfoProvider {
     }
 
     /// Drops the previous run's heartbeat of a container, so a brand-new window can never be
-    /// judged by an earlier process's timestamp.
+    /// judged by an earlier process's timestamp. Also removes the frame-ready marker and the
+    /// frozen-frame snapshot: each JPEG is 1-3 MB and they used to accumulate forever in the
+    /// App Group, including after the container was deleted.
     private func clearStaleGuestState(_ appUUID: String) {
         guard !appUUID.isEmpty else { return }
         let defaults = LCUtils.appGroupUserDefault
         defaults.removeObject(forKey: "LCGuestHeartbeat.\(appUUID)")
+        defaults.removeObject(forKey: "LCGuestFrameReady.\(appUUID)")
         defaults.synchronize()
+        lastFrameReadyAt.removeValue(forKey: appUUID)
+        if let baseURL = LCSharedUtils.appGroupPath() {
+            let frozenURL = baseURL
+                .appendingPathComponent("LiveContainer/StageFrozenFrames/\(appUUID).jpg")
+            try? FileManager.default.removeItem(at: frozenURL)
+        }
     }
 
     /// Window views that no longer belong to a running app are leftovers of a teardown that did
@@ -878,18 +901,28 @@ class AppInfoProvider {
 
     private func updateStageKeepAlive(active: Bool) {
         guard isKeepAliveActive != active else { return }
-        isKeepAliveActive = active
-        UIApplication.shared.isIdleTimerDisabled = active
         let session = AVAudioSession.sharedInstance()
         if active {
+            // Activate the session BEFORE latching the state bits: if either call throws,
+            // isKeepAliveActive stays false so the next stage entry retries instead of
+            // believing keep-alive is running while the guests can still be suspended.
             do {
                 try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
                 try session.setActive(true)
+                isKeepAliveActive = true
+                UIApplication.shared.isIdleTimerDisabled = true
             } catch {
-                NSLog("[LCStage] failed to activate keep-alive audio session: \(error)")
+                isKeepAliveActive = false
+                NSLog("[LCStage] 保活音频会话激活失败: \(error)")
             }
         } else {
-            try? session.setActive(false, options: [.notifyOthersOnDeactivation])
+            do {
+                try session.setActive(false, options: [.notifyOthersOnDeactivation])
+            } catch {
+                NSLog("[LCStage] 保活音频会话停用失败: \(error)")
+            }
+            isKeepAliveActive = false
+            UIApplication.shared.isIdleTimerDisabled = false
         }
     }
 
@@ -926,7 +959,7 @@ class AppInfoProvider {
         // and the host really got suspended).
         for app in apps {
             guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-            _ = vc.appSceneVC.perform(NSSelectorFromString("setHostedSceneForeground:"), with: true)
+            vc.appSceneVC.setHostedSceneForeground(true)
         }
         // Layout FIRST, then commit the main window geometry, so its touch region covers the
         // post-foreground slot.
@@ -938,13 +971,14 @@ class AppInfoProvider {
             self.lastSettledGeneration = self.pendingGeometryGeneration
             self.commitMainWindowGeometry()
         }
-        // Backstop: a guest without TweakLoader never reports frame-ready; never leave a card
-        // covered forever.
+        // Backstop: a guest without TweakLoader never reports frame-ready; never leave a frozen
+        // frame stuck on a card forever. Only the frozen frame is lifted here — a still-cold
+        // starting window's launch placeholder must survive a foreground round-trip.
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             guard let self else { return }
             for app in self.apps {
                 (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
-                    .hideContentCovers(animated: true)
+                    .hideFrozenFrame(animated: true)
             }
         }
     }
@@ -963,7 +997,7 @@ class AppInfoProvider {
         // Single choke point for the maxWindows guard — every entry path flows through here.
         guard apps.count < MultitaskStageLayout.maxWindows else { return }
 
-        let appName = appInfo?.displayName() ?? "Unknown App"
+        let appName = appInfo?.displayName() ?? "lc.multitask.unknownApp".loc
         let appModel = DockAppModel(appName: appName, appUUID: appUUID, appInfo: appInfo, view: view)
 
         // The model has to land in `apps` in the same runloop turn as the window view: the view is
@@ -1091,10 +1125,11 @@ class AppInfoProvider {
     /// feel like one continuous reflow as well as keep the work per tap small.
     func promoteToMain(index: Int) {
         guard index >= 0, index < apps.count else { return }
-        if index > 0 {
-            let app = apps.remove(at: index)
-            apps.insert(app, at: 0)
-        }
+        // Already in the main slot: repeated taps must not re-run the whole relayout plus a
+        // haptic and a role broadcast (used to make fast tapping visibly jitter).
+        guard index > 0 else { return }
+        let app = apps.remove(at: index)
+        apps.insert(app, at: 0)
         // Flip touch ownership immediately: the old main starts quarantining
         // and the new main releases touches while the promotion animates.
         publishStageRoles(active: true)
@@ -1162,6 +1197,33 @@ class AppInfoProvider {
             alert.addAction(UIAlertAction(title: "lc.common.ok".loc, style: .default))
             presenter.present(alert, animated: true)
         }
+    }
+
+    // MARK: - Pre-launch guarding
+
+    /// Pre-check executed on the ObjC launch path BEFORE the guest process is spawned (the
+    /// stage guard used to run only in `addRunningAppWithInfo`, i.e. after the extension
+    /// request had already launched a guest that then held the container lock forever).
+    /// - nil: launch allowed
+    /// - empty string: the container already has a window on stage (it was just promoted to
+    ///   the main slot); the caller aborts the launch silently
+    /// - non-empty string: localized rejection message the caller surfaces as an error
+    @objc(blockedReasonForNewStageWindowUUID:)
+    public class func blockedReason(forNewStageWindow uuid: String) -> String? {
+        let manager = shared
+        let check: () -> String? = {
+            guard manager.isDockEnabled() else { return nil }
+            if let index = manager.apps.firstIndex(where: { $0.appUUID == uuid }) {
+                manager.promoteToMain(index: index)
+                return ""
+            }
+            if manager.apps.count >= MultitaskStageLayout.maxWindows {
+                return "lc.multitask.stageLimitMessage".loc
+            }
+            return nil
+        }
+        if Thread.isMainThread { return check() }
+        return DispatchQueue.main.sync(execute: check)
     }
 
     // MARK: - Multitask mode check

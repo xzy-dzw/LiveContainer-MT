@@ -356,7 +356,10 @@ class LCAppModel: ObservableObject, Hashable {
                             return
                         }
                         guard let pidNumber = pidNumber else {
-                            continuation.resume(throwing: "Failed to obtain PID from LiveProcess")
+                            continuation.resume(throwing: NSError(
+                                domain: appInfo.displayName(), code: 2,
+                                userInfo: [NSLocalizedDescriptionKey: "lc.multitask.error.noPid".loc]
+                            ))
                             return
                         }
                         Task {
