@@ -357,7 +357,7 @@ class LCAppModel: ObservableObject, Hashable {
                         }
                         guard let pidNumber = pidNumber else {
                             continuation.resume(throwing: NSError(
-                                domain: appInfo.displayName(), code: 2,
+                                domain: self.appInfo.displayName(), code: 2,
                                 userInfo: [NSLocalizedDescriptionKey: "lc.multitask.error.noPid".loc]
                             ))
                             return
