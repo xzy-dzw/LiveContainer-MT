@@ -1,211 +1,89 @@
 <div align="center">
-   <img width="217" height="217" src="./screenshots/livecontainer_icon.png" alt="Logo">
+   <img width="160" height="160" src="./screenshots/livecontainer_icon.png" alt="Logo">
 </div>
-   
 
 <div align="center">
-  <h1><b>LiveContainer</b></h1>
-  <p><i>An app launcher that runs iOS apps without actually installing them! </i></p>
+  <h1><b>LiveContainer 多任务版</b></h1>
+  <p><i>在 LiveContainer 官方预发行版上打造的虚拟窗口多任务分支：一主三副，同屏多开</i></p>
 </div>
-<h6 align="center">
 
-Crowdin Project: [![Crowdin](https://badges.crowdin.net/livecontainer/localized.svg)](https://crowdin.com/project/livecontainer) &nbsp;| &nbsp; Documentation:[liveconainer.github.io](https://livecontainer.github.io/docs/intro)
+<p align="center">
+  <a href="https://github.com/xzy-dzw/LiveContainer-MT/releases">📦 下载地址（Releases）</a>
+</p>
 
-# LiveContainer
+---
 
-- LiveContainer is an app launcher (not emulator or hypervisor) that allows you to run iOS apps inside it.
-- Allows you to install unlimited apps (3 app/10 app id free developer account limit does not apply here) with only one app & app id. You can also have multiple versions of an app installed with multiple data containers.
-- (Below iOS 26) When JIT is available, codesign is entirely bypassed, no need to sign your apps before installing. Otherwise, your app will be signed with the same certificate used by LiveContainer.
+## 这是什么
 
-> [!CAUTION]
-> **Important Notice Regarding Third-Party Builds of LiveContainer**
->
-> We have recently noticed the appearance of certain closed-source third-party builds of LiveContainer. Please be aware that all your apps are installed within LiveContainer, which means these third-party builds **have full access to your data, including sensitive information such as keychain items and login credentials**. 
-> 
-> Furthermore, please note that we do not provide any support for issues of these third-party builds.
+本项目是 [LiveContainer](https://github.com/LiveContainer/LiveContainer) 的非官方中文分支，在官方预发行版（nightly，基线提交 `4dbe0f9`）完整源码之上，加入了虚拟窗口多任务内核。所有多任务代码集中在 `MultitaskSupport/` 目录和 guest 侧的 `TweakLoader/UIKit+GuestHooks.m`，构建脚本与 GitHub Actions 编译流程跟随官方，每次发布都产出与官方同名的两个 IPA：
 
+| 文件 | 说明 | 适合谁 |
+|---|---|---|
+| **LiveContainer.ipa** | 单文件版，只含 LiveContainer 本体（约 4.5 MB） | 用证书自签、AltStore、TrollStore 等方式安装的用户 |
+| **LiveContainer+SideStore.ipa** | 二合一版，内置 SideStore（约 34 MB） | 想免电脑签名、7 天自动重签的用户 |
 
-# Installation
-**LiveContainer comes with a standalone version and a version with built-in SideStore. [Please read the install guide here](https://livecontainer.github.io/docs/installation)**
+> 两个包的**多任务功能完全一致**，区别只是是否内置 SideStore。用 SideStore 二合一版时，安装升级请选择「保留 App 扩展（Keep App Extensions）」。
 
-If you encounter any issue please [read our FAQ here](https://livecontainer.github.io/docs/faq)
+## 多任务功能特性
 
-### Standalone 
-<table>
-<tr>
-<td>
-Stable
-</td>
-<td>
-<a href="https://stikstore.app/altdirect/?url=https://github.com/LiveContainer/LiveContainer/releases/download/1.0/apps.json&exclude=livecontainer" target="_blank">
-   <img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/AltSource_Blue.png" alt="Add AltSource" width="200"/>
-</a>
-</td>
-<td>
-<a href="https://github.com/LiveContainer/LiveContainer/releases/latest/download/LiveContainer.ipa" target="_blank">
-   <img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/Download_Blue.png" alt="Download .ipa" width="200"/>
-</a>
-</td>
-</tr>
-<tr>
-<td>
-Nightly
-</td>
-<td>
-<a href="https://stikstore.app/altdirect/?url=https://github.com/LiveContainer/LiveContainer/releases/download/nightly/apps_nightly.json&exclude=livecontainer" target="_blank">
-   <img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/AltSource_Blue.png" alt="Add AltSource" width="200"/>
-</a>
-</td>
-<td>
-<a href="https://github.com/LiveContainer/LiveContainer/releases/download/nightly/LiveContainer.ipa" target="_blank">
-   <img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/Download_Blue.png" alt="Download .ipa" width="200"/>
-</a>
-</td>
-</tr>
-</table>
+- **一主三副虚拟窗口舞台**：最多 4 个小 App 同屏运行，点副窗即切主位，带弹性分屏动画与玻璃控制条
+- **冷启动占位封面**：大 App 加载时显示「图标 + 名称 + 转圈」而不是黑屏，首帧渲染后自动淡入揭开
+- **切后台不闪黑**：副窗全程保活不挂起；每个 App 失活时自动冻结最后一屏，回前台先盖真画面再换新帧
+- **锁屏/息屏保活**：多任务舞台期间屏幕常亮，并通过混音播放会话让宿主与小 App 锁屏后不被系统冻结
+- **看门狗兜底**：每秒健康检查，基于真实进程号（getpgid）收尸崩溃窗口，**不会误杀主线程暂时卡顿的健康 App**；孤儿进程与容器锁自动回收
+- **电竞风帧数显示**：SF Mono 等宽数字 + 霓虹绿 OSD 芯片，跳帧不抖动
+- 支持点击链接跳转宿主、画中画最小化、多任务设置项（默认多任务启动、首次启动最大化等）
 
-### LiveContainer+SideStore
-|Stable|Nightly|
-|:-:|:-:|
-|<a href="https://github.com/LiveContainer/LiveContainer/releases/latest/download/LiveContainer+SideStore.ipa" target="_blank"><img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/Download_Blue.png" alt="Download .ipa" width="200" /></a>|<a href="https://github.com/LiveContainer/LiveContainer/releases/download/nightly/LiveContainer+SideStore.ipa" target="_blank"><img src="https://raw.githubusercontent.com/StikStore/altdirect/refs/heads/main/assets/png/Download_Blue.png" alt="Download .ipa" width="200" /></a>|
+## 系统要求
 
+- iOS / iPadOS 16.0 及以上（推荐 iOS 17+，真机主要在 iOS 26 上验证）
+- 侧载安装需开启「设置 → 隐私与安全性 → 开发者模式」
+- 安装或升级 IPA 时选择「保留 App 扩展」，否则多任务 guest 进程无法拉起
 
-## Requirements
+## 安装方法
 
-- iOS/iPadOS 15+
-   + Multitasking requires iOS/iPadOS 16.0+
-- AltStore 2.0+ / SideStore 0.6.0+
+1. 前往 [Releases](https://github.com/xzy-dzw/LiveContainer-MT/releases) 下载需要的 IPA
+2. 用你常用的侧载工具安装（证书签名 / AltStore / SideStore / TrollStore 等）
+3. 首次打开多开的 App 前，在 LiveContainer 设置里确认多任务模式为「虚拟窗口」
+4. 二合一版的 SideStore 签名配置（Apple ID、自动刷新）属于 SideStore 功能，请参考 [SideStore 官方文档](https://docs.sidestore.io/)
 
+## 使用方法
 
-# Features & Guides
+- 在 App 列表点开任意 App，即自动进入多任务舞台；连续打开最多 4 个
+- 点任意副窗口卡片：切到主位；点玻璃条上的按钮：全屏 / 关闭
+- 从屏幕底部 Dock 可以再启动其他 App；第 5 个窗口会被中文提示拦下（请先关闭一个）
+- 同一 App 重复启动不会再开一个窗口，而是把已有窗口提到主位
 
-### Installing Apps
-- Open LiveContainer, tap the plus icon in the upper right hand corner and select IPA files to install.
-- Choose the app you want to open in the next launch.
-- You can long-press the app to manage it.
+## 目录结构（多任务代码在哪）
 
-### [Add Apps to Home Screen](https://livecontainer.github.io/docs/guides/add-to-home-screen)
+```
+LiveContainer/
+├── MultitaskSupport/              ★ 多任务内核（host 侧）
+│   ├── MultitaskDockView.swift      舞台管理器：窗口、布局、看门狗、保活
+│   ├── MultitaskStage.swift         分屏布局与 FPS 计数芯片
+│   ├── MultitaskManager.swift       容器锁与孤儿进程回收
+│   ├── AppSceneViewController.*     guest 场景承载（_UISceneHostingController）
+│   ├── DecoratedAppSceneViewController.*  窗口卡片、启动封面、冻结帧
+│   ├── LCStageIPC.h                 host 与 guest 的 Darwin/IPC 通道
+│   └── UIKitHooks.m                 host 侧触摸与通知钩子
+├── TweakLoader/
+│   └── UIKit+GuestHooks.m         ★ guest 侧：心跳、冻结帧截图、首帧上报
+└── LiveContainerSwiftUI/Views/Settings/
+    └── LCMultitaskSettingView.swift  多任务设置页
+```
 
-### [Multiple LiveContainers](https://livecontainer.github.io/docs/guides/multiple-livecontainers)
-Using multiple LiveContainers allows you to run multiples different apps simultaneously, with *almost* seamless data transfer between the LiveContainers.
+## 从源码构建
 
-### [Multitasking](https://livecontainer.github.io/docs/guides/multitask)
-You can now launch multiple apps simultaneously in in-app virtual windows. These windows can be resized, scaled, and even displayed using the native Picture-in-Picture (PiP) feature. On iPads, apps can run in native window mode, displaying each app in a separate system window. And if you wish, you can choose to run apps in multitasking mode by default in settings.
+项目包含官方全部源码与三个子模块（fishhook / OpenSSL / litehook），CI 流程与官方一致：
 
-To use multitasking, hold its banner and tap **"Multitask"**. You can also make Multitask the default launch mode in settings.
+- 推送到 `main` 或提交 PR：自动构建两个 IPA 作为构建产物（不发布 Release）
+- 手动执行「构建 IPA」工作流并勾选「发布中文 Release」：构建成功后自动创建中文 Release 并上传两个 IPA
 
->[!Note]
->1. To use multitasking, ensure you select **"Keep App Extensions"** when installing via SideStore/AltStore.  
->2. If you want to enable JIT for multitasked apps, you’ll need a JIT enabler that supports attaching by PID. (StikDebug)
+本地复现官方打包：安装 Xcode 26.2 后直接使用工程根目录的 `.github/build_github.sh`；仓库外层提供的 `build.sh` 用于补丁链整合与静态校验。
 
-### [JIT Support](https://livecontainer.github.io/docs/guides/jit-support)
-### [Installing external tweaks](https://livecontainer.github.io/docs/guides/tweaks)
-### [Multiple Containers/External Containers](https://livecontainer.github.io/docs/guides/containers-and-external-data)
-### [Hiding Apps](https://livecontainer.github.io/docs/guides/lock-app)
+## 致谢与声明
 
-### Fix File Picker & Local Notification
-Some apps may experience issues with their file pickers or not be able to apply for notification permission in LiveContainer. To resolve this, enable "Fix File Picker" & "Fix Local Notifications" accordingly in the app-specific settings.
-
-### "Open In App" Support
-- You can simply share a URL or a file to app simply by using iOS's native share sheet. In share sheet, select LiveContainer, and LiveContainer will ask you which app you'd like to open that URL/file in.
-- What's more, you also can tap the link icon in the top-right corner of the "Apps" tab and input the URL. LiveContainer will detect the appropriate app and ask if you want to launch it.
-
-## Compatibility
-Unfortunately, not all apps work in LiveContainer, so we have a [compatibility list](https://github.com/LiveContainer/LiveContainer/labels/compatibility) to tell if there is apps that have issues. If they aren't on this list, then it's likely going run. However, if it doesn't work, please make an [issue](https://github.com/LiveContainer/LiveContainer/issues/new/choose) about it.
-
-## Building
-Open Xcode, edit `DEVELOPMENT_TEAM[config=Debug]` in `xcconfigs/Global.xcconfig` to your team id and compile.
-
-## Project structure
-### Main executable
-- Core of LiveContainer
-- Contains the logic of setting up guest environment and loading guest app.
-- If no app is selected, it loads LiveContainerSwiftUI.
-
-### LiveContainerSwiftUI
-- SwiftUI rewrite of LiveContainerUI (by @hugeBlack)
-- Language file `Localizable.xcstrings` is in here for multilingual support. To help us translate LiveContainer, please visit [our crowdin project](https://crowdin.com/project/livecontainer)
-
-### MultitaskSupport
-- Contains the implementation of multitasking feature.
-- Based on [FrontBoardAppLauncher](https://github.com/khanhduytran0/FrontBoardAppLauncher)
-
-### SideStore
-- Supporting code for SideStore's app refreshing integration
-
-### TweakLoader
-- A simple tweak injector, which loads CydiaSubstrate and loads tweaks.
-- Injected to every app you install in LiveContainer.
-
-### ZSign
-- The app signer shipped with LiveContainer.
-- Originally made by [zhlynn](https://github.com/zhlynn/zsign).
-- LiveContainer uses [Feather's](https://github.com/khcrysalis/Feather) version of ZSign modified by khcrysalis.
-- Changes are made to meet LiveContainer's needs.
-
-## How does it work?
-
-### Patching guest executable
-- Patch `__PAGEZERO` segment:
-  + Change `vmaddr` to `0xFFFFC000` (`0x100000000 - 0x4000`)
-  + Change `vmsize` to `0x4000`
-- Change `MH_EXECUTE` to `MH_DYLIB`.
-- Inject a load command to load `TweakLoader.dylib`
-
-### Patching `@executable_path`
-- Hook `dyld4::APIs::_NSGetExecutablePath`
-- Call `_NSGetExecutablePath`
-- Replace `config.process.mainExecutablePath`
-  - Calculate address of `config.process.mainExecutablePath` using `dyld4::APIs` instance (passed as first parameter)
-  - Use `builtin_vm_protect` or TPRO unlock to make it writable
-  - Replace the address with one we have control of
-- Put the original `dyld4::APIs::_NSGetExecutablePath` back
-
-> Old Method
->- Call `_NSGetExecutablePath` with an invalid buffer pointer input -> SIGSEGV
->- Do some [magic stuff](https://github.com/khanhduytran0/LiveContainer/blob/5ef1e6a/main.m#L74-L115) to overwrite the contents of executable_path.
-
-### Patching `NSBundle.mainBundle`
-- This property is overwritten with the guest app's bundle.
-
-### Bypassing Library Validation
-- JIT is optional to bypass codesigning. In JIT-less mode, all executables are signed so this does not apply.
-- Derived from [Restoring Dyld Memory Loading](https://blog.xpnsec.com/restoring-dyld-memory-loading)
-
-### dlopening the executable
-- Call `dlopen` with the guest app's executable
-- TweakLoader loads all tweaks in the selected folder
-- Find the entry point
-- Jump to the entry point
-- The guest app's entry point calls `UIApplicationMain` and start up like any other iOS apps.
-
-### Multi-Account support & Keychain Semi-Separation
-[128 keychain access groups](./entitlements.xml) are created and LiveContainer allocates them randomly to each container of the same app. So you can create 128 container with different keychain access groups.
-
-## Limitations
-- Entitlements from the guest app are not applied to the host app. This isn't a big deal since sideloaded apps requires only basic entitlements.
-- App Permissions are globally applied.
-- Guest app containers are not sandboxed. This means one guest app can access other guest apps' data.
-- App extensions aren't supported. they cannot be registered because: LiveContainer is sandboxed, SpringBoard doesn't know what apps are installed in LiveContainer, and they take up App ID.
-- Multitasking can be achieved by using multiple LiveContainer and the multitasking feature. However, while we were able to fix physical keyboard input issue on iPadOS (https://github.com/LiveContainer/LiveContainer/issues/524), iPhone Mirroring uses different checks which still broke it (https://github.com/LiveContainer/LiveContainer/issues/793).
-- Remote push notification will not work
-- Querying custom URL schemes might not work(?)
-
-## TODO
-- Use ChOma instead of custom MachO parser
-
-## License
-[GNU Affero General Public License v3.0](https://github.com/LiveContainer/LiveContainer/blob/main/LICENSE)
-
-## Credits
-- [xpn's blogpost: Restoring Dyld Memory Loading](https://blog.xpnsec.com/restoring-dyld-memory-loading)
-- [LinusHenze's CFastFind](https://github.com/pinauten/PatchfinderUtils/blob/master/Sources/CFastFind/CFastFind.c): [MIT license](https://github.com/pinauten/PatchfinderUtils/blob/master/LICENSE)
-- [litehook](https://github.com/opa334/litehook): [MIT license](https://github.com/opa334/litehook/blob/main/LICENSE)
-- @haxi0 & @m1337v for icon
-- @Vishram1123 for the initial shortcut implementation.
-- @hugeBlack for SwiftUI contribution
-- @Staubgeborener for automatic AltStore/SideStore source updater
-- @fkunn1326 for improved app hiding
-- @slds1 for dynamic color feature
-- @Vishram1123 for iOS 26+ JIT Script Support
-- @StephenDev0 for AltStore source support
+- 内核基于 [LiveContainer](https://github.com/LiveContainer/LiveContainer)（nightly，`4dbe0f9`）
+- 二合一版内置 [SideStore](https://github.com/SideStore/SideStore)
+- 本项目为爱好者非官方分支，与 LiveContainer / SideStore 官方无关；遇到问题请先在本仓库 Issues 反馈
+- 仅供学习交流与个人备份使用，请遵守所在地法律法规及相关软件许可

@@ -1,53 +1,58 @@
-name: LiveContainer UI / Extension Bug Report
-description: Report a bug when using LiveContainer's own UI or extension.
-title: "[BUG] "
+name: 问题反馈
+description: 反馈多任务版 LiveContainer 的 Bug 或使用问题
+title: "[问题] "
 labels: ["bug"]
 body:
-  - type: markdown
+  - type: dropdown
+    id: package
     attributes:
-      value: |
-        Thanks for taking the time to fill out this bug report! Before you continue filling out the report, please **[read our FAQ](https://github.com/LiveContainer/LiveContainer/issues/265) and [search in GitHub Issues](https://github.com/LiveContainer/LiveContainer/issues) for the bug you are experiencing.**
-
-  - type: textarea
-    id: description
-    attributes:
-      label: Describe the bug
-      description: What is the bug and how did you discover it?
-      placeholder: Please be concise with your description.
-    validations:
-      required: true
-  - type: textarea
-    id: how-to-reproduce
-    attributes:
-      label: Instructions to reproduce
-      description: Please include consistent instructions for reproducing the bug.
+      label: 使用的安装包
+      options:
+        - 单文件版 LiveContainer.ipa
+        - 二合一版 LiveContainer+SideStore.ipa
     validations:
       required: true
   - type: input
-    id: app-version
+    id: version
     attributes:
-      label: What version of LiveContainer and iOS are you using?
-      description: To retrieve LiveContainer version, go to LiveContainer settings, then scroll to the bottom of the page.
+      label: 多任务版版本号
+      description: 在 App 内关于页面或 Release 标签查看，例如 mt-v4.0.0
+      placeholder: mt-v4.0.0
     validations:
       required: true
-  - type: checkboxes
+  - type: input
+    id: device
     attributes:
-      label: Verify steps
-      options:
-        - label: I downloaded LiveContainer from releases / actions section or LiveContainer's AltStore source.
-        - label: I have the latest LiveContainer.
-        - label: I installed LiveContainer through AltStore/SideStore/Impactor/iloader/TrollStore or I'm confident that I signed LiveContainer correctly with all required entitlements.
-    validations:
-      required: true
-  - type: textarea
-    id: crash-log
-    attributes:
-      label: Crash Log
-      description: If a crash happened, please upload the crash log in iOS settings - Privacy Security - Analytics Improvements - Analytics Data - Search LiveContainer/LiveProcess. **Do not copy and paste.** Instead, please change .ips to .txt and upload it. If you are certain no crash report is produced, type "no crash report is produced".
+      label: 设备与系统版本
+      placeholder: 例如 iPhone 13 Pro Max / iOS 26.7
     validations:
       required: true
   - type: textarea
-    id: other-info
+    id: what-happened
     attributes:
-      label: Other info
-      description: If you have any other info that might be useful, or if you found a workaround, please put it here.
+      label: 问题描述
+      description: 出现了什么问题？预期应该是什么表现？
+      placeholder: 尽量描述清楚现象、出现频率、能否稳定复现
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开……
+        2. 点击……
+        3. 出现……
+    validations:
+      required: false
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充材料
+      description: 截图、录屏、日志等（可直接粘贴图片）
+    validations:
+      required: false
+  - type: markdown
+    attributes:
+      value: |
+        > 说明：本仓库仅维护多任务功能。LiveContainer 本体与 SideStore 上游的问题请反馈给对应官方仓库。

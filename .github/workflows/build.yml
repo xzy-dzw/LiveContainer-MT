@@ -1,18 +1,36 @@
-name: Xcode - Build
+name: 构建 IPA
 
-on: 
+# 构建流程严格跟随 LiveContainer 官方预发行版：
+#   同一个 xcodebuild archive 产物，经 .github/build_github.sh 分别打包成
+#   LiveContainer.ipa（单文件版）和 LiveContainer+SideStore.ipa（二合一版）。
+# 推送到 main 或提交 PR 时只做构建验证；发布中文 Release 需要手动执行工作流并勾选发布。
+on:
   push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
-    inputs: 
-      release__nightly:
-        description: Create a nightly release
+    inputs:
+      publish_release:
+        description: 构建完成后发布中文 Release
         type: boolean
+        default: false
+      release_tag:
+        description: Release 标签名（例如 mt-v4.0.0）
+        type: string
+        required: false
+      release_title:
+        description: Release 标题
+        type: string
+        required: false
+      release_notes:
+        description: Release 说明（中文，支持多行 Markdown）
+        type: string
         required: false
 
 jobs:
   build:
-    name: Build using xcodebuild command
+    name: 构建双版本 IPA
     runs-on: macos-latest
     env:
       scheme: LiveContainer
@@ -23,124 +41,106 @@ jobs:
       artifact: ${{ env.scheme }}.ipa
       artifact2: ${{ env.scheme }}+SideStore.ipa
     steps:
-      - uses: maxim-lobanov/setup-xcode@v1
+      - name: 选择 Xcode 版本
+        uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: '26.2'
-      - name: Checkout
+      - name: 检出源码（含子模块）
         uses: actions/checkout@v6
         with:
           submodules: recursive
-      - name: Set Scheme
+      - name: 确定构建 Scheme
         id: scheme
         run: |
           if [ $scheme = default ]
           then
             scheme_list=$(xcodebuild -list -json | tr -d "\n")
             scheme=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-            echo Using default scheme: $scheme
+            echo 使用默认 scheme: $scheme
           else
-            echo Using configured scheme: $scheme
+            echo 使用指定 scheme: $scheme
           fi
           echo "scheme=$scheme" >> $GITHUB_OUTPUT
-      - name: Set filetype_parameter
+      - name: 判断工程类型
         id: filetype_parameter
         run: |
           filetype_parameter=`ls -A | grep -i \\.xcworkspace\$ && echo workspace || echo project`
           echo "filetype_parameter=$filetype_parameter" >> $GITHUB_OUTPUT
-      - name: Set file_to_build
+      - name: 定位工程文件
         id: file_to_build
         run: |
           file_to_build=`ls -A | grep -i \\.xcworkspace\$ || ls -A | grep -i \\.xcodeproj\$`
           file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
           echo "file_to_build=$file_to_build" >> $GITHUB_OUTPUT
-      - name: Stamp build commit
+      - name: 写入本次构建的提交号
         run: /usr/libexec/PlistBuddy -c "Set :LCBuildCommit ${GITHUB_SHA:0:7}" LiveContainer/Info.plist
-      - name: Archive
+      - name: 归档编译（Release）
         env:
           scheme: ${{ steps.scheme.outputs.scheme }}
           filetype_parameter: ${{ steps.filetype_parameter.outputs.filetype_parameter }}
           file_to_build: ${{ steps.file_to_build.outputs.file_to_build }}
         run: xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release | xcpretty && exit ${PIPESTATUS[0]}
-      - name: Tar Build Artifact
+      - name: 打包归档产物
         run: tar -cvf "$archive_path.xcarchive.tar" "$archive_path.xcarchive"
-      - name: Upload a Build Artifact
+      - name: 上传归档产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.archive_path }}.xcarchive.tar
           path: ${{ env.archive_path }}.xcarchive.tar
-      - name: Create IPA
+      - name: 生成单文件版与二合一版 IPA
         run: |
           sh .github/build_github.sh
-
-      - name: Upload a Build Artifact
+      - name: 上传单文件版 IPA
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.scheme }}.ipa
           path: ${{ env.scheme }}.ipa
-      
-      - name: Upload LiveContainer+SideStore
+          if-no-files-found: error
+      - name: 上传二合一版 IPA（LiveContainer+SideStore）
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.scheme }}+SideStore.ipa
           path: ${{ env.scheme }}+SideStore.ipa
+          if-no-files-found: error
 
-  release__nightly:
-    name: Nightly Release
+  publish_release:
+    name: 发布中文 Release
+    needs: [build]
+    if: ${{ inputs.publish_release == true }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    if: inputs.release__nightly || github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
-    needs: [build]
-    concurrency:
-      group: release__nightly
-      cancel-in-progress: true
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Download a Build Artifact
+      - name: 检出源码
+        uses: actions/checkout@v6
+      - name: 下载单文件版 IPA
         uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.artifact }}
-      - name: Download a Build Artifact2
+      - name: 下载二合一版 IPA
         uses: actions/download-artifact@v8
         with:
           name: ${{ needs.build.outputs.artifact2 }}
-      - name: Get Commit Info
-        id: commit_info
-        run: |
-          COMMIT_SHA=$(git rev-parse HEAD)
-          COMMIT_MSG=$(git log -1 --pretty=%s)
-          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
-          echo "COMMIT_MSG=$COMMIT_MSG" >> $GITHUB_ENV
-      - name: Update AltStore source
-        id: update_source
+      - name: 生成发行说明文件
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NIGHTLY_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
-          commit_sha: ${{ env.COMMIT_SHA }}
-          commit_msg: ${{ env.COMMIT_MSG }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
-          python .github/update_json.py
-      - name: Nightly Release
-        uses: andelf/nightly-release@5834076edc55cc05975561c9722043f072ac5c26
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with: 
-          body: |
-            **Commit:** [${{ github.sha }}](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
-            **Message:** ${{ github.event.head_commit.message }}
-            
-            This is a nightly release [created automatically with GitHub Actions workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}).
+          set -eu
+          test -n "$RELEASE_TAG"
+          test -n "$RELEASE_TITLE"
+          printf '%s\n' "$RELEASE_NOTES" > RELEASE_NOTES.md
+          echo "准备发布: $RELEASE_TAG / $RELEASE_TITLE"
+          ls -lh *.ipa
+      - name: 创建 GitHub Release 并上传双 IPA
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_title }}
+          body_path: RELEASE_NOTES.md
           files: |
             ${{ needs.build.outputs.artifact }}
             ${{ needs.build.outputs.artifact2 }}
-            .github/apps_nightly.json
-      - name: Update apps.json in Release 1.0
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: "1.0"
-          files: |
-            .github/apps_ss_lc.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
