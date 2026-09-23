@@ -285,6 +285,7 @@ class MultitaskRelaunchManager: NSObject {
     /// Unlike scheduleRelaunchIfNeeded this is immediate (the slot is already showing a cover),
     /// ignores relaunch settings/lastLaunched timing, and reports failure back so the stage can
     /// drop the slot instead of spinning forever.
+    @available(iOS 16.0, *)
     static func recoverGuest(bundleId: String, dataUUID: String) {
         let key = "recover#\(bundleId)#\(dataUUID)"
         guard markPendingIfNeeded(key: key) else { return }

@@ -63,7 +63,9 @@ struct LCMultitaskSettingView: View {
                         }
                     }
                     .onChange(of: keepAliveAudio) { _ in
-                        MultitaskDockManager.shared.applyKeepAliveSettings()
+                        if #available(iOS 16.0, *) {
+                            MultitaskDockManager.shared.applyKeepAliveSettings()
+                        }
                     }
                     Toggle(isOn: $keepAlivePiP) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -74,7 +76,9 @@ struct LCMultitaskSettingView: View {
                         }
                     }
                     .onChange(of: keepAlivePiP) { _ in
-                        MultitaskDockManager.shared.applyKeepAliveSettings()
+                        if #available(iOS 16.0, *) {
+                            MultitaskDockManager.shared.applyKeepAliveSettings()
+                        }
                     }
                     Toggle(isOn: $autoRecoverGuest) {
                         VStack(alignment: .leading, spacing: 2) {

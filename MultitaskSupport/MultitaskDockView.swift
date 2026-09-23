@@ -348,7 +348,7 @@ private final class StagePiPKeepAlive: NSObject {
         if let hostView, hostView.window === window, pipController != nil { return }
         teardownViews()
 
-        let view = UIView(frame: CGRect(x: 1, y: window.bounds.maxY - 2, width: 1, height: 1))
+        let view = UIView(frame: CGRect(x: 0.1, y: window.bounds.maxY - 0.2, width: 0.1, height: 0.1))
         view.backgroundColor = .black
         view.isUserInteractionEnabled = false
         view.clipsToBounds = true
@@ -417,9 +417,10 @@ private final class StagePiPKeepAlive: NSObject {
         }
         CVPixelBufferUnlockBaseAddress(buffer, [])
         pixelBuffer = buffer
-        CMVideoFormatDescriptionCreate(kCFAllocatorDefault,
-                                       kCVPixelFormatType_32BGRA,
-                                       1, 1, nil, &formatDescription)
+        CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault,
+                                       codecType: kCVPixelFormatType_32BGRA,
+                                       width: 1, height: 1, extensions: nil,
+                                       formatDescriptionOut: &formatDescription)
     }
 
     private func setupController(with layer: AVSampleBufferDisplayLayer) {
@@ -459,7 +460,11 @@ private final class StagePiPKeepAlive: NSObject {
             decodeTimeStamp: .invalid
         )
         var sample: CMSampleBuffer?
-        CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fmt, &timing, &sample)
+        CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault,
+                                                 imageBuffer: pb,
+                                                 formatDescription: fmt,
+                                                 sampleTiming: &timing,
+                                                 sampleBufferOut: &sample)
         if let sample { layer.enqueue(sample) }
     }
 
