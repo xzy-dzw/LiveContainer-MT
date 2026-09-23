@@ -516,7 +516,9 @@ extension StagePiPKeepAlive: AVPictureInPictureControllerDelegate {
 extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {}
 
-    func pictureInPictureControllerTimeRange(forPlayback controller: AVPictureInPictureController) -> CMTimeRange {
+    // Xcode 26 SDK imports pictureInPictureControllerTimeRangeForPlayback: with no first
+    // argument label (older SDKs imported it as timeRange(forPlayback:)).
+    func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
         // Infinite live range: the last black frame keeps the session alive without a constant feed.
         CMTimeRange(start: .zero, duration: .positiveInfinity)
     }
