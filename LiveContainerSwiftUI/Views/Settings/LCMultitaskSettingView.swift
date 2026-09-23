@@ -20,6 +20,7 @@ struct LCMultitaskSettingView: View {
     @AppStorage("LCStageKeepAliveAudio", store: LCUtils.appGroupUserDefault) var keepAliveAudio = true
     @AppStorage("LCAutoRecoverGuest", store: LCUtils.appGroupUserDefault) var autoRecoverGuest = true
     @AppStorage("LCStageKeepAlivePiP", store: LCUtils.appGroupUserDefault) var keepAlivePiP = true
+    @AppStorage("LCStageKeepAliveLocation", store: LCUtils.appGroupUserDefault) var keepAliveLocation = true
 
     var body: some View {
         List {
@@ -76,6 +77,19 @@ struct LCMultitaskSettingView: View {
                         }
                     }
                     .onChange(of: keepAlivePiP) { _ in
+                        if #available(iOS 16.0, *) {
+                            MultitaskDockManager.shared.applyKeepAliveSettings()
+                        }
+                    }
+                    Toggle(isOn: $keepAliveLocation) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("lc.settings.stageKeepAliveLocation".loc)
+                            Text("lc.settings.stageKeepAliveLocation.detail".loc)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .onChange(of: keepAliveLocation) { _ in
                         if #available(iOS 16.0, *) {
                             MultitaskDockManager.shared.applyKeepAliveSettings()
                         }

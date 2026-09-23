@@ -27938,6 +27938,38 @@
         }
       }
     },
+    "lc.settings.stageKeepAliveLocation" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Location strongest keep-alive"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "定位最强保活（推荐）"
+          }
+        }
+      }
+    },
+    "lc.settings.stageKeepAliveLocation.detail" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keeps a continuous-location session like a navigation app, so the system reclaims multitask windows last even while other apps interrupt audio or PiP. Distance filter is maxed so GPS is barely powered; a location arrow may show in the status bar. Requires \"Always\" location permission."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "像导航 App 一样维持持续定位会话，即使其他 App 打断音频或挤掉画中画，系统也会最后才回收多任务窗口。已把距离过滤拉满，基本不真正唤醒 GPS；状态栏可能出现定位箭头。需要授予「始终允许」定位权限。"
+          }
+        }
+      }
+    },
     "lc.settings.stageKeepAlivePiP" : {
       "localizations" : {
         "en" : {
@@ -27959,13 +27991,13 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Adds a second, independent background channel. While backgrounded a small black floating window appears (drag it to a screen edge) and apps are even harder for the system to kill. Does not affect the 120fps of multitask windows."
+            "value" : "Adds a second, independent background channel. While backgrounded an ultra-thin hairline PiP window appears in a screen corner (effectively invisible, drag it to the edge) and apps are even harder for the system to kill. Does not affect the 120fps of multitask windows."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "额外增加一条独立的后台保活通道。切到后台时屏幕会出现一个黑色小悬浮窗（可拖到屏幕边缘磁吸），窗口更难被系统回收；不影响多任务窗口的 120fps 帧率。"
+            "value" : "额外增加一条独立的后台保活通道。切到后台时屏幕角落只出现一条发丝般的极细画中画（几乎不可见，可拖到屏幕边缘磁吸），窗口更难被系统回收；不影响多任务窗口的 120fps 帧率。"
           }
         }
       }

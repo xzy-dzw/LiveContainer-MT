@@ -13,6 +13,7 @@ import ObjectiveC.runtime
 import AVFoundation
 import AVKit
 import CoreMedia
+import CoreLocation
 
 // MARK: - App Info Provider
 class AppInfoProvider {
@@ -297,6 +298,102 @@ private final class StageAudioKeepAlive {
     }
 }
 
+// MARK: - Real keep-alive location (host, primary channel)
+
+/// STRONGEST of the three host-side background assertions: an app that is continuously using
+/// location is treated by the system like a navigation app and is the last process jetsam reaps
+/// under memory pressure. It is independent of AVAudioSession, so a native app (WeChat voice
+/// message, phone call) that interrupts or suspends our playback cannot touch this assertion.
+///
+/// Battery is kept minimal: desiredAccuracy is Best (which also makes iOS treat the session as
+/// navigation-level, showing the status-bar arrow less), while distanceFilter is essentially
+/// infinite so the GPS radio is not actually woken up to fix positions. We never read the
+/// coordinates; the session itself is the point.
+@available(iOS 16.0, *)
+private final class StageLocationKeepAlive: NSObject {
+    static let shared = StageLocationKeepAlive()
+
+    private let manager = CLLocationManager()
+    private var isArmed = false
+
+    private override init() {
+        super.init()
+        manager.delegate = self
+    }
+
+    var isAuthorized: Bool {
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse: return true
+        default: return false
+        }
+    }
+
+    func arm() {
+        guard !isArmed else { return }
+        isArmed = true
+        guard CLLocationManager.locationServicesEnabled() else {
+            NSLog("[LCStage][保活] 定位通道待命，但系统定位服务未开启（音轨+PiP 继续兜底）")
+            return
+        }
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+        // Effectively "never actually move": do not wake the GPS radio to fix positions, only keep
+        // the continuous-location session alive.
+        manager.distanceFilter = 999_999
+        manager.allowsBackgroundLocationUpdates = true
+        manager.pausesLocationUpdatesAutomatically = false
+        switch manager.authorizationStatus {
+        case .notDetermined:
+            // First stage entry: ask for Always directly. iOS may grant WhenInUse first and
+            // re-prompt for Always later; didChangeAuthorization starts updates for either.
+            manager.requestAlwaysAuthorization()
+            NSLog("[LCStage][保活] 定位通道请求「始终允许」权限")
+        case .authorizedAlways, .authorizedWhenInUse:
+            manager.startUpdatingLocation()
+            NSLog("[LCStage][保活] 定位通道已启动（\(manager.authorizationStatus == .authorizedAlways ? "始终" : "使用期间")）")
+        case .restricted, .denied:
+            NSLog("[LCStage][保活] 定位权限被拒绝，定位通道不可用（音轨+PiP 继续兜底）")
+        @unknown default:
+            manager.requestAlwaysAuthorization()
+        }
+    }
+
+    func disarm() {
+        guard isArmed else { return }
+        isArmed = false
+        manager.stopUpdatingLocation()
+        NSLog("[LCStage][保活] 定位通道已关闭")
+    }
+
+    // Coordinates are irrelevant — the delegate only exists to drive the session lifecycle.
+    private func beginUpdatesIfPossible(_ status: CLAuthorizationStatus) {
+        guard isArmed else { return }
+        switch status {
+        case .authorizedAlways, .authorizedWhenInUse:
+            // startUpdatingLocation is idempotent; this also covers the WhenInUse → Always upgrade.
+            manager.startUpdatingLocation()
+            NSLog("[LCStage][保活] 定位权限变为已授权，定位通道启动")
+        case .denied, .restricted:
+            NSLog("[LCStage][保活] 定位权限被关闭，定位通道失效（音轨+PiP 继续兜底）")
+        default: break
+        }
+    }
+}
+
+@available(iOS 16.0, *)
+extension StageLocationKeepAlive: CLLocationManagerDelegate {
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        beginUpdatesIfPossible(manager.authorizationStatus)
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {}
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        // Transient errors (no fix available etc.) must not stop the session; the manager keeps
+        // trying and the background assertion stands.
+        NSLog("[LCStage][保活] 定位回调错误（不影响保活会话）: \(error)")
+    }
+}
+
 // MARK: - Real keep-alive PiP (host, second channel)
 
 /// Second, INDEPENDENT background assertion: an always-playing 1pt black "video" makes the system
@@ -307,12 +404,21 @@ private final class StageAudioKeepAlive {
 /// own PiP (e.g. a video call) pushes ours out, the audio assertion keeps the host runnable.
 ///
 /// The feed is 1 frame/second: the assertion only requires a live session, and this feed goes into
-/// a private 1pt AVSampleBufferDisplayLayer — it has nothing to do with the guest windows' render
-/// pipeline, so it never caps their ProMotion 120Hz. A small black PiP window is visible while the
-/// host is backgrounded (a public-API limit on iPhone); the user can drag it to a screen edge.
+/// a private 0.1pt AVSampleBufferDisplayLayer — it has nothing to do with the guest windows' render
+/// pipeline, so it never caps their ProMotion 120Hz.
+///
+/// Invisibility trick: the PiP window's SHAPE follows the aspect ratio of the enqueued video
+/// buffers. A 1×1 buffer produced a large 1:1 black square. We feed a 2048×2 (1024:1) buffer, so at
+/// the system's minimum PiP width the window is a sub-point black hairline tucked in a screen
+/// corner — effectively invisible. The user can still drag it to the edge to magnetize it.
 @available(iOS 16.0, *)
 private final class StagePiPKeepAlive: NSObject {
     static let shared = StagePiPKeepAlive()
+
+    /// Ultra-wide, near-zero-height feed. The exact numbers only need to survive CVPixelBuffer
+    /// creation and describe an extreme aspect ratio; content is pure black.
+    private static let feedWidth = 2048
+    private static let feedHeight = 2
 
     private var hostView: UIView?
     private var displayLayer: AVSampleBufferDisplayLayer?
@@ -407,7 +513,7 @@ private final class StagePiPKeepAlive: NSObject {
             kCVPixelBufferMetalCompatibilityKey as String: true,
         ]
         var pb: CVPixelBuffer?
-        CVPixelBufferCreate(kCFAllocatorDefault, 1, 1,
+        CVPixelBufferCreate(kCFAllocatorDefault, Self.feedWidth, Self.feedHeight,
                             kCVPixelFormatType_32BGRA,
                             attrs as CFDictionary, &pb)
         guard let buffer = pb else { return }
@@ -419,7 +525,8 @@ private final class StagePiPKeepAlive: NSObject {
         pixelBuffer = buffer
         CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault,
                                        codecType: kCVPixelFormatType_32BGRA,
-                                       width: 1, height: 1, extensions: nil,
+                                       width: Int32(Self.feedWidth), height: Int32(Self.feedHeight),
+                                       extensions: nil,
                                        formatDescriptionOut: &formatDescription)
     }
 
@@ -1406,6 +1513,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         return defaults.bool(forKey: LCStageIPCPiPKeepAliveKey)
     }
 
+    /// Continuous-location primary-channel toggle (App Group). Missing key defaults to ON.
+    private var keepAliveLocationEnabled: Bool {
+        let defaults = LCUtils.appGroupUserDefault
+        if defaults.object(forKey: LCStageIPCLocationKeepAliveKey) == nil { return true }
+        return defaults.bool(forKey: LCStageIPCLocationKeepAliveKey)
+    }
+
     /// Called by the settings toggles while a stage is live: start/stop each channel immediately
     /// instead of waiting for the next stage entry.
     @objc func applyKeepAliveSettings() {
@@ -1421,6 +1535,11 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         } else {
             StagePiPKeepAlive.shared.disarm()
         }
+        if keepAliveLocationEnabled {
+            StageLocationKeepAlive.shared.arm()
+        } else {
+            StageLocationKeepAlive.shared.disarm()
+        }
     }
 
     private func updateStageKeepAlive(active: Bool) {
@@ -1428,6 +1547,12 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         isKeepAliveActive = active
         if active {
             UIApplication.shared.isIdleTimerDisabled = true
+            // Layered lifecycle, weakest to strongest; each layer is independent, so any native
+            // interruption can only knock out one at a time:
+            //   1. silent audio  — playback assertion, mixes with other apps, auto-resumes
+            //   2. hairline PiP  — video assertion, auto-opens in background
+            //   3. location      — navigation-level assertion, survives audio/PiP eviction
+            // Guests additionally arm their own silent track only while the host is backgrounded.
             if keepAliveAudioEnabled {
                 StageAudioKeepAlive.shared.start()
             } else {
@@ -1438,11 +1563,17 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             } else {
                 StagePiPKeepAlive.shared.disarm()
             }
-            NSLog("[LCStage][保活] 舞台保活已激活（静音音轨=\(keepAliveAudioEnabled)，PiP=\(keepAlivePiPEnabled)）")
+            if keepAliveLocationEnabled {
+                StageLocationKeepAlive.shared.arm()
+            } else {
+                StageLocationKeepAlive.shared.disarm()
+            }
+            NSLog("[LCStage][保活] 舞台保活已激活（定位=\(keepAliveLocationEnabled)，音轨=\(keepAliveAudioEnabled)，PiP=\(keepAlivePiPEnabled)）")
         } else {
             UIApplication.shared.isIdleTimerDisabled = false
             StageAudioKeepAlive.shared.stop()
             StagePiPKeepAlive.shared.disarm()
+            StageLocationKeepAlive.shared.disarm()
             endBackgroundTaskIfNeeded()
             NSLog("[LCStage][保活] 舞台保活已关闭")
         }

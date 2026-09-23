@@ -74,6 +74,12 @@ static NSString * const LCStageIPCKeepAliveAudioKey = @"LCStageKeepAliveAudio";
 /// backgrounding opens an automatic PiP session holding a second background assertion.
 static NSString * const LCStageIPCPiPKeepAliveKey = @"LCStageKeepAlivePiP";
 
+/// App Group Bool written by the host's multitask settings page. When YES (default), the host
+/// runs continuous background location updates while the stage is active. This is the STRONGEST
+/// background assertion (navigation-level jetsam resistance); distanceFilter is maxed so GPS is
+/// not really powered. Requires "Always" location authorization.
+static NSString * const LCStageIPCLocationKeepAliveKey = @"LCStageKeepAliveLocation";
+
 /// Guest-written timestamp keys, one per data container.
 static NSString * const LCStageIPCFrameReadyKeyPrefix = @"LCGuestFrameReady.";
 

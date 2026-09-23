@@ -174,7 +174,7 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>The guest app is requesting for this permission.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>The guest app is requesting for this permission.</string>
+	<string>多任务后台保活需要「始终允许」定位：系统会因此像导航 App 一样把多任务窗口留到最后才回收，distanceFilter 已拉满，不会真正采集或上传位置；副窗口内应用的定位请求也复用此权限。 / Required to keep multitask windows alive in the background; no location data is collected or uploaded.</string>
 	<key>NSLocationDefaultAccuracyReduced</key>
 	<true/>
 	<key>NSLocationTemporaryUsageDescriptionDictionary</key>
@@ -182,7 +182,7 @@
 	<key>NSLocationUsageDescription</key>
 	<string>The guest app is requesting for this permission.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>The guest app is requesting for this permission.</string>
+	<string>多任务保活与副窗口应用可能使用定位；不会采集或上传位置。 / Location may be used to keep the multitask stage alive; no data is collected.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>The guest app is requesting for this permission.</string>
 	<key>NSMotionUsageDescription</key>
