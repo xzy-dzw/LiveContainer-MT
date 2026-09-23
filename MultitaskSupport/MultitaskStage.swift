@@ -30,9 +30,9 @@ import UIKit
     static let controlLeadingInset: CGFloat = 12
     /// Trailing inset of the FPS readout, measured from the far edge of the strip.
     static let fpsTrailingInset: CGFloat = 12
-    /// Fixed size of the FPS readout: a 120fps readout in SF Mono 11pt plus the chip padding
-    /// never reflows as the count changes.
-    static let fpsWidth: CGFloat = 58
+    /// Fixed size of the FPS readout: a glass capsule holding a 6pt status dot plus the widest
+    /// value ("120 FPS") so the chip never reflows as the count changes.
+    static let fpsWidth: CGFloat = 70
     static let fpsHeight: CGFloat = 22
     /// Bottom dock, sized like the iOS dock.
     static let dockHeight: CGFloat = 90
@@ -393,16 +393,18 @@ final class MultitaskStageGlassButton: UIButton {
 
 // MARK: - FPS readout
 
-/// The stage's frame rate: how many frames the stage actually presented per second, drawn at the far
-/// end of the blank strip above the windows.
+/// The stage's frame rate readout at the far end of the blank strip above the windows.
 ///
-/// It exists to make performance visible while the user switches between windows, so it only ticks
-/// while the multitask stage is on screen — fullscreen belongs to the guest app, and the readout
-/// leaves with the strip. The look is the gaming OSD players already know from GPU overlays:
-/// SF Mono bold tabular digits with wide tracking, a phosphor-green glow, inside a dark glass
-/// chip. SF Mono is the system monospaced face — the digits never twitch as the number changes,
-/// and no custom font has to ship with the app.
+/// Design: a piece of the SAME glass chrome as the window controls (Liquid Glass capsule on
+/// iOS 26, ultra-thin material elsewhere, solid fill under Reduce Transparency) — not a dark
+/// gaming-OSD chip. Inside, a single 6pt status dot carries the meaning by colour (green:
+/// smooth, amber: strained, red: dropping frames; grey: idle), and the value is set in
+/// monospaced tabular digits so the numerals never twitch as the number updates. The "FPS"
+/// unit is one step quieter than the value. The dot cross-dissolves between states — a status
+/// change, never an alarm flash — and the readout leaves with the strip in fullscreen.
 @objc class MultitaskStageFPSCounterView: UIView {
+    private let glass = UIVisualEffectView(effect: nil)
+    private let statusDot = UIView()
     private let label = UILabel()
     private var link: CADisplayLink?
     private var framesInWindow = 0
@@ -410,8 +412,22 @@ final class MultitaskStageGlassButton: UIButton {
 
     /// Longer than a frame, short enough to show a stutter as it happens.
     private static let sampleInterval: CFTimeInterval = 0.5
-    /// Phosphor green of the in-game performance overlays players compare against.
-    private static let counterGreen = UIColor(red: 0.188, green: 0.820, blue: 0.345, alpha: 1)
+
+    private enum FPSState {
+        case idle, smooth, strained, dropping
+
+        /// Semantic, calm system colours with no glow. Green reads "healthy", amber is a
+        /// warning the eye catches peripherally, red is reserved for actually dropping frames.
+        var color: UIColor {
+            switch self {
+            case .idle: return .tertiaryLabel
+            case .smooth: return .systemGreen
+            case .strained: return .systemYellow
+            case .dropping: return .systemRed
+            }
+        }
+    }
+    private var state: FPSState = .idle
 
     /// Whether the readout should tick. Driven by the stage: on while the split layout is on
     /// screen, off in fullscreen and once the stage is gone.
@@ -429,43 +445,97 @@ final class MultitaskStageGlassButton: UIButton {
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
-        backgroundColor = UIColor.black.withAlphaComponent(0.55)
-        layer.cornerRadius = 6
-        layer.cornerCurve = .continuous
-        // No masksToBounds: the label's green glow would be clipped at the chip edge.
-        layer.borderWidth = MultitaskStageLayout.hairline
-        layer.borderColor = UIColor.white.withAlphaComponent(0.12).cgColor
-
-        label.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
-        label.textColor = Self.counterGreen
-        label.textAlignment = .center
-        // A soft green halo is what makes the digits read as an OSD readout rather than plain
-        // text stamped on the strip.
-        label.layer.shadowColor = Self.counterGreen.cgColor
-        label.layer.shadowOpacity = 0.45
-        label.layer.shadowRadius = 3
-        label.layer.shadowOffset = .zero
-        label.attributedText = readoutText("-- FPS")
-        addSubview(label)
+        backgroundColor = .clear
+        setupMaterial()
+        setupStatusDot()
+        setupLabel()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    /// Wide letter spacing (positive tracking is correct at small sizes) keeps the chip reading
-    /// as instrument typography instead of a sentence.
-    private func readoutText(_ text: String) -> NSAttributedString {
-        NSAttributedString(string: text, attributes: [
-            .font: UIFont.monospacedSystemFont(ofSize: 11, weight: .bold),
-            .kern: 0.6,
-            .foregroundColor: Self.counterGreen,
+    private func setupMaterial() {
+        glass.isUserInteractionEnabled = false
+        glass.clipsToBounds = true
+        glass.layer.cornerCurve = .continuous
+
+        if #available(iOS 26.0, *), SharedModel.isLiquidGlassEnabled {
+            // Same Liquid Glass capsule language as the window controls: chrome made of one
+            // material, not competing chips.
+            glass.cornerConfiguration = .capsule()
+            glass.effect = UIGlassEffect()
+        } else if UIAccessibility.isReduceTransparencyEnabled {
+            glass.effect = nil
+            glass.backgroundColor = .secondarySystemFill
+            addRim()
+        } else {
+            glass.effect = UIBlurEffect(style: .systemUltraThinMaterial)
+            addRim()
+        }
+        addSubview(glass)
+    }
+
+    /// Hairline rim on the fallback material; real Liquid Glass draws its own edge.
+    private func addRim() {
+        glass.layer.borderWidth = MultitaskStageLayout.hairline
+        glass.layer.borderColor = UIColor.label.withAlphaComponent(0.10).cgColor
+    }
+
+    private func setupStatusDot() {
+        statusDot.isUserInteractionEnabled = false
+        statusDot.backgroundColor = state.color
+        statusDot.layer.cornerRadius = 3
+        statusDot.layer.cornerCurve = .continuous
+        glass.contentView.addSubview(statusDot)
+    }
+
+    private func setupLabel() {
+        label.textAlignment = .left
+        label.attributedText = readoutText(value: nil)
+        glass.contentView.addSubview(label)
+    }
+
+    /// Monospaced tabular digits in the label colour (vibrancy keeps them legible over the
+    /// material); the unit is one tone quieter and a hair smaller. Positive micro-tracking is
+    /// correct at this size. No glow, no game-OSD green.
+    private func readoutText(value: Int?) -> NSAttributedString {
+        let digits = value.map(String.init) ?? "--"
+        let full = "\(digits) FPS"
+        let result = NSMutableAttributedString(string: full, attributes: [
+            .font: UIFont.monospacedSystemFont(ofSize: 11, weight: .semibold),
+            .kern: 0.2,
+            .foregroundColor: UIColor.label.withAlphaComponent(0.92),
         ])
+        let unitRange = NSRange(location: (full as NSString).length - 3, length: 3)
+        result.addAttributes([
+            .font: UIFont.monospacedSystemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: UIColor.secondaryLabel,
+        ], range: unitRange)
+        return result
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        label.frame = bounds
+        glass.frame = bounds
+        if #available(iOS 26.0, *), SharedModel.isLiquidGlassEnabled {
+            // cornerConfiguration owns the capsule shape; no layer radius is needed.
+        } else {
+            glass.layer.cornerRadius = bounds.height / 2
+        }
+        let dotSize: CGFloat = 6
+        statusDot.frame = CGRect(
+            x: 9,
+            y: (bounds.height - dotSize) / 2,
+            width: dotSize,
+            height: dotSize
+        )
+        label.frame = CGRect(
+            x: 9 + dotSize + 5,
+            y: 0,
+            width: bounds.width - (9 + dotSize + 5) - 9,
+            height: bounds.height
+        )
     }
 
     override func didMoveToWindow() {
@@ -502,6 +572,8 @@ final class MultitaskStageGlassButton: UIButton {
         link = nil
         framesInWindow = 0
         windowStart = 0
+        label.attributedText = readoutText(value: nil)
+        transition(to: .idle)
     }
 
     /// One increment and one compare per presented frame — the counter must never be the reason the
@@ -517,9 +589,32 @@ final class MultitaskStageGlassButton: UIButton {
         guard elapsed >= Self.sampleInterval else { return }
         // Frames in the window over the time the window actually took, so a dropped frame pulls the
         // number down instead of being averaged away.
-        let rate = Double(framesInWindow) / elapsed
-        label.attributedText = readoutText("\(Int(rate.rounded())) FPS")
+        let rate = Int((Double(framesInWindow) / elapsed).rounded())
+        label.attributedText = readoutText(value: rate)
+        // Absolute thresholds: 50+ is smooth on both 60Hz and ProMotion panels, 30–49 is visibly
+        // strained, below 30 the stage is dropping frames.
+        if rate >= 50 {
+            transition(to: .smooth)
+        } else if rate >= 30 {
+            transition(to: .strained)
+        } else {
+            transition(to: .dropping)
+        }
         windowStart = link.timestamp
         framesInWindow = 0
+    }
+
+    /// The dot is the only thing that changes colour, and it does so with a quiet cross-dissolve.
+    private func transition(to newState: FPSState) {
+        guard newState != state else { return }
+        state = newState
+        guard UIAccessibility.isReduceMotionEnabled else {
+            UIView.transition(with: statusDot, duration: 0.3,
+                              options: [.transitionCrossDissolve, .beginFromCurrentState]) {
+                self.statusDot.backgroundColor = newState.color
+            }
+            return
+        }
+        statusDot.backgroundColor = newState.color
     }
 }

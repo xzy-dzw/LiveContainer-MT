@@ -52,6 +52,27 @@ static NSString * const LCStagePromoteRequestNotificationName =
 /// placeholder / frozen-frame cover out. Payload: LCGuestFrameReady.<uuid>.
 static NSString * const LCStageFrameReadyNotificationName =
     @"com.kdt.livecontainer.stage.frameReady";
+/// Posted by the host at UIApplicationWillResignActive while the stage is on
+/// screen. A hosted guest's own willResignActive notification is intentionally
+/// removed (AppSceneViewController.m) so apps like YouTube keep playing, so
+/// the host uses this channel to tell every guest "snapshot your last frame
+/// NOW and make sure your keep-alive audio engine is running".
+static NSString * const LCStageHostBackgroundingNotificationName =
+    @"com.kdt.livecontainer.stage.hostBackgrounding";
+/// Posted by the host at UIApplicationWillEnterForeground. Hosted guests do not receive their
+/// own didBecomeActive on modern iOS hosting, so they re-arm frame-ready reporting on this.
+static NSString * const LCStageHostForegroundingNotificationName =
+    @"com.kdt.livecontainer.stage.hostForegrounding";
+
+/// App Group Bool written by the host's multitask settings page. When YES and
+/// the stage is active, every guest process runs its own near-silent looping
+/// audio buffer so the system grants it a playback assertion while backgrounded.
+static NSString * const LCStageIPCKeepAliveAudioKey = @"LCStageKeepAliveAudio";
+
+/// App Group Bool written by the host's multitask settings page. When YES (default), the host
+/// also runs the invisible black-frame Picture-in-Picture channel while the stage is active, so
+/// backgrounding opens an automatic PiP session holding a second background assertion.
+static NSString * const LCStageIPCPiPKeepAliveKey = @"LCStageKeepAlivePiP";
 
 /// Guest-written timestamp keys, one per data container.
 static NSString * const LCStageIPCFrameReadyKeyPrefix = @"LCGuestFrameReady.";
@@ -85,6 +106,23 @@ static inline void LCStagePublishRoles(BOOL active, NSString *_Nullable mainUUID
                                          NULL, NULL, TRUE);
 }
 
+/// Host: tells every staged guest that the host is about to resign active
+/// (screen lock / user switched to another app). Guests use it to snapshot
+/// their frozen frame and to arm keep-alive audio.
+static inline void LCStageNotifyHostBackgrounding(void) {
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         (__bridge CFStringRef)LCStageHostBackgroundingNotificationName,
+                                         NULL, NULL, TRUE);
+}
+
+/// Host: tells every staged guest that the host is returning to the foreground. Guests use it
+/// to re-arm frame-ready reporting (their own didBecomeActive is removed under hosting).
+static inline void LCStageNotifyHostForegrounding(void) {
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         (__bridge CFStringRef)LCStageHostForegroundingNotificationName,
+                                         NULL, NULL, TRUE);
+}
+
 /// Guest: asks the host to promote this guest's window to the main slot.
 static inline void LCStageRequestPromote(NSString *guestUUID) {
     if (guestUUID.length == 0) { return; }
@@ -95,6 +133,19 @@ static inline void LCStageRequestPromote(NSString *guestUUID) {
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          (__bridge CFStringRef)LCStagePromoteRequestNotificationName,
                                          NULL, NULL, TRUE);
+}
+
+/// Guest: YES while the host's virtual-window stage is on screen and the role state is fresh.
+/// Guests use it to start/stop their own keep-alive audio; classic single-app launches never
+/// publish active roles, so this stays NO there.
+static inline BOOL LCStageGuestIsStageActive(void) {
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    if (![defaults boolForKey:LCStageIPCActiveKey]) { return NO; }
+    double timestamp = [defaults doubleForKey:LCStageIPCRolesTimestampKey];
+    if (timestamp <= 0 || CFAbsoluteTimeGetCurrent() - timestamp > LCStageIPCRoleStaleness) {
+        return NO;
+    }
+    return YES;
 }
 
 /// Guest: YES when this guest is currently a non-interactive side window on

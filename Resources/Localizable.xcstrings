@@ -18486,6 +18486,22 @@
         }
       }
     },
+    "lc.multitask.recovery.placeholder" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reloading %@…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在恢复 %@…"
+          }
+        }
+      }
+    },
     "lc.multitask.restoreWindow" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -19723,6 +19739,38 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "默認以多任務模式啟動"
+          }
+        }
+      }
+    },
+    "lc.settings.autoRecoverGuest" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Relaunch killed apps in place"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用被系统回收后原位重启"
+          }
+        }
+      }
+    },
+    "lc.settings.autoRecoverGuest.detail" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "When memory pressure kills a window, silently relaunch it in the same slot with its last frame shown. Unsaved content cannot be restored."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "内存不足导致窗口被杀时，在原位置静默重启并显示最后一屏画面；应用内未保存的内容无法恢复。"
           }
         }
       }
@@ -27854,6 +27902,70 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "略過終止提示"
+          }
+        }
+      }
+    },
+    "lc.settings.stageKeepAliveAudio" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep apps alive in background"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "后台保活多任务窗口"
+          }
+        }
+      }
+    },
+    "lc.settings.stageKeepAliveAudio.detail" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Plays inaudible audio so staged apps survive the lock screen and switching to other apps. Uses slightly more battery; interruptions such as phone calls resume automatically."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "通过播放无声音频，让多任务窗口在锁屏和切换到其他 App 后不被系统回收。会略微增加耗电，来电等中断后自动恢复。"
+          }
+        }
+      }
+    },
+    "lc.settings.stageKeepAlivePiP" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Picture-in-Picture extra keep-alive"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "画中画双重保活"
+          }
+        }
+      }
+    },
+    "lc.settings.stageKeepAlivePiP.detail" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adds a second, independent background channel. While backgrounded a small black floating window appears (drag it to a screen edge) and apps are even harder for the system to kill. Does not affect the 120fps of multitask windows."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "额外增加一条独立的后台保活通道。切到后台时屏幕会出现一个黑色小悬浮窗（可拖到屏幕边缘磁吸），窗口更难被系统回收；不影响多任务窗口的 120fps 帧率。"
           }
         }
       }

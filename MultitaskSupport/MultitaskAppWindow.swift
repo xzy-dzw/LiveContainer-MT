@@ -280,6 +280,34 @@ class MultitaskRelaunchManager: NSObject {
             print("Failed to restart \(bundleId): \(error)")
         }
     }
+
+    /// In-place recovery entry used by the stage watchdog when a guest was killed by jetsam.
+    /// Unlike scheduleRelaunchIfNeeded this is immediate (the slot is already showing a cover),
+    /// ignores relaunch settings/lastLaunched timing, and reports failure back so the stage can
+    /// drop the slot instead of spinning forever.
+    static func recoverGuest(bundleId: String, dataUUID: String) {
+        let key = "recover#\(bundleId)#\(dataUUID)"
+        guard markPendingIfNeeded(key: key) else { return }
+        Task {
+            defer { clearPending(key: key) }
+            do {
+                guard let appModel = await MainActor.run(body: { lookupAppModel(bundleId: bundleId) }) else {
+                    NSLog("[LCStage][恢复] 找不到已安装应用 \(bundleId)")
+                    await MainActor.run {
+                        MultitaskDockManager.shared.recoveryFailed(uuid: dataUUID, reason: "app not found")
+                    }
+                    return
+                }
+                try await appModel.runApp(multitask: true, containerFolderName: dataUUID)
+                NSLog("[LCStage][恢复] 已发起 \(bundleId) 容器 \(dataUUID) 的原位重启")
+            } catch {
+                NSLog("[LCStage][恢复] 原位重启抛错: \(error)")
+                await MainActor.run {
+                    MultitaskDockManager.shared.recoveryFailed(uuid: dataUUID, reason: "\(error)")
+                }
+            }
+        }
+    }
     
     @MainActor private static func lookupAppModel(bundleId: String) -> LCAppModel? {
         let sharedModel = DataManager.shared.model

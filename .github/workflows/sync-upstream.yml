@@ -1,0 +1,252 @@
+name: 自动跟随官方预览版
+
+# 每天自动检查 LiveContainer 官方仓库（LiveContainer/LiveContainer）main 分支：
+#   1. 官方没有新提交：什么都不做；
+#   2. 有新提交：建/更新 sync/upstream 分支合并官方代码，开中文 PR；
+#   3. 在 macOS runner 上对合并结果做一次完整 xcodebuild archive 编译验证；
+#   4. 编译通过：自动把 PR 合并进 main（官方代码即已跟上，日常构建会照常出包）；
+#   5. 合并冲突或编译失败：不合并，自动建（或更新）一条中文 issue 通知人工修复。
+#
+# 说明：由默认 GITHUB_TOKEN 发起的 PR/合并不会触发其它 workflow，所以编译验证直接放在本
+# 工作流里完成，不依赖 PR 上的构建任务。若配置了 secret LC_REPO_PAT（含 repo/workflow
+# 权限的 PAT），则优先使用它，合并后还能顺带触发 main 上的正式构建工作流。
+
+on:
+  schedule:
+    # 每 6 小时一次（GitHub 定时任务有延迟，只保证当天内跟上）
+    - cron: '11 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/LiveContainer/LiveContainer.git
+  SYNC_BRANCH: sync/upstream
+  PR_LABEL: upstream-sync
+
+jobs:
+  sync:
+    name: 合并官方新提交
+    runs-on: ubuntu-latest
+    outputs:
+      has_update: ${{ steps.check.outputs.has_update }}
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+    steps:
+      - name: 检出本仓完整历史
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 拉取官方最新代码
+        run: |
+          git config user.name "multitask-builder"
+          git config user.email "builder@local"
+          git remote add upstream "$UPSTREAM_URL" || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch upstream main
+
+      - name: 判断官方是否有新提交
+        id: check
+        run: |
+          COUNT=$(git rev-list --count HEAD..upstream/main)
+          echo "官方领先提交数: $COUNT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            echo "官方没有新提交，结束。"
+          else
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            COMMITS=$(git log --oneline HEAD..upstream/main | head -50)
+            echo "COMMITS<<EOF" >> "$GITHUB_ENV"
+            echo "$COMMITS" >> "$GITHUB_ENV"
+            echo "EOF" >> "$GITHUB_ENV"
+          fi
+
+      - name: 合并官方代码
+        if: steps.check.outputs.has_update == 'true'
+        id: merge
+        run: |
+          set -e
+          git checkout -B "$SYNC_BRANCH"
+          # 让子模块指针跟随官方（我们未改子模块，冲突概率极低）
+          git merge --no-edit upstream/main || {
+            echo "MERGE_CONFLICT=true" >> "$GITHUB_ENV"
+            # 保留冲突现场摘要，供 issue 使用
+            {
+              echo "### 合并冲突文件"
+              echo '```'
+              git diff --name-only --diff-filter=U
+              echo '```'
+            } > /tmp/conflict.md
+            exit 78
+          }
+          # 官方更新了子模块指针时同步检出
+          git submodule update --init --recursive || true
+          git log --oneline -1
+
+      - name: 合并冲突时创建/更新中文 issue
+        if: failure() && steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.LC_REPO_PAT || github.token }}
+        run: |
+          BODY_FILE=/tmp/issue_body.md
+          {
+            echo "## 官方新版本自动适配失败：合并冲突"
+            echo
+            echo "检查时间：$(date '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo "自动合并官方 main 时出现冲突，已暂停自动跟随，需要人工解决后这条分支才能继续。"
+            echo
+            cat /tmp/conflict.md 2>/dev/null || echo "（未能获取冲突文件列表）"
+            echo
+            echo "### 处理方法"
+            echo "1. 在本地切到 ${SYNC_BRANCH} 分支解决冲突并提交；"
+            echo "2. 推送后本工作流的编译验证会在下一轮自动重跑，或手动触发本工作流；"
+            echo "3. 编译通过后 PR 会自动合并进 main。"
+          } > "$BODY_FILE"
+          gh label create "$PR_LABEL" --force \
+            --description "官方上游自动同步相关" >/dev/null 2>&1 || true
+          EXISTING=$(gh issue list --label "$PR_LABEL" --state open --limit 1 --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+            echo "已更新 issue #$EXISTING"
+          else
+            gh issue create \
+              --title "⚠️ 官方新版本自动适配失败（合并冲突，需人工修复）" \
+              --label "$PR_LABEL" \
+              --body-file "$BODY_FILE"
+          fi
+
+      - name: 推送同步分支
+        if: steps.check.outputs.has_update == 'true' && steps.merge.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.LC_REPO_PAT || github.token }}
+        run: |
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            --force-with-lease "$SYNC_BRANCH"
+
+      - name: 创建或更新适配 PR
+        if: steps.check.outputs.has_update == 'true' && steps.merge.outcome == 'success'
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.LC_REPO_PAT || github.token }}
+        run: |
+          # 官方提交清单（PR 正文）
+          {
+            echo "## 官方新提交（自动同步）"
+            echo
+            echo '```'
+            echo "$COMMITS"
+            echo '```'
+            echo
+            echo "本 PR 由「自动跟随官方预览版」工作流创建。macOS 编译验证通过后会自动合并；"
+            echo "若编译失败，会有中文 issue 通知人工修复。"
+          } > /tmp/pr_body.md
+          gh label create "$PR_LABEL" --force \
+            --description "官方上游自动同步相关" >/dev/null 2>&1 || true
+          if PR_URL=$(gh pr create --base main --head "$SYNC_BRANCH" \
+              --title "⬆️ 自动同步官方最新预览版（$(date +%m-%d)）" \
+              --label "$PR_LABEL" \
+              --body-file /tmp/pr_body.md 2>/tmp/pr_create.err); then
+            PR_NUM=$(gh pr view "$PR_URL" --json number --jq .number)
+          else
+            cat /tmp/pr_create.err
+            # PR 已存在：更新分支内容（已 force-push）并刷新正文
+            PR_NUM=$(gh pr list --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number')
+            gh pr edit "$PR_NUM" --body-file /tmp/pr_body.md >/dev/null
+          fi
+          echo "pr_number=$PR_NUM" >> "$GITHUB_OUTPUT"
+          echo "PR #$PR_NUM 已就绪，等待编译验证。"
+
+  verify:
+    name: macOS 完整编译验证
+    needs: sync
+    if: needs.sync.outputs.has_update == 'true' && needs.sync.outputs.pr_number != ''
+    runs-on: macos-latest
+    env:
+      scheme: LiveContainer
+      archive_path: archive
+    steps:
+      - name: 选择 Xcode 版本
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.2'
+      - name: 检出同步分支（含子模块）
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SYNC_BRANCH }}
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.LC_REPO_PAT || github.token }}
+
+      - name: 确定构建 Scheme
+        id: scheme
+        run: |
+          scheme_list=$(xcodebuild -list -json | tr -d "\n")
+          scheme=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
+          echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
+
+      - name: 判断并定位工程文件
+        id: project
+        run: |
+          filetype_parameter=`ls -A | grep -i \\.xcworkspace\$ && echo workspace || echo project`
+          file_to_build=`ls -A | grep -i \\.xcworkspace\$ || ls -A | grep -i \\.xcodeproj\$`
+          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
+          echo "filetype_parameter=$filetype_parameter" >> "$GITHUB_OUTPUT"
+          echo "file_to_build=$file_to_build" >> "$GITHUB_OUTPUT"
+
+      - name: 归档编译（Release）
+        env:
+          scheme: ${{ steps.scheme.outputs.scheme }}
+          filetype_parameter: ${{ steps.project.outputs.filetype_parameter }}
+          file_to_build: ${{ steps.project.outputs.file_to_build }}
+        run: xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release | xcpretty && exit ${PIPESTATUS[0]}
+
+      - name: 编译失败时创建/更新中文 issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.LC_REPO_PAT || github.token }}
+          PR_NUMBER: ${{ needs.sync.outputs.pr_number }}
+        run: |
+          BODY_FILE=/tmp/issue_body.md
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "## 官方新版本自动适配失败：编译不通过"
+            echo
+            echo "检查时间：$(date '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo "官方新提交合并后 Xcode 26.2 Release 编译失败，PR 未自动合并。"
+            echo
+            echo "- 适配 PR：#${PR_NUMBER}"
+            echo "- 失败的编译日志：${RUN_URL}"
+            echo
+            echo "### 处理方法"
+            echo "1. 打开上面的 Actions 页面查看具体编译错误；"
+            echo "2. 在 ${SYNC_BRANCH} 分支修复并推送；"
+            echo "3. 手动重新触发本工作流，编译通过后 PR 自动合并。"
+          } > "$BODY_FILE"
+          gh label create "$PR_LABEL" --force >/dev/null 2>&1 || true
+          EXISTING=$(gh issue list --label "$PR_LABEL" --state open --limit 1 --json number --jq '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+          else
+            gh issue create \
+              --title "⚠️ 官方新版本自动适配失败（编译错误，需人工修复）" \
+              --label "$PR_LABEL" \
+              --body-file "$BODY_FILE"
+          fi
+
+      - name: 编译通过，自动合并进 main
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.LC_REPO_PAT || github.token }}
+          PR_NUMBER: ${{ needs.sync.outputs.pr_number }}
+        run: |
+          gh pr merge "$PR_NUMBER" --merge --delete-branch
+          echo "✅ PR #$PR_NUMBER 已自动合并，main 已跟上官方最新版本。"

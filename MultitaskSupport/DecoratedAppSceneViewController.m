@@ -205,6 +205,22 @@
         self.placeholderIcon.image = icon;
         self.placeholderName.text = appName;
         // Re-arm the cover for a fresh launch even if a previous one was hidden.
+        // The recovery variant uses a translucent background over a frozen frame; a cold start
+        // cover must be opaque black again.
+        self.launchPlaceholder.backgroundColor = UIColor.blackColor;
+        self.launchPlaceholder.hidden = NO;
+        self.launchPlaceholder.alpha = 1;
+        [self.placeholderSpinner startAnimating];
+    });
+}
+
+- (void)showRecoveryCoverWithIcon:(UIImage*)icon appName:(NSString*)appName {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.placeholderIcon.image = icon;
+        NSString* template = NSLocalizedString(@"lc.multitask.recovery.placeholder", @"");
+        self.placeholderName.text = [NSString stringWithFormat:template, appName ?: @""];
+        // The recovery cover rides over the frozen last frame (kept underneath), never over black.
+        self.launchPlaceholder.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
         self.launchPlaceholder.hidden = NO;
         self.launchPlaceholder.alpha = 1;
         [self.placeholderSpinner startAnimating];
@@ -377,6 +393,14 @@
         return;
     }
     _didReportExit = true;
+    if(_isRecoveringGuest) {
+        // Stage watchdog-triggered in-place recovery: the dead scene/extension is being cleaned
+        // up, but the card view and the slot must survive until the freshly launched guest takes
+        // over (addRunningAppWithInfo swaps the view in). Do NOT remove the slot or relaunch
+        // here — MultitaskRelaunchManager.recoverGuest already owns the relaunch.
+        NSLog(@"[LCStage][恢复] %@ 旧 guest 已退出，槽位保留等待原位重启", self.dataUUID);
+        return;
+    }
     BOOL skipTerminationScreen = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCSkipTerminatedScreen"];
     BOOL isManual = _isAppTerminationRequested;
     if(isManual || skipTerminationScreen) {

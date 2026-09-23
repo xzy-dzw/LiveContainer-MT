@@ -1,4 +1,5 @@
 @import UIKit;
+@import AVFoundation;
 #import "LCSharedUtils.h"
 #import "UIKitPrivate.h"
 #import "../LiveContainer/utils.h"
@@ -13,6 +14,12 @@ BOOL launchURLProcessed = NO;
 static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *observer,
                                         CFStringRef name, const void *object,
                                         CFDictionaryRef userInfo);
+static void LCStageHostBackgroundingCallback(CFNotificationCenterRef center, void *observer,
+                                             CFStringRef name, const void *object,
+                                             CFDictionaryRef userInfo);
+static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, void *observer,
+                                             CFStringRef name, const void *object,
+                                             CFDictionaryRef userInfo);
 
 /// Resolved once in the constructor: the data container UUID this guest runs with. Drives the
 /// heartbeat key and the side-window quarantine verdict.
@@ -35,6 +42,192 @@ static NSString *LCGuestResolveDataUUID(void) {
 }
 
 #pragma mark - Frozen frame + frame-ready signalling
+
+#pragma mark - Guest keep-alive audio
+//
+// Each staged guest is its own LiveProcess.appex process. When the host is backgrounded or the
+// screen locks, iOS suspends appexes that hold no media assertion — that suspension is what let
+// jetsam kill the side windows. While the stage is active every guest therefore renders a
+// near-silent looping PCM buffer through AVAudioEngine under .playback + .mixWithOthers: the
+// process keeps a real playback assertion, stays runnable, makes no audible sound and never
+// interrupts the user's music/calls. Classic single-app mode never publishes active roles, so
+// the engine never runs there.
+
+@interface LCGuestKeepAliveAudio : NSObject
+@property(nonatomic, strong) AVAudioEngine *engine;
+@property(nonatomic, strong) AVAudioPlayerNode *player;
+@property(nonatomic, assign) BOOL running;
+@property(nonatomic, assign) BOOL wantsRunning;
+@property(nonatomic, strong) id interruptionBeganObserver;
+@property(nonatomic, strong) id interruptionEndedObserver;
+@property(nonatomic, strong) id resetObserver;
++ (instancetype)shared;
+/// Stage disappeared entirely: stop and release the session.
+- (void)reconcile;
+/// Host is about to background/lock: arm the engine (subject to the user toggle).
+- (void)armForBackground;
+/// Host returned to foreground: stop OUR engine but leave the session activated, so the guest
+/// app's own audio (e.g. music that kept playing in the background) is never cut by us.
+- (void)disarmForForeground;
+@end
+
+@implementation LCGuestKeepAliveAudio
+
++ (instancetype)shared {
+    static LCGuestKeepAliveAudio *instance;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ instance = [LCGuestKeepAliveAudio new]; });
+    return instance;
+}
+
+- (BOOL)toggleEnabled {
+    NSUserDefaults *defaults = NSUserDefaults.lcSharedDefaults;
+    // Default ON when the key has never been written (boolForKey would otherwise default to NO).
+    if ([defaults objectForKey:LCStageIPCKeepAliveAudioKey] == nil) { return YES; }
+    return [defaults boolForKey:LCStageIPCKeepAliveAudioKey];
+}
+
+- (void)reconcile {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // The engine only ever runs while the host is backgrounded (armed by
+        // armForBackground). This callback's only job is tearing it down when the whole stage
+        // goes away, so it never fights the guest app's own AVAudioSession configuration while
+        // the stage is in the foreground.
+        if (!LCStageGuestIsStageActive() && self.running) {
+            [self stopLockedDeactivating:YES];
+        }
+    });
+}
+
+- (void)armForBackground {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.wantsRunning = [self toggleEnabled];
+        if (self.wantsRunning && !self.running) {
+            [self startLocked];
+        }
+    });
+}
+
+- (void)disarmForForeground {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.wantsRunning = NO;
+        if (self.running) {
+            [self stopLockedDeactivating:NO];
+        }
+    });
+}
+
+- (void)startLocked {
+    NSError *error = nil;
+    AVAudioSession *session = AVAudioSession.sharedInstance;
+    if (![session setCategory:AVAudioSessionCategoryPlayback
+                         mode:AVAudioSessionModeDefault
+                      options:AVAudioSessionCategoryOptionMixWithOthers
+                        error:&error]
+        || ![session setActive:YES error:&error]) {
+        NSLog(@"[LCStage][保活] guest %@ 音频会话失败，2 秒后重试: %@", LCGuestDataUUID, error);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self.wantsRunning) { [self startLocked]; }
+        });
+        return;
+    }
+
+    AVAudioEngine *engine = [AVAudioEngine new];
+    AVAudioPlayerNode *player = [AVAudioPlayerNode new];
+    [engine attachNode:player];
+    double sampleRate = 44100.0;
+    AVAudioFormat *format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:sampleRate channels:1];
+    AVAudioFrameCount frameCount = (AVAudioFrameCount)sampleRate;
+    AVAudioPCMBuffer *buffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:frameCount];
+    buffer.frameLength = frameCount;
+    float *channel = buffer.floatChannelData[0];
+    // ±1 LSB: provably rendering, completely inaudible.
+    for (AVAudioFrameCount i = 0; i < frameCount; i++) {
+        channel[i] = (i % 2 == 0) ? (1.0f / 32768.0f) : (-1.0f / 32768.0f);
+    }
+    [engine connect:player to:engine.mainMixerNode format:format];
+    if (![engine startAndReturnError:&error]) {
+        NSLog(@"[LCStage][保活] guest %@ 引擎启动失败，2 秒后重试: %@", LCGuestDataUUID, error);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self.wantsRunning) { [self startLocked]; }
+        });
+        return;
+    }
+    [player scheduleBuffer:buffer atTime:nil options:AVAudioPlayerNodeBufferLoops completionHandler:nil];
+    [player play];
+    self.engine = engine;
+    self.player = player;
+    self.running = YES;
+    [self registerObservers];
+    NSLog(@"[LCStage][保活] guest %@ 静音音轨已启动", LCGuestDataUUID);
+}
+
+- (void)stopLockedDeactivating:(BOOL)deactivate {
+    [self unregisterObservers];
+    [self.player stop];
+    [self.engine stop];
+    self.player = nil;
+    self.engine = nil;
+    self.running = NO;
+    // On foreground return the session stays activated: the guest app may own playback of its
+    // own (background music) and deactivating would cut it. Only the full stage teardown
+    // releases the session back to the system.
+    if (deactivate) {
+        [AVAudioSession.sharedInstance setActive:NO
+                                     withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
+                                           error:nil];
+    }
+    NSLog(@"[LCStage][保活] guest %@ 静音音轨已停止（释放会话=%@）", LCGuestDataUUID,
+          deactivate ? @"是" : @"否");
+}
+
+- (void)registerObservers {
+    [self unregisterObservers];
+    __weak typeof(self) weakSelf = self;
+    self.interruptionBeganObserver =
+        [NSNotificationCenter.defaultCenter addObserverForName:AVAudioSessionInterruptionNotification
+                                                        object:nil queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *note) {
+        typeof(self) self = weakSelf;
+        NSUInteger type = [note.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+        if (type == AVAudioSessionInterruptionTypeBegan) {
+            NSLog(@"[LCStage][保活] guest %@ 被中断，结束后自动续播", LCGuestDataUUID);
+        } else if (type == AVAudioSessionInterruptionTypeEnded) {
+            // Tear the graph down and reconcile; startLocked re-activates the session and engine.
+            [self hardRestart];
+        }
+    }];
+    self.resetObserver =
+        [NSNotificationCenter.defaultCenter addObserverForName:AVAudioSessionMediaServicesWereResetNotification
+                                                        object:nil queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *note) {
+        NSLog(@"[LCStage][保活] guest %@ 媒体服务重置，重建引擎", LCGuestDataUUID);
+        [weakSelf hardRestart];
+    }];
+}
+
+- (void)unregisterObservers {
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    if (self.interruptionBeganObserver) { [center removeObserver:self.interruptionBeganObserver]; }
+    if (self.interruptionEndedObserver) { [center removeObserver:self.interruptionEndedObserver]; }
+    if (self.resetObserver) { [center removeObserver:self.resetObserver]; }
+    self.interruptionBeganObserver = nil;
+    self.interruptionEndedObserver = nil;
+    self.resetObserver = nil;
+}
+
+- (void)hardRestart {
+    [self.player stop];
+    [self.engine stop];
+    self.player = nil;
+    self.engine = nil;
+    self.running = NO;
+    if (self.wantsRunning) { [self startLocked]; }
+}
+
+@end
 
 /// The foreground-active key window of this guest, regardless of whether the
 /// app adopted UIScene already (old apps only have -[UIApplication keyWindow]).
@@ -106,7 +299,9 @@ static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
 
 - (void)tick:(CADisplayLink *)link {
     self.ticks += 1;
-    if (self.ticks < 5) { return; }
+    // 3 real display ticks (was 5): the first frame can still be a blank system buffer, but
+    // beyond three committed frames the guest is visibly live — faster reveal of the cover.
+    if (self.ticks < 3) { return; }
     [self.link invalidate];
     self.link = nil;
     LCStageGuestMarkFrameReady(LCGuestDataUUID);
@@ -222,8 +417,26 @@ static void UIKitGuestHooksInit() {
                                         (__bridge CFStringRef)LCStageRolesChangedNotificationName,
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
+        // Host is about to background/lock: our own willResignActive is stripped under hosting,
+        // so snapshot NOW and make sure the keep-alive engine is armed before the suspension.
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        LCStageHostBackgroundingCallback,
+                                        (__bridge CFStringRef)LCStageHostBackgroundingNotificationName,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+        // Host returned to foreground: re-arm frame-ready reporting ourselves.
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        LCStageHostForegroundingCallback,
+                                        (__bridge CFStringRef)LCStageHostForegroundingNotificationName,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
         swizzle(UIApplication.class, @selector(sendEvent:), @selector(hook_lcStage_sendEvent:));
     });
+    // The stage may already be active by the time TweakLoader loads (guest launched straight
+    // into a stage slot); reconcile once instead of waiting for the next roles change.
+    [LCGuestKeepAliveAudio.shared reconcile];
 }
 
 // Cached side-window verdict. LCStageGuestIsSideWindow() hits App Group defaults on every
@@ -251,6 +464,28 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
     // the cached verdict to be recomputed on the next event.
     [NSUserDefaults.lcSharedDefaults synchronize];
     lc_sideWindowCacheValidUntil = 0;
+    // Stage active state is also the on/off switch for this guest's keep-alive audio.
+    [LCGuestKeepAliveAudio.shared reconcile];
+}
+
+static void LCStageHostBackgroundingCallback(CFNotificationCenterRef center, void *observer,
+                                             CFStringRef name, const void *object,
+                                             CFDictionaryRef userInfo) {
+    // Runs at host willResignActive. The guest's own lifecycle notifications are removed under
+    // hosting (so YouTube-style apps keep playing), so the host tells us directly: freeze the
+    // last frame and arm keep-alive BEFORE suspension begins.
+    LCGuestCaptureFrozenFrame(LCGuestDataUUID);
+    [LCGuestKeepAliveAudio.shared armForBackground];
+}
+
+static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, void *observer,
+                                             CFStringRef name, const void *object,
+                                             CFDictionaryRef userInfo) {
+    // The host is back; our own didBecomeActive never arrives under hosting. Stop our keep-alive
+    // engine (without touching the guest app's own session) and re-arm the frame-ready signaler
+    // so the cover lifts as soon as THIS guest's new frames are on screen.
+    [LCGuestKeepAliveAudio.shared disarmForForeground];
+    [[LCFrameReadySignaler shared] arm];
 }
 
 @interface UIApplication (LCStageTouchHook)

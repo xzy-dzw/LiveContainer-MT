@@ -15,7 +15,12 @@ struct LCMultitaskSettingView: View {
     @AppStorage("LCSkipTerminatedScreen", store: LCUtils.appGroupUserDefault) var skipTerminatedScreen = false
     @AppStorage("LCRestartTerminatedApp", store: LCUtils.appGroupUserDefault) var restartTerminatedApp = false
     @AppStorage("LCRedirectURLToHost", store: LCUtils.appGroupUserDefault) var redirectURLToHost = false
-    
+    // Default ON: the AppStorage literal only drives the UI when the key is absent; the host
+    // and guests treat a missing key as ON as well, so a fresh install shows and runs keep-alive.
+    @AppStorage("LCStageKeepAliveAudio", store: LCUtils.appGroupUserDefault) var keepAliveAudio = true
+    @AppStorage("LCAutoRecoverGuest", store: LCUtils.appGroupUserDefault) var autoRecoverGuest = true
+    @AppStorage("LCStageKeepAlivePiP", store: LCUtils.appGroupUserDefault) var keepAlivePiP = true
+
     var body: some View {
         List {
             Section {
@@ -48,6 +53,36 @@ struct LCMultitaskSettingView: View {
                     }
                     Toggle(isOn: $redirectURLToHost) {
                         Text("lc.settings.redirectURLToHost".loc)
+                    }
+                    Toggle(isOn: $keepAliveAudio) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("lc.settings.stageKeepAliveAudio".loc)
+                            Text("lc.settings.stageKeepAliveAudio.detail".loc)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .onChange(of: keepAliveAudio) { _ in
+                        MultitaskDockManager.shared.applyKeepAliveSettings()
+                    }
+                    Toggle(isOn: $keepAlivePiP) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("lc.settings.stageKeepAlivePiP".loc)
+                            Text("lc.settings.stageKeepAlivePiP.detail".loc)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .onChange(of: keepAlivePiP) { _ in
+                        MultitaskDockManager.shared.applyKeepAliveSettings()
+                    }
+                    Toggle(isOn: $autoRecoverGuest) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("lc.settings.autoRecoverGuest".loc)
+                            Text("lc.settings.autoRecoverGuest.detail".loc)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
 
                 }

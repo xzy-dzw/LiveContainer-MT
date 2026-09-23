@@ -220,6 +220,7 @@
 		<string>fetch</string>
 		<string>location</string>
 		<string>nearby-interaction</string>
+		<string>picture-in-picture</string>
 		<string>remote-notification</string>
 		<string>voip</string>
 	</array>
