@@ -530,7 +530,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
     func pictureInPictureController(_ controller: AVPictureInPictureController,
                                     skipByInterval skipInterval: CMTime,
-                                    completionHandler: @escaping () -> Void) {
+                                    completion completionHandler: @escaping () -> Void) {
         completionHandler()
     }
 }
