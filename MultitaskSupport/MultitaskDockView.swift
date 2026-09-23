@@ -516,7 +516,7 @@ extension StagePiPKeepAlive: AVPictureInPictureControllerDelegate {
 extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {}
 
-    func pictureInPictureControllerTimeRange(for controller: AVPictureInPictureController) -> CMTimeRange {
+    func pictureInPictureControllerTimeRange(forPlayback controller: AVPictureInPictureController) -> CMTimeRange {
         // Infinite live range: the last black frame keeps the session alive without a constant feed.
         CMTimeRange(start: .zero, duration: .positiveInfinity)
     }
@@ -530,7 +530,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
     func pictureInPictureController(_ controller: AVPictureInPictureController,
                                     skipByInterval skipInterval: CMTime,
-                                    completion completionHandler: @escaping () -> Void) {
+                                    completionHandler: @escaping () -> Void) {
         completionHandler()
     }
 }
