@@ -495,7 +495,7 @@ static void UIKitGuestHooksInit() {
     }
 
     // Restart evidence for the host's [LCStage][场景] logs: one bump per process lifetime.
-    LCGuestBumpLaunchCount(LCGuestDataUUID);
+    LCStageGuestBumpLaunchCount(LCGuestDataUUID);
     NSLog(@"[LCStage][场景] guest 进程启动 uuid=%@ pid=%d launchCount=%ld",
           LCGuestDataUUID, NSProcessInfo.processInfo.processIdentifier,
           (long)LCStageHostGuestLaunchCount(LCGuestDataUUID));
