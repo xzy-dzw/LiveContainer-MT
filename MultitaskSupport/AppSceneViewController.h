@@ -55,12 +55,12 @@ API_AVAILABLE(ios(16.0))
 /// YES while the hosted scene is foreground AND carries no deactivation reasons — the state
 /// foreground pinning maintains. The stage reads this on foreground return to decide whether a
 /// scene needs any explicit wake-up push at all.
-- (BOOL)lc_isSceneForegroundActive;
+- (BOOL)lc_isSceneForegroundActive NS_SWIFT_NAME(lcIsSceneForegroundActive());
 /// Re-asserts foreground=YES and clears every deactivation reason on the hosted scene. On the
 /// iOS 18+ hosting path it pushes through the scene settings channel (the same proven channel
 /// PiP uses); on the legacy presenter path it also strips the extension's host-lifecycle
 /// observers. Safe to call repeatedly while the host is locked/backgrounded.
-- (void)lc_pinForeground;
+- (void)lc_pinForeground NS_SWIFT_NAME(lcPinForeground());
 /// Set when the guest is deliberately terminated (red close button). Used to ignore the
 /// cancellation error the extension reports on the way out.
 @property(nonatomic, assign) BOOL terminationRequested;
