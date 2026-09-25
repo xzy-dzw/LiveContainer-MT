@@ -1757,8 +1757,8 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         for app in apps {
             guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
             let scene = vc.appSceneVC
-            let wasForemost = scene.lcIsSceneForegroundActive()
-            scene.lcPinForeground()
+            let wasForemost = scene?.lcIsSceneForegroundActive() ?? false
+            scene?.lcPinForeground()
             if !wasForemost {
                 NSLog("[LCStage][场景] 重钉前台（\(reason)）：\(app.appName) 此前已失活，已补推 foreground=YES")
             }
@@ -1814,9 +1814,9 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             // manufacture the exact reactivation transition that bounces apps back to their feed.
             for app in apps {
                 guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-                if !vc.appSceneVC.lcIsSceneForegroundActive() {
+                if vc.appSceneVC?.lcIsSceneForegroundActive() != true {
                     NSLog("[LCStage][场景] 回前台：\(app.appName) 钉住失败已失活，补推一次前台")
-                    vc.appSceneVC.setHostedSceneForeground(true)
+                    vc.appSceneVC?.setHostedSceneForeground(true)
                 }
             }
             // The main window's geometry commit waits until the covers are lifted on pixel-verified real
