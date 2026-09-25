@@ -82,8 +82,9 @@ static NSString *LCGuestResolveDataUUID(void) {
 
 - (BOOL)toggleEnabled {
     NSUserDefaults *defaults = NSUserDefaults.lcSharedDefaults;
-    // Default ON when the key has never been written (boolForKey would otherwise default to NO).
-    if ([defaults objectForKey:LCStageIPCKeepAliveAudioKey] == nil) { return YES; }
+    // v4.1.2+: this is a BACKUP channel and defaults OFF. Location + foreground pinning are the
+    // primary keep-alive; enable this manually only for comparison testing if they fail.
+    if ([defaults objectForKey:LCStageIPCKeepAliveAudioKey] == nil) { return NO; }
     return [defaults boolForKey:LCStageIPCKeepAliveAudioKey];
 }
 
@@ -248,9 +249,46 @@ static UIWindow *LCGuestKeyWindow(void) {
     return UIApplication.sharedApplication.keyWindow;
 }
 
+/// Renders a view into a tiny side x side 32bpp RGBA8 buffer and computes mean luminance plus
+/// its standard deviation. A blank system buffer is ~(0,0); a dark video frame is black-ish but
+/// noisy, so mean OR stddev crossing the thresholds is what separates "real content" from "black
+/// nothing". Used both to verify frozen-frame captures and to verify post-unlock frames.
+static BOOL LCGuestRenderLumaStats(UIView *view, CGFloat side, CGFloat *outMean, CGFloat *outStd) {
+    CGSize size = view.bounds.size;
+    if (size.width < 2 || size.height < 2) { return NO; }
+    NSInteger w = (NSInteger)side;
+    NSInteger h = (NSInteger)side;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w * 4, colorSpace,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(colorSpace);
+    if (!ctx) { return NO; }
+    CGContextScaleCTM(ctx, (CGFloat)w / size.width, (CGFloat)h / size.height);
+    [view.layer renderInContext:ctx];
+    UInt8 *bytes = (UInt8 *)CGBitmapContextGetData(ctx);
+    if (!bytes) { CGContextRelease(ctx); return NO; }
+    double sum = 0, sumSq = 0;
+    NSInteger count = w * h;
+    for (NSInteger i = 0; i < count; i++) {
+        double r = bytes[i * 4 + 0] / 255.0;
+        double g = bytes[i * 4 + 1] / 255.0;
+        double b = bytes[i * 4 + 2] / 255.0;
+        double luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        sum += luma;
+        sumSq += luma * luma;
+    }
+    CGContextRelease(ctx);
+    double mean = sum / count;
+    double variance = MAX(0.0, sumSq / count - mean * mean);
+    if (outMean) { *outMean = (CGFloat)mean; }
+    if (outStd) { *outStd = (CGFloat)sqrt(variance); }
+    return YES;
+}
+
 /// Snapshots the guest's last visible frame into the App Group. Runs on
 /// willResignActive while the frame is still on screen; afterScreenUpdates:NO
-/// keeps it synchronous and cheap.
+/// keeps it synchronous and cheap. Logs JPEG size and pixel stats so a black/broken
+/// capture is obvious from the logs instead of looking like a guest bug.
 static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
     if (dataUUID.length == 0) { return; }
     UIWindow *window = LCGuestKeyWindow();
@@ -261,20 +299,34 @@ static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
         [window drawViewHierarchyInRect:bounds afterScreenUpdates:NO];
     }];
     NSData *jpeg = UIImageJPEGRepresentation(image, 0.7);
-    if (jpeg.length == 0) { return; }
+    if (jpeg.length == 0) {
+        NSLog(@"[LCStage][闪黑] 冻结帧拍照失败：JPEG 编码为空（uuid=%@）", dataUUID);
+        return;
+    }
     NSString *path = LCStageFrozenFramePath(dataUUID);
     [NSFileManager.defaultManager createDirectoryAtPath:path.stringByDeletingLastPathComponent
                             withIntermediateDirectories:YES attributes:nil error:nil];
     [jpeg writeToFile:path atomically:YES];
+    CGFloat mean = 0, std = 0;
+    LCGuestRenderLumaStats(window, 40, &mean, &std);
+    NSLog(@"[LCStage][闪黑] 冻结帧已写入：%lu 字节，平均亮度=%.3f 标准差=%.3f",
+          (unsigned long)jpeg.length, mean, std);
 }
 
-/// Counts a few display ticks after activation before reporting "frame ready":
-/// the first callback frame alone can still be the system's blank buffer.
+/// Pixel-verified frame-ready: every second display tick after arming, the key window is sampled
+/// as a 40x40 thumbnail. Two CONSECUTIVE samples with mean luminance >0.02 OR stddev >0.01 count
+/// as real content (a blank system buffer is ~(0,0); a dark video is black but noisy), and only
+/// then is the host told to lift its cover. A 3s backstop always reports ready so a cover can
+/// never get stuck on a genuinely dark app.
 @interface LCFrameReadySignaler : NSObject
 @property(nonatomic, strong) CADisplayLink *link;
 @property(nonatomic, assign) NSInteger ticks;
+@property(nonatomic, assign) NSInteger goodFrames;
+@property(nonatomic, assign) CFAbsoluteTime armedAt;
+@property(nonatomic, assign) BOOL done;
 + (instancetype)shared;
 - (void)arm;
+- (void)finishWithReason:(NSString *)reason;
 @end
 
 @implementation LCFrameReadySignaler
@@ -292,22 +344,148 @@ static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
         return;
     }
     [self.link invalidate];
+    self.link = nil;
     self.ticks = 0;
+    self.goodFrames = 0;
+    self.done = NO;
+    self.armedAt = CFAbsoluteTimeGetCurrent();
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
     [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
 }
 
-- (void)tick:(CADisplayLink *)link {
-    self.ticks += 1;
-    // 3 real display ticks (was 5): the first frame can still be a blank system buffer, but
-    // beyond three committed frames the guest is visibly live — faster reveal of the cover.
-    if (self.ticks < 3) { return; }
+- (void)finishWithReason:(NSString *)reason {
+    if (self.done) { return; }
+    self.done = YES;
     [self.link invalidate];
     self.link = nil;
+    NSLog(@"[LCStage][闪黑] 像素验真通过（%@，耗时 %.2fs，连续真实帧=%ld），上报 frame-ready",
+          reason, CFAbsoluteTimeGetCurrent() - self.armedAt, (long)self.goodFrames);
     LCStageGuestMarkFrameReady(LCGuestDataUUID);
 }
 
+- (void)tick:(CADisplayLink *)link {
+    if (self.done) { return; }
+    self.ticks += 1;
+    if (self.ticks % 2 != 0) { return; }  // sample every 2nd tick
+
+    CGFloat mean = 0, std = 0;
+    if (LCGuestRenderLumaStats(LCGuestKeyWindow(), 40, &mean, &std)) {
+        if (mean > 0.02 || std > 0.01) {
+            self.goodFrames += 1;
+        } else {
+            self.goodFrames = 0;
+        }
+        if (self.goodFrames >= 2) {
+            [self finishWithReason:[NSString stringWithFormat:@"亮度=%.3f 噪点=%.3f", mean, std]];
+            return;
+        }
+    }
+    if (CFAbsoluteTimeGetCurrent() - self.armedAt > 3.0) {
+        [self finishWithReason:[NSString stringWithFormat:@"3s 兜底（亮度=%.3f 噪点=%.3f）", mean, std]];
+    }
+}
+
 @end
+
+#pragma mark - Lifecycle broadcast masking (foreground pinning)
+//
+// Even with the host re-pinning every scene, iOS can still deliver UIScene lifecycle broadcasts
+// into the guest during lock/background (willDeactivate / didActivate / willEnterForeground /
+// didEnterBackground). Scene-based apps react to those by reloading their root feed (Instagram
+// navigates back home from a deep profile page). While the stage is active and the user hasn't
+// disabled pinning, TweakLoader therefore:
+//   1. swallows those four broadcasts at NSNotificationCenter's post boundary, and
+//   2. clamps -[UIScene activationState] / -[UIApplication applicationState] to active.
+// Scene delegate methods are deliberately NOT swizzled. Classic single-app mode never publishes
+// active roles, so zero behavior changes there.
+
+static NSSet<NSString *> *LCStageMaskedLifecycleNames(void) {
+    static NSSet *names;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        names = [NSSet setWithArray:@[
+            UISceneWillDeactivateNotification,
+            UISceneDidActivateNotification,
+            UISceneWillEnterForegroundNotification,
+            UISceneDidEnterBackgroundNotification,
+        ]];
+    });
+    return names;
+}
+
+/// Set to YES after THIS guest process has observed its first scene activation. Masking only arms
+/// afterwards: a guest cold-starting into an already-active stage (first launch or watchdog
+/// recovery relaunch) must receive its initial willEnterForeground/didActivate broadcasts or some
+/// apps never finish bootstrapping their UI. The flag is process-local, so a relaunched guest
+/// starts unmasked again.
+static BOOL LCStageGuestHasActivatedOnce = NO;
+
+static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
+    if (name.length == 0 || ![LCStageMaskedLifecycleNames() containsObject:name]) { return NO; }
+    if (!LCStageGuestHasActivatedOnce) { return NO; }
+    if (!LCStageGuestPinningEnabled()) { return NO; }
+    return LCStageGuestIsStageActive();
+}
+
+@interface NSNotificationCenter (LCStageLifecycleMask)
+- (void)hook_lc_postNotificationName:(NSString *)name object:(id)object userInfo:(NSDictionary *)userInfo;
+- (void)hook_lc_postNotification:(NSNotification *)notification;
+@end
+
+@implementation NSNotificationCenter (LCStageLifecycleMask)
+- (void)hook_lc_postNotificationName:(NSString *)name object:(id)object userInfo:(NSDictionary *)userInfo {
+    if (LCStageShouldMaskLifecycleName(name)) { return; }
+    [self hook_lc_postNotificationName:name object:object userInfo:userInfo];
+}
+- (void)hook_lc_postNotification:(NSNotification *)notification {
+    if (LCStageShouldMaskLifecycleName(notification.name)) { return; }
+    [self hook_lc_postNotification:notification];
+}
+@end
+
+@interface UIScene (LCStageLifecycleMask)
+- (UISceneActivationState)hook_lc_activationState;
+@end
+
+@implementation UIScene (LCStageLifecycleMask)
+- (UISceneActivationState)hook_lc_activationState {
+    if (LCStageGuestPinningEnabled() && LCStageGuestIsStageActive()) {
+        return UISceneActivationStateForegroundActive;
+    }
+    return [self hook_lc_activationState];
+}
+@end
+
+@interface UIApplication (LCStageLifecycleMask)
+- (UIApplicationState)hook_lc_applicationState;
+@end
+
+@implementation UIApplication (LCStageLifecycleMask)
+- (UIApplicationState)hook_lc_applicationState {
+    if (LCStageGuestPinningEnabled() && LCStageGuestIsStageActive()) {
+        return UIApplicationStateActive;
+    }
+    return [self hook_lc_applicationState];
+}
+@end
+
+static void LCStageInstallLifecycleMasking(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        swizzle(NSNotificationCenter.class,
+                @selector(postNotificationName:object:userInfo:),
+                @selector(hook_lc_postNotificationName:object:userInfo:));
+        swizzle(NSNotificationCenter.class,
+                @selector(postNotification:),
+                @selector(hook_lc_postNotification:));
+        swizzle(UIScene.class,
+                @selector(activationState),
+                @selector(hook_lc_activationState));
+        swizzle(UIApplication.class,
+                @selector(applicationState),
+                @selector(hook_lc_applicationState));
+    });
+}
 
 __attribute__((constructor))
 static void UIKitGuestHooksInit() {
@@ -315,6 +493,26 @@ static void UIKitGuestHooksInit() {
     if(!NSUserDefaults.lcGuestAppId) {
         return;
     }
+
+    // Restart evidence for the host's [LCStage][场景] logs: one bump per process lifetime.
+    LCGuestBumpLaunchCount(LCGuestDataUUID);
+    NSLog(@"[LCStage][场景] guest 进程启动 uuid=%@ pid=%d launchCount=%ld",
+          LCGuestDataUUID, NSProcessInfo.processInfo.processIdentifier,
+          (long)LCStageHostGuestLaunchCount(LCGuestDataUUID));
+    // Lifecycle masking hooks are installed unconditionally but only act while a stage is active
+    // and the pinning toggle is on.
+    LCStageInstallLifecycleMasking();
+    // The first activation broadcast of THIS process must always reach the app (it finishes UI
+    // bootstrapping); only arm lifecycle masking once it has landed. This observer fires before
+    // masking could swallow anything because LCStageShouldMaskLifecycleName checks the flag.
+    [NSNotificationCenter.defaultCenter addObserverForName:UISceneDidActivateNotification
+                                                    object:nil queue:nil
+                                                usingBlock:^(NSNotification *note) {
+        if (!LCStageGuestHasActivatedOnce) {
+            LCStageGuestHasActivatedOnce = YES;
+            NSLog(@"[LCStage][场景] guest 首次激活完成，生命周期屏蔽已武装（uuid=%@）", LCGuestDataUUID);
+        }
+    }];
 
     swizzle(UIApplication.class, @selector(_applicationOpenURLAction:payload:origin:), @selector(hook__applicationOpenURLAction:payload:origin:));
     swizzle(UIApplication.class, @selector(_connectUISceneFromFBSScene:transitionContext:), @selector(hook__connectUISceneFromFBSScene:transitionContext:));
@@ -381,6 +579,22 @@ static void UIKitGuestHooksInit() {
     [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
     NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", dataUUID, hbKey);
 
+    // MARK: - Backdrop luminance for adaptive control glyphs
+    //
+    // The host cannot snapshot a hosted scene's cross-process content (it renders black), so the
+    // MAIN guest measures its own rendered content and publishes a 0..1 mean luma. The host tints
+    // the stage control glyphs white on dark video and dark on light apps. Side windows never
+    // sample (their glyphs are hidden) and the cost is a single 40x40 software render at 2Hz.
+    NSTimer *lumaTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+        if (!LCStageGuestIsMainWindow(LCGuestDataUUID)) { return; }
+        CGFloat mean = 0, std = 0;
+        if (LCGuestRenderLumaStats(LCGuestKeyWindow(), 40, &mean, &std)) {
+            LCStageGuestWriteBackdropLuma(LCGuestDataUUID, (double)mean);
+        }
+    }];
+    lumaTimer.tolerance = 0.15;
+    [[NSRunLoop mainRunLoop] addTimer:lumaTimer forMode:NSRunLoopCommonModes];
+
     // MARK: - First-frame report + frozen-frame capture
     //
     // A hosted scene shows a black card until the guest's first frame reaches
@@ -389,6 +603,15 @@ static void UIKitGuestHooksInit() {
     // resigning active, so after unlock the host can cover the recovering
     // scene with a still of THIS app instead of a black flash.
     [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
+                                                    object:nil queue:nil
+                                                usingBlock:^(NSNotification *note) {
+        LCGuestCaptureFrozenFrame(LCGuestDataUUID);
+    }];
+    // Earliest in-process moment the scene is about to deactivate, captured independently of the
+    // host's Darwin snapshot request. When lifecycle masking is ON this broadcast is swallowed at
+    // the post boundary (so this observer does not run either — the host's Darwin request takes
+    // the snapshot); when the user has turned masking OFF, this is the backup capture channel.
+    [NSNotificationCenter.defaultCenter addObserverForName:UISceneWillDeactivateNotification
                                                     object:nil queue:nil
                                                 usingBlock:^(NSNotification *note) {
         LCGuestCaptureFrozenFrame(LCGuestDataUUID);

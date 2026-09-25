@@ -38,8 +38,15 @@ API_AVAILABLE(ios(16.0))
 - (void)showRecoveryCoverWithIcon:(nullable UIImage *)icon appName:(NSString *)appName;
 
 /// Shows the guest's frozen last frame (JPEG path) over the recovering scene.
-/// No-op when the file is missing or unreadable.
+/// No-op when the file is missing or unreadable; the previous cover (if any) is kept.
 - (void)showFrozenFrameAtPath:(NSString *)path;
+
+/// Same as showFrozenFrameAtPath:, but ignores JPEGs whose modification date is older than
+/// minModified (epoch seconds; pass 0 to disable the freshness gate). Used on the 100ms/500ms
+/// re-cover after backgrounding: a JPEG from an earlier session must never replace the frame just
+/// captured for THIS lock. Runs synchronously when called on the main thread so the cover is
+/// already in place before the resign-away animation samples the hierarchy.
+- (void)showFrozenFrameAtPath:(NSString *)path notOlderThan:(NSTimeInterval)minModified;
 
 /// Fades (or instantly removes) every content cover — launch placeholder and
 /// frozen frame alike. Idempotent: safe to call as a periodic backstop.

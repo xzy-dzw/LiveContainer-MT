@@ -18536,6 +18536,23 @@
         }
       }
     },
+    "lc.multitask.toggleHandedness" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Switch Left/Right Hand Layout"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "切换左右手布局"
+          }
+        }
+      }
+    },
     "lc.multitask.copyPid" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -27998,6 +28015,74 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "额外增加一条独立的后台保活通道。切到后台时屏幕角落只出现一条发丝般的极细画中画（几乎不可见，可拖到屏幕边缘磁吸），窗口更难被系统回收；不影响多任务窗口的 120fps 帧率。"
+          }
+        }
+      }
+    },
+    "lc.settings.scenePinning" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keep apps on their current page"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "锁定 App 页面状态"
+          }
+        }
+      }
+    },
+    "lc.settings.scenePinning.detail" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keeps staged windows in the foreground while the screen is locked or you switch apps, so returning to the stage lands exactly where you left off — including deep pages like a profile — instead of the app reloading its feed. Turn off if an app misbehaves."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "锁屏或切换其他 App 时持续把多任务窗口钉在前台，回到多任务后停留在离开时的页面（例如个人主页等深层页面），而不是重新载入信息流。如果个别 App 出现兼容问题，可关闭此开关。"
+          }
+        }
+      }
+    },
+    "lc.settings.backupKeepAlive.header" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Backup Keep-Alive Channels (Experimental)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "备用保活通道（实验性）"
+          }
+        }
+      }
+    },
+    "lc.settings.backupKeepAlive.footer" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Location keep-alive alone proved sufficient in testing, so these channels are off by default to save battery and reduce heat. Enable them only if a future iOS update weakens location keep-alive."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "实测仅定位保活已足够，这些通道默认关闭以省电、减少发热。仅当未来系统更新导致定位保活失效时，再按需开启测试。"
           }
         }
       }

@@ -15,12 +15,14 @@ struct LCMultitaskSettingView: View {
     @AppStorage("LCSkipTerminatedScreen", store: LCUtils.appGroupUserDefault) var skipTerminatedScreen = false
     @AppStorage("LCRestartTerminatedApp", store: LCUtils.appGroupUserDefault) var restartTerminatedApp = false
     @AppStorage("LCRedirectURLToHost", store: LCUtils.appGroupUserDefault) var redirectURLToHost = false
-    // Default ON: the AppStorage literal only drives the UI when the key is absent; the host
-    // and guests treat a missing key as ON as well, so a fresh install shows and runs keep-alive.
-    @AppStorage("LCStageKeepAliveAudio", store: LCUtils.appGroupUserDefault) var keepAliveAudio = true
+    // v4.1.2: audio/PiP are backup channels, OFF by default (a one-time migration flips existing
+    // users off as well). Location stays the only default-on channel.
+    @AppStorage("LCStageKeepAliveAudio", store: LCUtils.appGroupUserDefault) var keepAliveAudio = false
     @AppStorage("LCAutoRecoverGuest", store: LCUtils.appGroupUserDefault) var autoRecoverGuest = true
-    @AppStorage("LCStageKeepAlivePiP", store: LCUtils.appGroupUserDefault) var keepAlivePiP = true
+    @AppStorage("LCStageKeepAlivePiP", store: LCUtils.appGroupUserDefault) var keepAlivePiP = false
     @AppStorage("LCStageKeepAliveLocation", store: LCUtils.appGroupUserDefault) var keepAliveLocation = true
+    // Foreground pinning / lifecycle masking. Missing key defaults to ON in both host and guests.
+    @AppStorage("LCStageScenePinning", store: LCUtils.appGroupUserDefault) var scenePinning = true
 
     var body: some View {
         List {
@@ -55,6 +57,40 @@ struct LCMultitaskSettingView: View {
                     Toggle(isOn: $redirectURLToHost) {
                         Text("lc.settings.redirectURLToHost".loc)
                     }
+                    Toggle(isOn: $scenePinning) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("lc.settings.scenePinning".loc)
+                            Text("lc.settings.scenePinning.detail".loc)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Toggle(isOn: $keepAliveLocation) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("lc.settings.stageKeepAliveLocation".loc)
+                            Text("lc.settings.stageKeepAliveLocation.detail".loc)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .onChange(of: keepAliveLocation) { _ in
+                        if #available(iOS 16.0, *) {
+                            MultitaskDockManager.shared.applyKeepAliveSettings()
+                        }
+                    }
+                    Toggle(isOn: $autoRecoverGuest) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("lc.settings.autoRecoverGuest".loc)
+                            Text("lc.settings.autoRecoverGuest.detail".loc)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+
+            if multitaskMode == .virtualWindow {
+                Section {
                     Toggle(isOn: $keepAliveAudio) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("lc.settings.stageKeepAliveAudio".loc)
@@ -81,28 +117,10 @@ struct LCMultitaskSettingView: View {
                             MultitaskDockManager.shared.applyKeepAliveSettings()
                         }
                     }
-                    Toggle(isOn: $keepAliveLocation) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("lc.settings.stageKeepAliveLocation".loc)
-                            Text("lc.settings.stageKeepAliveLocation.detail".loc)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .onChange(of: keepAliveLocation) { _ in
-                        if #available(iOS 16.0, *) {
-                            MultitaskDockManager.shared.applyKeepAliveSettings()
-                        }
-                    }
-                    Toggle(isOn: $autoRecoverGuest) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("lc.settings.autoRecoverGuest".loc)
-                            Text("lc.settings.autoRecoverGuest.detail".loc)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
+                } header: {
+                    Text("lc.settings.backupKeepAlive.header".loc)
+                } footer: {
+                    Text("lc.settings.backupKeepAlive.footer".loc)
                 }
             }
         }

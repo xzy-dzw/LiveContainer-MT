@@ -143,6 +143,9 @@ extern const UIApplication *UIApp;
 // FBSSceneSettings
 @interface UIApplicationSceneSettings(Multitask)
 - (bool)isForeground;
+/// Present on the concrete (mutable-backed) settings object at runtime; declared here so foreground
+/// pinning can read whether any deactivation reasons are currently attached.
+- (NSUInteger)deactivationReasons;
 - (CGRect)frame;
 - (UIInterfaceOrientation)interfaceOrientation;
 - (UIMutableApplicationSceneSettings *)mutableCopy;

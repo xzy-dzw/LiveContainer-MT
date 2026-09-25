@@ -228,13 +228,37 @@
 }
 
 - (void)showFrozenFrameAtPath:(NSString*)path {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    [self showFrozenFrameAtPath:path notOlderThan:0];
+}
+
+- (void)showFrozenFrameAtPath:(NSString*)path notOlderThan:(NSTimeInterval)minModified {
+    void (^show)(void) = ^{
+        if(minModified > 0) {
+            NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+            NSTimeInterval modified = attrs.fileModificationDate.timeIntervalSince1970;
+            // Small tolerance for the cross-process write landing just after our clock read.
+            if(!attrs || modified + 0.1 < minModified) {
+                NSLog(@"[LCStage][闪黑] 冻结帧不够新鲜（mdate=%.3f 阈值=%.3f），保留现有遮罩",
+                      modified, minModified);
+                return;
+            }
+        }
         UIImage* image = [[UIImage alloc] initWithContentsOfFile:path];
-        if(!image) { return; }
+        if(!image) {
+            // Loading failed: keep whatever cover is already showing. The black container backing
+            // must never be exposed while the hosted surface is reconnected.
+            NSLog(@"[LCStage][闪黑] 冻结帧读取失败（%@），保留现有遮罩", path.lastPathComponent);
+            return;
+        }
         self.frozenFrameView.image = image;
         self.frozenFrameView.hidden = NO;
         self.frozenFrameView.alpha = 1;
-    });
+    };
+    if(NSThread.isMainThread) {
+        show();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), show);
+    }
 }
 
 - (void)hideContentCoversAnimated:(BOOL)animated {

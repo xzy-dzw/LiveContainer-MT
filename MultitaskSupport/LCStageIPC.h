@@ -67,11 +67,13 @@ static NSString * const LCStageHostForegroundingNotificationName =
 /// App Group Bool written by the host's multitask settings page. When YES and
 /// the stage is active, every guest process runs its own near-silent looping
 /// audio buffer so the system grants it a playback assertion while backgrounded.
+/// As of v4.1.2 this is a BACKUP channel: a missing key defaults to NO.
 static NSString * const LCStageIPCKeepAliveAudioKey = @"LCStageKeepAliveAudio";
 
-/// App Group Bool written by the host's multitask settings page. When YES (default), the host
+/// App Group Bool written by the host's multitask settings page. When YES, the host
 /// also runs the invisible black-frame Picture-in-Picture channel while the stage is active, so
 /// backgrounding opens an automatic PiP session holding a second background assertion.
+/// As of v4.1.2 this is a BACKUP channel: a missing key defaults to NO.
 static NSString * const LCStageIPCPiPKeepAliveKey = @"LCStageKeepAlivePiP";
 
 /// App Group Bool written by the host's multitask settings page. When YES (default), the host
@@ -80,8 +82,28 @@ static NSString * const LCStageIPCPiPKeepAliveKey = @"LCStageKeepAlivePiP";
 /// not really powered. Requires "Always" location authorization.
 static NSString * const LCStageIPCLocationKeepAliveKey = @"LCStageKeepAliveLocation";
 
+/// App Group Bool written by the host's multitask settings page. When YES (default, read by both
+/// host and guests), the host RE-PINS every staged guest scene (foreground=YES,
+/// deactivationReasons=0) while it is backgrounded/locked, and guests suppress their own
+/// UIScene lifecycle broadcasts and clamp their visible activation state. This is what keeps an
+/// app like Instagram from navigating back to its feed on foreground return. A missing key
+/// defaults to YES; turning it off restores the pre-v4.1.2 lifecycle behavior.
+static NSString * const LCStageIPCPinningKey = @"LCStageScenePinning";
+
+/// Guest-written monotonic launch counter, one key per data container (plus a ".pid" sibling).
+/// The host logs these values at window entry / foreground return / interruption: a counter that
+/// stays flat across a lock/unlock cycle proves the guest process (and therefore its UI state)
+/// survived; a counter jump proves iOS really killed and relaunched it.
+static NSString * const LCStageIPCLaunchCountKeyPrefix = @"LCGuestLaunchCount.";
+
 /// Guest-written timestamp keys, one per data container.
 static NSString * const LCStageIPCFrameReadyKeyPrefix = @"LCGuestFrameReady.";
+
+/// Guest-written mean backdrop luminance (0..1 double) of the MAIN window's rendered content,
+/// sampled a few times per second by the main guest itself. The host cannot snapshot a hosted
+/// scene's cross-process pixels (they render black), so the control glyphs' adaptive color is
+/// driven by this value. Stale (>2s) or missing values make the host fall back to white glyphs.
+static NSString * const LCStageIPCBackdropLumaKeyPrefix = @"LCGuestBackdropLuma.";
 
 /// Role state older than this many seconds is treated as missing. The host
 /// republishes roughly once per second while the stage is on screen, so a
@@ -210,6 +232,70 @@ static inline CFAbsoluteTime LCStageHostFrameReadyAt(NSString *guestUUID) {
     NSUserDefaults *defaults = LCStageSharedDefaults();
     [defaults synchronize];
     return [defaults doubleForKey:[LCStageIPCFrameReadyKeyPrefix stringByAppendingString:guestUUID]];
+}
+
+/// Guest: whether foreground pinning / lifecycle masking is enabled. Missing key defaults to YES.
+static inline BOOL LCStageGuestPinningEnabled(void) {
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    if ([defaults objectForKey:LCStageIPCPinningKey] == nil) { return YES; }
+    return [defaults boolForKey:LCStageIPCPinningKey];
+}
+
+/// Guest: bumps this container's monotonic launch counter and records the live pid. Runs exactly
+/// once per guest process start (TweakLoader constructor), so the counter doubles as restart
+/// evidence for the host's [LCStage][场景] logs.
+static inline void LCStageGuestBumpLaunchCount(NSString *guestUUID) {
+    if (guestUUID.length == 0) { return; }
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    NSString *key = [LCStageIPCLaunchCountKeyPrefix stringByAppendingString:guestUUID];
+    NSInteger count = [defaults integerForKey:key] + 1;
+    [defaults setInteger:count forKey:key];
+    [defaults setInteger:NSProcessInfo.processInfo.processIdentifier
+                  forKey:[key stringByAppendingString:@".pid"]];
+    [defaults synchronize];
+}
+
+/// Host: reads a container's launch counter (0 when the guest has never reported one).
+static inline NSInteger LCStageHostGuestLaunchCount(NSString *guestUUID) {
+    if (guestUUID.length == 0) { return 0; }
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    [defaults synchronize];
+    return [defaults integerForKey:[LCStageIPCLaunchCountKeyPrefix stringByAppendingString:guestUUID]];
+}
+
+/// Guest: YES when this guest is currently the interactive main window and the role state is
+/// fresh. The backdrop luminance sampler runs only in that guest.
+static inline BOOL LCStageGuestIsMainWindow(NSString *guestUUID) {
+    if (guestUUID.length == 0) { return NO; }
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    if (!LCStageGuestIsStageActive()) { return NO; }
+    return [[defaults stringForKey:LCStageIPCMainUUIDKey] isEqualToString:guestUUID];
+}
+
+/// Guest (main window only): publishes the mean luminance of its currently rendered content.
+static inline void LCStageGuestWriteBackdropLuma(NSString *guestUUID, double luma) {
+    if (guestUUID.length == 0) { return; }
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    NSString *lumaKey = [LCStageIPCBackdropLumaKeyPrefix stringByAppendingString:guestUUID];
+    [defaults setDouble:luma forKey:lumaKey];
+    [defaults setDouble:CFAbsoluteTimeGetCurrent() forKey:[lumaKey stringByAppendingString:@".t"]];
+    // No synchronize/notification: this is a 2Hz advisory value; the host polls.
+}
+
+/// Host: reads the main guest's latest backdrop luminance. Returns -1 when missing or older than
+/// `maxAgeSeconds` (dead/injected-off guest), in which case the host keeps white glyphs.
+static inline double LCStageHostGuestBackdropLuma(NSString *guestUUID, NSTimeInterval maxAgeSeconds) {
+    if (guestUUID.length == 0) { return -1.0; }
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    // The guest writes without synchronize (2Hz advisory); force a cross-process refresh so we
+    // read the latest sample instead of the host's cached copy.
+    [defaults synchronize];
+    NSString *lumaKey = [LCStageIPCBackdropLumaKeyPrefix stringByAppendingString:guestUUID];
+    if ([defaults objectForKey:lumaKey] == nil) { return -1.0; }
+    NSString *ageKey = [lumaKey stringByAppendingString:@".t"];
+    double writtenAt = [defaults doubleForKey:ageKey];
+    if (writtenAt <= 0 || CFAbsoluteTimeGetCurrent() - writtenAt > maxAgeSeconds) { return -1.0; }
+    return [defaults doubleForKey:lumaKey];
 }
 
 /// Path of the frozen-frame JPEG one guest stores right before resigning

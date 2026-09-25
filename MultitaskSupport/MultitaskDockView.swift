@@ -668,6 +668,14 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     /// The stage's frame-rate readout, in the strip's far corner. Like the controls it lives on the
     /// window itself, so it is always drawn above every guest window.
     private let fpsCounter = MultitaskStageFPSCounterView(frame: .zero)
+    /// Left/right handedness toggle, on the outer edge right beside the FPS capsule. Flips the stage
+    /// between main-left/sides-right and main-right/sides-left; the choice is persisted.
+    private lazy var handednessButton: MultitaskStageGlassButton = {
+        let button = MultitaskStageGlassButton(symbol: "rectangle.split.2x1", pressedTint: nil)
+        button.accessibilityLabel = "lc.multitask.toggleHandedness".loc
+        button.addTarget(self, action: #selector(toggleLayoutHandedness), for: .touchUpInside)
+        return button
+    }()
     /// Reused impact generators: allocating one per tap puts Taptic engine setup on the hot path,
     /// which is exactly what a fast run of window switches does not need.
     private lazy var switchFeedback = UIImpactFeedbackGenerator(style: .light)
@@ -726,6 +734,21 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     private var lastFrameReadyAt: [String: Double] = [:]
     /// Whether the stage currently keeps the screen on and the host alive in the background.
     private var isKeepAliveActive = false
+    /// YES between host willResignActive and willEnterForeground while foreground pinning is on: the
+    /// escalating re-pin scheduler is running.
+    private var isPinningForeground = false
+    private var foregroundPinningTimer: Timer?
+    /// Set at foreground return when pinning handled the background stay; the main window's geometry commit
+    /// is then deferred until the pixel-verified frame-ready reveal (or a 3s backstop) instead of
+    /// racing the reconnecting surface and contributing its own black frame.
+    private var pendingWakeGeometryCommit = false
+    private var backgroundingBeganAt = Date.distantPast
+    /// Backdrop luminance sampler state for adaptive control-glyph tinting. nil = still unprobed.
+    private var backdropProbeTimer: Timer?
+    private var backdropIsDark: Bool?
+    /// Left/right handedness state at the last geometry settle, so a mirror flip arms a geometry commit
+    /// for the main window (its touch region moves halves of the screen).
+    private var lastSettledMirrored = MultitaskStageLayout.isMirrored
     /// Extra ~30s of foreground-style runtime bought at the moment we go to the background.
     /// The playback assertion is the long-term keeper; this task bridges the handoff so the
     /// freeze-frame IPC and guest engine arming always complete even on slow devices.
@@ -741,6 +764,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
     override init() {
         super.init()
+        migrateKeepAliveDefaultsOnce()
         if let rootView = keyWindow?.rootViewController?.view {
             // The windows live inside the app's own hierarchy; the controls and the dock sit on
             // the window itself so they are always drawn above every guest window.
@@ -860,9 +884,16 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             fpsCounter.removeFromSuperview()
             window.addSubview(fpsCounter)
         }
-        // The invisible 1pt PiP layer must live in a real on-screen window while the stage is
-        // active; that foreground "playing" state is what permits automatic background PiP.
-        StagePiPKeepAlive.shared.attach(to: window)
+        if handednessButton.superview !== window {
+            handednessButton.removeFromSuperview()
+            window.addSubview(handednessButton)
+        }
+        // The invisible 1pt PiP layer must live in a real on-screen window while the PiP channel
+        // is ARMED. v4.1.2 keeps PiP a backup channel: when the toggle is off no layer,
+        // timer or video session is ever created (zero overhead).
+        if keepAlivePiPEnabled {
+            StagePiPKeepAlive.shared.attach(to: window)
+        }
         if let dockView = dockHost?.view, dockView.superview !== window {
             dockView.removeFromSuperview()
             window.addSubview(dockView)
@@ -898,6 +929,9 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             // background while the stage exists: auto-lock is what suspended and killed guests
             // in the middle of a session.
             updateStageKeepAlive(active: true)
+            // Control glyphs must track the guest content behind them (white on dark video,
+            // dark on light apps): start the low-frequency backdrop sampler with the page.
+            startBackdropProbe()
         }
         isStagePresented = true
         windowHostingView.isHidden = false
@@ -986,8 +1020,10 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
             self.controls.isHidden = false
             self.controls.isFullscreen = self.isFullscreen
-            // The same frame in both modes: the pair must not move while the main window grows.
-            self.controls.frame = MultitaskStageLayout.controlsFrame(bounds: bounds, safeArea: safeArea)
+            // The controls hug the main window's outer edge: leading edge in left-handed layout,
+            // trailing edge in right-handed layout; fullscreen only moves them toward the screen edge.
+            self.controls.frame = MultitaskStageLayout.controlsFrame(
+                bounds: bounds, safeArea: safeArea, fullscreen: self.isFullscreen)
 
             // The readout belongs to the split stage: fullscreen is the guest app's screen, so the
             // counter leaves with the strip — and stops sampling, instead of ticking away on a
@@ -996,6 +1032,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             self.fpsCounter.frame = MultitaskStageLayout.fpsFrame(bounds: bounds, safeArea: safeArea)
             self.fpsCounter.alpha = self.isFullscreen ? 0 : 1
             self.fpsCounter.isCounting = !self.isFullscreen
+
+            // The handedness toggle rides the outer edge next to the FPS capsule and leaves together
+            // with it in fullscreen.
+            self.handednessButton.isHidden = false
+            self.handednessButton.frame = MultitaskStageLayout.handednessFrame(bounds: bounds, safeArea: safeArea)
+            self.handednessButton.alpha = self.isFullscreen ? 0 : 1
+            self.handednessButton.isUserInteractionEnabled = !self.isFullscreen
 
             if let dockView = self.dockHost?.view {
                 // Fullscreen means the guest app owns the whole screen, dock included.
@@ -1059,6 +1102,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
         window.bringSubviewToFront(controls)
         window.bringSubviewToFront(fpsCounter)
+        window.bringSubviewToFront(handednessButton)
         if let dockView = dockHost?.view {
             window.bringSubviewToFront(dockView)
         }
@@ -1420,6 +1464,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     private func armGeometryCommitIfNeeded() {
         let changed = lastSettledFullscreen != isFullscreen
             || lastSettledMainUUID != apps.first?.appUUID
+            || lastSettledMirrored != MultitaskStageLayout.isMirrored
         guard changed else { return }
         pendingGeometryGeneration += 1
     }
@@ -1440,6 +1485,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
         lastSettledFullscreen = isFullscreen
         lastSettledMainUUID = apps.first?.appUUID
+        lastSettledMirrored = MultitaskStageLayout.isMirrored
 
         // The main window changed (fullscreen toggle, promotion, refill after a close), so its
         // touch region has to cover the slot it sits in now. Windows that slid into side slots
@@ -1471,6 +1517,8 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // No stage on screen: the readout goes with it, and stops sampling frames nobody can see.
         fpsCounter.isCounting = false
         fpsCounter.isHidden = true
+        handednessButton.isHidden = true
+        stopBackdropProbe()
         // No stage on screen: every guest keeps its own touches again.
         publishStageRoles(active: false)
         UIView.animate(withDuration: 0.2, animations: {
@@ -1499,25 +1547,49 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     // what keeps jetsam from collecting the side windows.
 
     /// User toggle from the multitask settings page (App Group so guests read the same key).
-    /// Missing key defaults to ON.
+    /// v4.1.2: backup channel — a missing key defaults to OFF.
     private var keepAliveAudioEnabled: Bool {
         let defaults = LCUtils.appGroupUserDefault
-        if defaults.object(forKey: LCStageIPCKeepAliveAudioKey) == nil { return true }
+        if defaults.object(forKey: LCStageIPCKeepAliveAudioKey) == nil { return false }
         return defaults.bool(forKey: LCStageIPCKeepAliveAudioKey)
     }
 
-    /// PiP second-channel toggle (App Group). Missing key defaults to ON.
+    /// PiP second-channel toggle (App Group). v4.1.2: backup channel — a missing key defaults to OFF.
     private var keepAlivePiPEnabled: Bool {
         let defaults = LCUtils.appGroupUserDefault
-        if defaults.object(forKey: LCStageIPCPiPKeepAliveKey) == nil { return true }
+        if defaults.object(forKey: LCStageIPCPiPKeepAliveKey) == nil { return false }
         return defaults.bool(forKey: LCStageIPCPiPKeepAliveKey)
     }
 
-    /// Continuous-location primary-channel toggle (App Group). Missing key defaults to ON.
+    /// Continuous-location primary-channel toggle (App Group). Missing key defaults to ON. Location is the
+    /// only channel on by default as of v4.1.2.
     private var keepAliveLocationEnabled: Bool {
         let defaults = LCUtils.appGroupUserDefault
         if defaults.object(forKey: LCStageIPCLocationKeepAliveKey) == nil { return true }
         return defaults.bool(forKey: LCStageIPCLocationKeepAliveKey)
+    }
+
+    /// Foreground pinning / lifecycle-masking master switch (host re-pin + guest broadcast masking
+    /// both honor it). Missing key defaults to ON; the settings page lets users escape to legacy.
+    private var scenePinningEnabled: Bool {
+        let defaults = LCUtils.appGroupUserDefault
+        if defaults.object(forKey: LCStageIPCPinningKey) == nil { return true }
+        return defaults.bool(forKey: LCStageIPCPinningKey)
+    }
+
+    /// One-time v4.1.2 migration: existing users ran audio + PiP + location. Real-device testing
+    /// proved location alone sufficient, so the first launch after upgrade explicitly turns the other two OFF
+    /// (the code stays; a user can flip them right back on). A marker key makes this run once.
+    private func migrateKeepAliveDefaultsOnce() {
+        let defaults = LCUtils.appGroupUserDefault
+        let markerKey = "LCStageKeepAliveMigratedV412"
+        guard defaults.object(forKey: markerKey) == nil else { return }
+        defaults.set(false, forKey: LCStageIPCKeepAliveAudioKey)
+        defaults.set(false, forKey: LCStageIPCPiPKeepAliveKey)
+        defaults.set(true, forKey: LCStageIPCLocationKeepAliveKey)
+        defaults.set(true, forKey: markerKey)
+        defaults.synchronize()
+        NSLog("[LCStage][保活] v4.1.2 一次性迁移：仅保留定位通道，宿主音轨/PiP/副窗音轨默认关闭（代码保留可随时重新开启）")
     }
 
     /// Called by the settings toggles while a stage is live: start/stop each channel immediately
@@ -1606,8 +1678,14 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             // spinner is never shown for this launch.
             app.placeholderWorkItem?.cancel()
             app.placeholderWorkItem = nil
+            let isMain = app.appUUID == apps.first?.appUUID
             (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
                 .hideContentCovers(animated: true)
+            // Only the main window's verified frame releases the geometry commit deferred at
+            // foreground return; side-window geometry never needed re-committing.
+            if isMain {
+                settleWakeGeometryIfNeeded(trigger: "Darwin frame-ready")
+            }
         }
     }
 
@@ -1622,6 +1700,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
     @objc private func appWillResignActive() {
         guard isDockEnabled(), isStagePresented, !apps.isEmpty else { return }
+        backgroundingBeganAt = Date()
         // 1) Tell every guest to snapshot its CURRENT frame right now. Under modern iOS hosting
         //    the guests' own willResignActive is stripped (AppSceneViewController.m), so without
         //    this explicit channel no frozen frame exists and the foreground return flashes black.
@@ -1629,52 +1708,137 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // 2) Locally cover every card with whatever frozen frame already exists (from the last
         //    round) immediately, so even the resign animation itself never shows a black gap.
         coverCardsWithFrozenFrames()
-        // 3) Nudge the PiP channel: automatic-from-inline usually opens it without help, but ask
-        //    explicitly while a start is still permitted.
-        StagePiPKeepAlive.shared.nudgeStart()
-        NSLog("[LCStage][闪黑] 宿主即将后台/锁屏：已通知 \(apps.count) 个 guest 拍照并盖上冻结帧")
+        // 3) Foreground pinning: re-assert foreground on every scene THIS SAME FRAME, before the
+        //    system's deactivation lands, then keep re-pinning throughout the background. This is the
+        //    root-cause fix for both "Instagram bounces to its feed" and the black flash: a scene
+        //    that is never deactivated never rebuilds its cross-process render surface.
+        if scenePinningEnabled {
+            beginForegroundPinning()
+        }
+        // 4) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
+        if keepAlivePiPEnabled {
+            StagePiPKeepAlive.shared.nudgeStart()
+        }
+        logGuestStates(context: "宿主即将后台/锁屏")
+        NSLog("[LCStage][闪黑] 宿主即将后台/锁屏：已通知 \(apps.count) 个 guest 拍照并盖上冻结帧，前台钉住=\(scenePinningEnabled)")
     }
 
     @objc private func appDidEnterBackground() {
         guard isKeepAliveActive else { return }
-        // Bridge time: the playback assertions do the long-term keeping; this just makes sure
-        // the snapshot IPC and guest engine arming finish during the foreground→background handoff.
+        // Bridge time: the location assertion does the long-term keeping; this makes sure the
+        // snapshot IPC and the 100ms/500ms re-covers finish during the handoff.
         beginBackgroundTaskIfNeeded()
+        // Re-cover with the frames the guests captured during this very lock: the first Darwin round
+        // trip crosses processes with a few milliseconds of lag, so an immediate cover can still be
+        // the previous session's frame. Freshness gate keeps the older cover if the new JPEG isn't
+        // there yet.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.coverCardsWithFrozenFrames(freshSince: self?.backgroundingBeganAt.timeIntervalSince1970 ?? 0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.coverCardsWithFrozenFrames(freshSince: self?.backgroundingBeganAt.timeIntervalSince1970 ?? 0)
+        }
     }
 
     /// Covers every staged card with its guest's frozen last frame (no-op when the JPEG is
     /// missing — showFrozenFrameAtPath returns early on unreadable files).
-    private func coverCardsWithFrozenFrames() {
+    /// - Parameter freshSince: when > 0, JPEGs older than this epoch timestamp are ignored so a stale
+    ///   frame from an earlier session can never replace this lock's capture.
+    private func coverCardsWithFrozenFrames(freshSince: TimeInterval = 0) {
         for app in apps {
             guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-            vc.showFrozenFrame(atPath: LCStageFrozenFramePath(app.appUUID))
+            vc.showFrozenFrame(atPath: LCStageFrozenFramePath(app.appUUID), notOlderThan: freshSince)
         }
+    }
+
+    /// Re-pins every staged guest scene and logs which scenes were not foremost anymore. Runs on the
+    /// escalating background scheduler (immediate, 0.2s, 0.5s, 1s, then 1/s).
+    @objc func pinAllStagedScenesForeground(reason: String) {
+        for app in apps {
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            let scene = vc.appSceneVC
+            let wasForemost = scene.lcIsSceneForegroundActive()
+            scene.lcPinForeground()
+            if !wasForemost {
+                NSLog("[LCStage][场景] 重钉前台（\(reason)）：\(app.appName) 此前已失活，已补推 foreground=YES")
+            }
+        }
+    }
+
+    private func beginForegroundPinning() {
+        guard !isPinningForeground else { return }
+        isPinningForeground = true
+        NSLog("[LCStage][场景] 前台钉住开始：对 \(apps.count) 个场景立即重钉")
+        pinAllStagedScenesForeground(reason: "锁屏当帧")
+        for delay in [0.2, 0.5, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.isPinningForeground else { return }
+                self.pinAllStagedScenesForeground(reason: "后台 \(delay)s")
+            }
+        }
+        // Then once per second for as long as we stay out of the foreground app state. The
+        // location assertion keeps us runnable, so this timer really fires in the background.
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self, self.isPinningForeground,
+                  UIApplication.shared.applicationState != .active else { return }
+            self.pinAllStagedScenesForeground(reason: "后台周期 1s")
+        }
+        timer.tolerance = 0.2
+        RunLoop.main.add(timer, forMode: .common)
+        foregroundPinningTimer = timer
+    }
+
+    private func endForegroundPinning() {
+        guard isPinningForeground else { return }
+        isPinningForeground = false
+        foregroundPinningTimer?.invalidate()
+        foregroundPinningTimer = nil
+        NSLog("[LCStage][场景] 前台钉住结束（宿主回前台）")
     }
 
     @objc private func appWillEnterForeground() {
         endBackgroundTaskIfNeeded()
+        endForegroundPinning()
         lastHostWakeAt = Date()
         // Guests' own didBecomeActive is stripped under hosting; tell them to re-arm frame-ready.
         LCStageNotifyHostForegrounding()
         // Cover with the snapshots taken at willResignActive first. Each cover is lifted only by
-        // that guest's own fresh frame-ready report (handleGuestFrameReady, also polled by the
-        // watchdog) — never on a fixed timer, which used to reveal still-black surfaces.
+        // that guest's own pixel-verified frame-ready report (handleGuestFrameReady, also polled by
+        // the watchdog) — never on a fixed frame counter alone.
         coverCardsWithFrozenFrames()
-        // Re-wake every scene explicitly (covers the case the keep-alive session was unavailable
-        // and the host really got suspended).
-        for app in apps {
-            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-            vc.appSceneVC.setHostedSceneForeground(true)
-        }
-        // Layout FIRST, then commit the main window geometry, so its touch region covers the
-        // post-foreground slot.
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.performLayout(animated: false)
-            self.lastSettledFullscreen = self.isFullscreen
-            self.lastSettledMainUUID = self.apps.first?.appUUID
-            self.lastSettledGeneration = self.pendingGeometryGeneration
-            self.commitMainWindowGeometry()
+        logGuestStates(context: "宿主回前台")
+
+        if scenePinningEnabled {
+            // The pinning scheduler held every scene foreground while we were away. Push ONLY the
+            // scenes the system actually managed to deactivate anyway — a blanket re-push used to
+            // manufacture the exact reactivation transition that bounces apps back to their feed.
+            for app in apps {
+                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+                if !vc.appSceneVC.lcIsSceneForegroundActive() {
+                    NSLog("[LCStage][场景] 回前台：\(app.appName) 钉住失败已失活，补推一次前台")
+                    vc.appSceneVC.setHostedSceneForeground(true)
+                }
+            }
+            // The main window's geometry commit waits until the covers are lifted on pixel-verified real
+            // frames; the geometry itself hasn't changed, so the touch region moving a few hundred ms late
+            // is invisible.
+            pendingWakeGeometryCommit = true
+            scheduleWakeGeometryBackstop()
+        } else {
+            // Escape hatch: pre-v4.1.2 behavior for users who turned pinning off.
+            for app in apps {
+                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+                vc.appSceneVC.setHostedSceneForeground(true)
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.performLayout(animated: false)
+                self.lastSettledFullscreen = self.isFullscreen
+                self.lastSettledMainUUID = self.apps.first?.appUUID
+                self.lastSettledMirrored = MultitaskStageLayout.isMirrored
+                self.lastSettledGeneration = self.pendingGeometryGeneration
+                self.commitMainWindowGeometry()
+            }
         }
         // Backstop ONLY for guests that cannot report frame-ready (TweakLoader injection off):
         // they never took a snapshot either, but if a stale cover exists it must not stick
@@ -1685,6 +1849,53 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
                     .hideFrozenFrame(animated: true)
             }
+        }
+    }
+
+    /// Runs the deferred post-wake geometry commit once the MAIN window's pixel-verified frame-ready
+    /// report has lifted its cover. Side reports arriving earlier are ignored.
+    private func settleWakeGeometryIfNeeded(trigger: String) {
+        guard pendingWakeGeometryCommit else { return }
+        pendingWakeGeometryCommit = false
+        NSLog("[LCStage][闪黑] 主窗像素验真揭图完成（\(trigger)），补提交主窗几何")
+        performLayout(animated: false)
+        lastSettledFullscreen = isFullscreen
+        lastSettledMainUUID = apps.first?.appUUID
+        lastSettledMirrored = MultitaskStageLayout.isMirrored
+        lastSettledGeneration = pendingGeometryGeneration
+        commitMainWindowGeometry()
+    }
+
+    /// A cover must never outlast a broken frame-ready pipeline: after 3s, reveal everything and
+    /// run the deferred geometry commit regardless of what the guests reported.
+    private func scheduleWakeGeometryBackstop() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            guard let self, self.pendingWakeGeometryCommit else { return }
+            NSLog("[LCStage][闪黑] 3 秒兜底：强制揭图并补提交主窗几何")
+            self.pendingWakeGeometryCommit = false
+            for app in self.apps {
+                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
+                    .hideContentCovers(animated: true)
+            }
+            self.performLayout(animated: false)
+            self.lastSettledFullscreen = self.isFullscreen
+            self.lastSettledMainUUID = self.apps.first?.appUUID
+            self.lastSettledMirrored = MultitaskStageLayout.isMirrored
+            self.lastSettledGeneration = self.pendingGeometryGeneration
+            self.commitMainWindowGeometry()
+        }
+    }
+
+    /// Evidence log: one line per staged window with pid / launch count / foremost state, so a single
+    /// lock/unlock cycle in the console proves whether a guest really restarted.
+    private func logGuestStates(context: String) {
+        for app in apps {
+            let decorated = app.view?._viewDelegate() as? DecoratedAppSceneViewController
+            let pid = decorated?.appSceneVC.pid ?? -1
+            let count = LCStageHostGuestLaunchCount(app.appUUID)
+            let foremost = decorated?.appSceneVC.lcIsSceneForegroundActive() ?? false
+            let alive = decorated?.appSceneVC.isAppRunning ?? false
+            NSLog("[LCStage][场景] \(context)：\(app.appName) pid=\(pid) alive=\(alive) launchCount=\(count) foreground=\(foremost)")
         }
     }
 
@@ -1890,6 +2101,9 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         guard index > 0 else { return }
         let app = apps.remove(at: index)
         apps.insert(app, at: 0)
+        // The new main window's content (and therefore its backdrop luma) is different; drop the
+        // hysteresis state so its first published sample decides the glyph color immediately.
+        backdropIsDark = nil
         // Flip touch ownership immediately: the old main starts quarantining
         // and the new main releases touches while the promotion animates.
         publishStageRoles(active: true)
@@ -1911,6 +2125,78 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // Fires on the same frame the layout animation starts, so the tap and the motion read as
         // one event.
         switchFeedback.impactOccurred()
+    }
+
+    /// Flips the whole stage between left-hand (main left) and right-hand (main right) layouts.
+    /// iPhone has no public API for detecting which hand holds the device, so this is an explicit
+    /// toggle; the choice persists across launches via MultitaskStageLayout.isMirrored.
+    @objc func toggleLayoutHandedness() {
+        MultitaskStageLayout.isMirrored.toggle()
+        switchFeedback.impactOccurred()
+        relayout(animated: true)
+        // A half-turn on the glyph reads as the two halves physically swapping places.
+        guard !UIAccessibility.isReduceMotionEnabled else { return }
+        let flip = CASpringAnimation(keyPath: "transform.rotation.y")
+        flip.fromValue = 0
+        flip.toValue = CGFloat.pi
+        flip.damping = 12
+        flip.stiffness = 180
+        flip.duration = 0.4
+        handednessButton.layer.add(flip, forKey: "handednessFlip")
+    }
+
+    // MARK: - Adaptive control-glyph backdrop sampling
+    //
+    // A hosted scene's cross-process pixels render black in every host-side snapshot, so the host
+    // cannot measure what is behind the controls. The MAIN guest instead publishes the mean luma
+    // of its own rendered content (TweakLoader, 2Hz); the host polls it and flips the glyphs
+    // between white (dark video) and near-black (light UI) with a hysteresis band so mid-greys
+    // never make them oscillate.
+
+    private static let backdropDarkThreshold = 0.42
+    private static let backdropLightThreshold = 0.58
+
+    private func startBackdropProbe() {
+        guard backdropProbeTimer == nil else { return }
+        // Probe immediately so the first decision doesn't wait a full period.
+        DispatchQueue.main.async { [weak self] in self?.sampleBackdropLuma() }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            self?.sampleBackdropLuma()
+        }
+        timer.tolerance = 0.15
+        RunLoop.main.add(timer, forMode: .common)
+        backdropProbeTimer = timer
+    }
+
+    private func stopBackdropProbe() {
+        backdropProbeTimer?.invalidate()
+        backdropProbeTimer = nil
+        backdropIsDark = nil
+    }
+
+    private func sampleBackdropLuma() {
+        guard isStagePresented,
+              UIApplication.shared.applicationState == .active,
+              let mainUUID = apps.first?.appUUID else { return }
+        let luma = LCStageHostGuestBackdropLuma(mainUUID, 2.0)
+        // Missing or stale (guest without TweakLoader, or just promoted): keep the current glyph
+        // color; the white initial value already handles a never-reported guest on dark video.
+        guard luma >= 0 else { return }
+        let dark: Bool
+        if let current = backdropIsDark {
+            // Hysteresis: once decided, the opposite threshold has to be crossed to flip back.
+            if current {
+                dark = luma <= Self.backdropLightThreshold
+            } else {
+                dark = luma < Self.backdropDarkThreshold
+            }
+        } else {
+            dark = luma < 0.5
+        }
+        guard dark != backdropIsDark else { return }
+        backdropIsDark = dark
+        controls.applyBackdropDark(dark, animated: true)
+        handednessButton.setGlyphOnDarkBackground(dark, animated: true)
     }
 
     // MARK: - Dock taps

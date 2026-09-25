@@ -13,6 +13,7 @@
 #import "Localization.h"
 #import "LCSharedUtils.h"
 #import "utils.h"
+#import "LCStageIPC.h"
 #import "UIKitPrivate+MultitaskSupport.h"
 
 @interface AppSceneViewController()
@@ -113,7 +114,7 @@
         [weakSelf.delegate appSceneVC:weakSelf didInitializeWithError:error];
     }];
     [_extension setRequestInterruptionBlock:^(NSUUID *uuid) {
-        [weakSelf appTerminationCleanUp];
+        [weakSelf handleExtensionInterruption];
     }];
     [_extension beginExtensionRequestWithInputItems:@[item] completion:^(NSUUID *identifier) {
         if(identifier) {
@@ -470,6 +471,54 @@
             settings.deactivationReasons = 0;
         }
     }];
+}
+
+- (BOOL)lc_isSceneForegroundActive {
+    if(!self.presenter) { return NO; }
+    UIApplicationSceneSettings *settings = self.presenter.scene.settings;
+    return [settings isForeground] && [settings deactivationReasons] == 0;
+}
+
+- (void)lc_pinForeground {
+    if(!self.presenter || _shouldIgnoreSceneUpdates) { return; }
+    if(!self.usesHostingControllerAPI) {
+        // Legacy presenter path: make sure the extension never forwards host
+        // resign/background notifications into the guest either.
+        [self setBackgroundNotificationEnabled:false];
+    }
+    [self.presenter.scene updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+        settings.foreground = YES;
+        settings.deactivationReasons = 0;
+    }];
+}
+
+/// NSExtension request interruptions arrive TRANSIENTLY on lock screen and app switches. The old
+/// code tore the hosted scene (FBScene + hosting controller) down unconditionally the moment one
+/// arrived; when the extension reconnected on unlock the guest UI cold-started — Instagram bounced
+/// from a profile page back to its feed — and the frozen-frame cover made it look like the app had
+/// refreshed itself. We now let the dust settle for half a second and verify the guest process
+/// with getpgid (the same ground-truth check the watchdog uses): a live process keeps its scene
+/// (and gets a re-pin), only a confirmed-dead process is cleaned up. appTerminationCleanUp is
+/// idempotent, so the real cancellation callback racing us stays harmless.
+- (void)handleExtensionInterruption {
+    const int pidAtInterrupt = _pid;
+    BOOL aliveAtInterrupt = self.isAppRunning;
+    NSLog(@"[LCStage][场景] appex 请求被中断（bundle=%@, pid=%d, 进程存活=%@），0.5s 后验尸",
+          _bundleId, pidAtInterrupt, aliveAtInterrupt ? @"是" : @"否");
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if(!self) { return; }
+        if(self.isAppRunning) {
+            NSLog(@"[LCStage][场景] 中断后验尸：pid=%d 仍存活，忽略本次中断并补钉前台（launchCount=%ld）",
+                  pidAtInterrupt, (long)LCStageHostGuestLaunchCount(self.dataUUID));
+            [self lc_pinForeground];
+            return;
+        }
+        NSLog(@"[LCStage][场景] 中断后验尸：pid=%d 已确认死亡，执行场景清理", pidAtInterrupt);
+        [self appTerminationCleanUp];
+    });
 }
 
 /// Geometry commit for the (interactive) MAIN window only, run once the stage layout animation

@@ -31,10 +31,24 @@ import CoreText
     static let controlLeadingInset: CGFloat = 12
     /// Trailing inset of the FPS readout, measured from the far edge of the strip.
     static let fpsTrailingInset: CGFloat = 12
-    /// Fixed size of the FPS readout: a glass capsule with a status dot, a large rounded tabular
-    /// value and a small "fps" unit; generous on purpose so "120" never clips at the big font.
-    static let fpsWidth: CGFloat = 94
+    /// Gap between the FPS capsule and the handedness toggle beside it.
+    static let chromeSpacing: CGFloat = 4
+    /// Fixed size of the FPS readout: a glass capsule with a status dot, a square tabular
+    /// value and a small superscript "FPS" unit; tightened around the smaller superscript unit.
+    static let fpsWidth: CGFloat = 80
     static let fpsHeight: CGFloat = 30
+
+    /// Persisted left/right handedness choice. NO (default): main window on the left for
+    /// left-hand use; YES: mirrored, main window on the right. Stored in the App Group so the
+    /// host and every guest agree on the geometry.
+    private static let mirrorDefaultsKey = "LCStageLayoutMirrored"
+    @objc static var isMirrored: Bool {
+        get { LCUtils.appGroupUserDefault.bool(forKey: mirrorDefaultsKey) }
+        set {
+            LCUtils.appGroupUserDefault.set(newValue, forKey: mirrorDefaultsKey)
+            LCUtils.appGroupUserDefault.synchronize()
+        }
+    }
     /// Bottom dock, sized like the iOS dock.
     static let dockHeight: CGFloat = 90
     static let dockSideInset: CGFloat = 10
@@ -74,14 +88,21 @@ import CoreText
         )
     }
 
-    /// Slot 0 is the main window, slots 1...3 are the stacked side windows.
+    /// Slot 0 is the main window, slots 1...3 are the stacked side windows. In right-handed
+    /// (mirrored) layout the block flips horizontally: the side stack leads on the left and the
+    /// main window trails on the right, while the side windows keep their top-to-bottom order.
     @objc static func slotFrame(_ index: Int, bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
         let g = geometry(bounds, safeArea)
+        let blockWidth = g.unit * CGFloat(maxWindows)
         if index <= 0 {
-            return CGRect(x: g.origin.x, y: g.origin.y, width: g.unit * 3, height: g.sideHeight * 3)
+            let x = isMirrored ? g.origin.x + g.unit : g.origin.x
+            return CGRect(x: x, y: g.origin.y, width: g.unit * 3, height: g.sideHeight * 3)
         }
+        let sideX = isMirrored
+            ? g.origin.x
+            : g.origin.x + blockWidth - g.unit
         return CGRect(
-            x: g.origin.x + g.unit * 3,
+            x: sideX,
             y: g.origin.y + g.sideHeight * CGFloat(index - 1),
             width: g.unit,
             height: g.sideHeight
@@ -95,30 +116,65 @@ import CoreText
         return (index <= 0 ? g.unit * 3 : g.unit) / bounds.width
     }
 
-    /// The two window controls live in the blank strip right above the window block, leading-aligned
-    /// with the main window's edge.
+    /// The window controls live in the blank strip right above the MAIN window's outer edge: the
+    /// leading edge in left-handed layout, the trailing edge in right-handed layout.
     ///
-    /// The frame is deliberately the same in both modes: fullscreen and the split stage differ in what
-    /// is behind the controls, never in where they are. The pair used to step six points down and left
-    /// as the main window grew, and a control that slides while its glyph stays put inside the circle
-    /// reads as the button coming apart — the window is what should move, not the chrome on top of it.
-    @objc static func controlsFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
+    /// Fullscreen shows ONLY the restore control (closing requires shrinking back to the split
+    /// stage first), and the single control steps to the screen edge the main window now reaches.
+    /// The width collapses with it, so the single circle keeps the same edge alignment.
+    @objc static func controlsFrame(bounds: CGRect, safeArea: UIEdgeInsets, fullscreen: Bool) -> CGRect {
         let g = geometry(bounds, safeArea)
+        let width = fullscreen ? controlSize : controlsWidth
+        let edgeX: CGFloat
+        if fullscreen {
+            // The main window now reaches the screen boundary.
+            edgeX = isMirrored
+                ? bounds.width - controlLeadingInset - width
+                : controlLeadingInset
+        } else {
+            // Split stage: hug the main window's outer side.
+            edgeX = isMirrored
+                ? g.origin.x + g.unit * 3 - controlLeadingInset - width
+                : g.origin.x + controlLeadingInset
+        }
         return CGRect(
-            x: g.origin.x + controlLeadingInset,
+            x: edgeX,
             y: safeArea.top + (controlsHeight - controlSize) / 2,
-            width: controlsWidth,
+            width: width,
             height: controlSize
         )
     }
 
-    /// The FPS readout sits at the far end of the strip, on the same line as the controls.
+    /// The FPS readout hugs the screen edge OPPOSITE the controls (the side-window side), on the
+    /// same line: right edge in left-handed layout, left edge in right-handed layout.
     @objc static func fpsFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
+        let x: CGFloat
+        if isMirrored {
+            x = fpsTrailingInset
+        } else {
+            x = max(0, bounds.width - fpsTrailingInset - fpsWidth)
+        }
         return CGRect(
-            x: max(0, bounds.width - fpsTrailingInset - fpsWidth),
+            x: x,
             y: safeArea.top + (controlsHeight - fpsHeight) / 2,
             width: fpsWidth,
             height: fpsHeight
+        )
+    }
+
+    /// The handedness toggle sits immediately toward screen center from the FPS capsule (to the
+    /// RIGHT of the FPS in mirrored layout, to its left otherwise), so the pair reads as one
+    /// instrument cluster in either handedness.
+    @objc static func handednessFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
+        let fps = fpsFrame(bounds: bounds, safeArea: safeArea)
+        let x = isMirrored
+            ? fps.maxX + chromeSpacing
+            : fps.minX - chromeSpacing - controlSize
+        return CGRect(
+            x: x,
+            y: safeArea.top + (controlsHeight - controlSize) / 2,
+            width: controlSize,
+            height: controlSize
         )
     }
 
@@ -142,14 +198,23 @@ import CoreText
         .layerMinXMaxYCorner, .layerMaxXMaxYCorner,
     ]
 
-    /// Only the outer contour of the window block is rounded, shared edges stay flush.
+    /// Only the outer contour of the window block is rounded, shared edges stay flush. Mirrored
+    /// layout swaps which side is the outer one: the main window rounds its right two corners and
+    /// the side stack rounds its left two.
     static func maskedCorners(_ index: Int, count: Int) -> CACornerMask {
         if count <= 1 { return allCorners }
-        if index <= 0 { return [.layerMinXMinYCorner, .layerMinXMaxYCorner] }
-
+        if !isMirrored {
+            if index <= 0 { return [.layerMinXMinYCorner, .layerMinXMaxYCorner] }
+            var corners: CACornerMask = []
+            if index == 1 { corners.insert(.layerMaxXMinYCorner) }
+            if index == count - 1 { corners.insert(.layerMaxXMaxYCorner) }
+            return corners
+        }
+        // Mirrored: main window on the right.
+        if index <= 0 { return [.layerMaxXMinYCorner, .layerMaxXMaxYCorner] }
         var corners: CACornerMask = []
-        if index == 1 { corners.insert(.layerMaxXMinYCorner) }
-        if index == count - 1 { corners.insert(.layerMaxXMaxYCorner) }
+        if index == 1 { corners.insert(.layerMinXMinYCorner) }
+        if index == count - 1 { corners.insert(.layerMinXMaxYCorner) }
         return corners
     }
 }
@@ -185,6 +250,11 @@ final class MultitaskStageGlassButton: UIButton {
     private let glass = UIVisualEffectView(effect: nil)
     private let tint = UIView()
     private let glyph = UIImageView()
+    /// Whether the content behind the control is currently dark. Dark backdrops want a WHITE glyph
+    /// (e.g. a black video in fullscreen); light backdrops want a dark glyph. Driven by the stage's
+    /// backdrop-luma sampler. Starts dark: white is the safe choice before the first sample arrives.
+    private var glyphOnDark = true
+    private var isPressed = false
 
     init(symbol: String, pressedTint: UIColor?) {
         self.pressedTint = pressedTint
@@ -253,10 +323,44 @@ final class MultitaskStageGlassButton: UIButton {
 
     private func setupGlyph(_ symbol: String) {
         glyph.image = UIImage(systemName: symbol, withConfiguration: Self.glyphConfiguration)
-        glyph.tintColor = .label
+        // White until the first backdrop sample: a dark glyph can vanish on a black video, a white
+        // one always survives on the translucent glass.
+        glyph.tintColor = .white
         glyph.contentMode = .center
         glyph.isUserInteractionEnabled = false
         addSubview(glyph)
+    }
+
+    /// Adaptive glyph color: dark backdrop → white glyph, light backdrop → near-black glyph.
+    /// A destructive control (close) keeps white glyphs while its red press state is showing.
+    func setGlyphOnDarkBackground(_ dark: Bool, animated: Bool) {
+        guard dark != glyphOnDark else { return }
+        glyphOnDark = dark
+        let color = currentGlyphColor
+        let apply = { self.glyph.tintColor = color }
+        guard animated && !UIAccessibility.isReduceMotionEnabled else { apply(); return }
+        // Cross-fade through a quick dissolve so the glyph never pops while a video cuts scenes.
+        if let snapshot = glyph.snapshotView(afterScreenUpdates: false) {
+            snapshot.frame = glyph.frame
+            addSubview(snapshot)
+            glyph.tintColor = color
+            glyph.alpha = 0
+            UIView.animate(withDuration: 0.18, delay: 0,
+                           options: [.beginFromCurrentState, .allowUserInteraction],
+                           animations: { self.glyph.alpha = 1 },
+                           completion: { _ in snapshot.removeFromSuperview() })
+        } else {
+            UIView.transition(with: glyph, duration: 0.18,
+                              options: [.transitionCrossDissolve, .beginFromCurrentState, .allowUserInteraction],
+                              animations: apply)
+        }
+    }
+
+    /// White under a finger on a tinted (destructive) button; otherwise white on dark backdrops,
+    /// near-black on light backdrops.
+    private var currentGlyphColor: UIColor {
+        if isPressed && pressedTint != nil { return .white }
+        return glyphOnDark ? .white : UIColor.label.resolvedColor(with: UITraitCollection(userInterfaceStyle: .light))
     }
 
     /// Press feedback. Reduce Motion keeps the color change — it is the feedback that says which
@@ -269,9 +373,9 @@ final class MultitaskStageGlassButton: UIButton {
     }
 
     private func applyPressedAppearance(_ pressed: Bool) {
-        let pressedTint = self.pressedTint
-        glyph.tintColor = (pressed && pressedTint != nil) ? .white : .label
+        isPressed = pressed
         let apply = {
+            self.glyph.tintColor = self.currentGlyphColor
             self.tint.alpha = pressed ? 1 : 0
             self.transform = pressed ? CGAffineTransform(scaleX: 0.94, y: 0.94) : .identity
         }
@@ -318,11 +422,14 @@ final class MultitaskStageGlassButton: UIButton {
 @objc class MultitaskStageControlsView: UIView {
     @objc weak var delegate: MultitaskStageControlsDelegate?
 
-    /// Only the zoom control changes with the mode: it grows the main window and restores it.
+    /// Fullscreen mode: the close control is retracted entirely. Closing now requires shrinking the
+    /// window back to the split stage first — fullscreen is the guest app's screen, and a
+    /// destructive button has no business floating over it.
     @objc var isFullscreen: Bool = false {
         didSet {
             guard isFullscreen != oldValue else { return }
             updateZoomControl()
+            updateCloseVisibility(animated: true)
         }
     }
 
@@ -347,6 +454,7 @@ final class MultitaskStageGlassButton: UIButton {
         addSubview(closeButton)
         addSubview(zoomButton)
         updateZoomControl()
+        updateCloseVisibility(animated: false)
     }
 
     @objc private func closeTapped() {
@@ -371,17 +479,61 @@ final class MultitaskStageGlassButton: UIButton {
         zoomButton.accessibilityLabel = (isFullscreen ? "lc.multitask.restoreWindow" : "lc.multitask.zoomWindow").loc
     }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
+    /// Fades and shrinks the close control out of the strip in fullscreen; the restore control
+    /// slides to its edge-aligned slot. The layout's own width collapses with the animation
+    /// (the host's controlsFrame hands us the single-button width).
+    private func updateCloseVisibility(animated: Bool) {
+        let collapsed = isFullscreen
+        let changes = {
+            self.closeButton.alpha = collapsed ? 0 : 1
+            self.closeButton.transform = collapsed
+                ? CGAffineTransform(scaleX: 0.4, y: 0.4)
+                : .identity
+            // The restore button hugs the outer edge in both layouts: the left edge of the pair in
+            // split mode, and the only slot in fullscreen.
+            self.layoutButtons()
+        }
+        closeButton.isUserInteractionEnabled = !collapsed
+        guard animated && !UIAccessibility.isReduceMotionEnabled else {
+            changes()
+            return
+        }
+        UIView.animate(withDuration: 0.32, delay: 0,
+                       usingSpringWithDamping: 0.82, initialSpringVelocity: 0,
+                       options: [.beginFromCurrentState, .allowUserInteraction],
+                       animations: changes)
+    }
+
+    /// Forwards the backdrop-derived glyph color to both buttons (the hidden close one included, so
+    /// it is already the right color the instant it returns in split mode).
+    @objc func applyBackdropDark(_ dark: Bool, animated: Bool) {
+        closeButton.setGlyphOnDarkBackground(dark, animated: animated)
+        zoomButton.setGlyphOnDarkBackground(dark, animated: animated)
+    }
+
+    private func layoutButtons() {
         let size = MultitaskStageLayout.controlSize
         let top = (bounds.height - size) / 2
-        closeButton.frame = CGRect(x: 0, y: top, width: size, height: size)
-        zoomButton.frame = CGRect(
-            x: size + MultitaskStageLayout.controlSpacing,
-            y: top,
-            width: size,
-            height: size
-        )
+        if MultitaskStageLayout.isMirrored {
+            // The view's frame hugs the screen's trailing edge: that edge is the OUTER side, so the
+            // restore control goes last (x = width - size) and close sits toward screen center.
+            zoomButton.frame = CGRect(x: bounds.width - size, y: top, width: size, height: size)
+            closeButton.frame = CGRect(x: 0, y: top, width: size, height: size)
+        } else {
+            // Leading edge of the screen is outer: restore leads, close trails toward center.
+            zoomButton.frame = CGRect(x: 0, y: top, width: size, height: size)
+            closeButton.frame = CGRect(
+                x: size + MultitaskStageLayout.controlSpacing,
+                y: top,
+                width: size,
+                height: size
+            )
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        layoutButtons()
     }
 
     /// Only the two buttons are tappable; the strip itself stays invisible to touches, so nothing on
@@ -413,8 +565,11 @@ final class MultitaskStageGlassButton: UIButton {
 
     /// Longer than a frame, short enough to show a stutter as it happens.
     private static let sampleInterval: CFTimeInterval = 0.5
-    private static let valueFontSize: CGFloat = 16
-    private static let unitFontSize: CGFloat = 10
+    private static let valueFontSize: CGFloat = 15
+    private static let unitFontSize: CGFloat = 9
+    /// How far the superscript "FPS" rides above the digits' baseline: roughly the cap-height gap
+    /// between the small unit and the hero number.
+    private static let unitBaselineOffset: CGFloat = 5
 
     private enum FPSState {
         case idle, smooth, strained, dropping
@@ -497,32 +652,33 @@ final class MultitaskStageGlassButton: UIButton {
         glass.contentView.addSubview(label)
     }
 
-    /// SF Rounded with the monospaced-numbers feature: rounded glyphs for the friendly feel,
-    /// tabular widths so "120" → "119" doesn't jiggle the capsule.
-    private func roundedTabularFont(size: CGFloat, weight: UIFont.Weight) -> UIFont {
+    /// The default SF Pro design (square, straight-sided — deliberately NOT SF Rounded) with the
+    /// monospaced-numbers feature: an instrument readout should read technical and stay put as the
+    /// digits change ("120" → "119" never jiggles the capsule).
+    private func squareTabularFont(size: CGFloat, weight: UIFont.Weight) -> UIFont {
         let base = UIFont.systemFont(ofSize: size, weight: weight)
-        guard let descriptor = base.fontDescriptor.withDesign(.rounded) else { return base }
         let feature: [UIFontDescriptor.FeatureKey: Any] = [
             .featureIdentifier: kNumberSpacingType,
             .typeIdentifier: kMonospacedNumbersSelector
         ]
-        let styled = descriptor.addingAttributes([.featureSettings: [feature]])
+        let styled = base.fontDescriptor.addingAttributes([.featureSettings: [feature]])
         return UIFont(descriptor: styled, size: size)
     }
 
     private func readoutText(value: Int?, color: UIColor) -> NSAttributedString {
         let digits = value.map(String.init) ?? "--"
         let result = NSMutableAttributedString(string: digits, attributes: [
-            .font: roundedTabularFont(size: Self.valueFontSize, weight: .heavy),
+            .font: squareTabularFont(size: Self.valueFontSize, weight: .heavy),
             .kern: 0.3,
             .foregroundColor: color,
         ])
-        // Lowercase "fps" set one tone quieter and nudged toward the baseline of the big digits.
-        let unit = NSAttributedString(string: " fps", attributes: [
-            .font: roundedTabularFont(size: Self.unitFontSize, weight: .semibold),
-            .kern: 0.2,
+        // Uppercase "FPS" as a true superscript: small caps-height glyphs riding the top of the
+        // digits (positive baseline offset), one tone quieter — the notation of a measurement unit.
+        let unit = NSAttributedString(string: " FPS", attributes: [
+            .font: squareTabularFont(size: Self.unitFontSize, weight: .bold),
+            .kern: 0.4,
             .foregroundColor: UIColor.secondaryLabel,
-            .baselineOffset: 1.5,
+            .baselineOffset: Self.unitBaselineOffset,
         ])
         result.append(unit)
         return result
