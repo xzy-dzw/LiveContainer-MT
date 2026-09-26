@@ -797,66 +797,22 @@ static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, voi
 @implementation UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event {
     if (event.type == UIEventTypeTouches && event.allTouches.count > 0) {
-        // Fast path: the overwhelmingly common case (a main-window guest, or an app that never
-        // uses the stage at all). With no quarantined gesture in flight and a fresh "not a side
-        // window" verdict, the event needs no set enumeration at all. The gate is bypassed the
-        // instant a side-window gesture is in flight, so sticky quarantine keeps working.
-        if (LCStageSideTouches.count == 0 && !LCStageGuestCachedIsSideWindow(LCGuestDataUUID)) {
-            [self hook_lcStage_sendEvent:event];
-            return;
-        }
-        if (!LCStageSideTouches) {
-            LCStageSideTouches = [NSHashTable weakObjectsHashTable];
-        }
-        NSSet<UITouch *> *touches = event.allTouches;
+        // New touch model: a side window is INTERACTIVE. Its touches are delivered to the app
+        // normally — began, moved, ended all reach it end-to-end (fixes hold-to-talk long-press
+        // being cut off and in-window buttons not firing). The ONLY side effect of touching a side
+        // window is a one-shot ask to the host to promote it to the main slot. Nothing is ever
+        // quarantined or dropped here.
         BOOL promoteRequested = NO;
-        for (UITouch *touch in touches) {
-            // Sequences leave the table the moment they finish.
-            if (touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled) {
-                [LCStageSideTouches removeObject:touch];
-                continue;
-            }
-            if (touch.phase != UITouchPhaseBegan) { continue; }
-            // A new sequence always starts fresh: purge any verdict a recycled UITouch instance
-            // carried from an earlier sequence, then adjudicate ONCE for this whole gesture.
-            // Always a FRESH verdict (never the cached gate value) so a began is never
-            // misclassified by a 0.5s-stale cache.
-            [LCStageSideTouches removeObject:touch];
-            if (LCStageGuestIsSideWindow(LCGuestDataUUID)) {
-                [LCStageSideTouches addObject:touch];
-                // Several Began can ride one UIEvent (two fingers landing almost together); the
-                // host promotes idempotently, so request it once per event rather than per finger.
+        for (UITouch *touch in event.allTouches) {
+            if (touch.phase == UITouchPhaseBegan && LCStageGuestIsSideWindow(LCGuestDataUUID)) {
+                // Several Began can ride one UIEvent (two fingers landing together); the host
+                // promotes idempotently, so request once per event.
                 promoteRequested = YES;
+                break;
             }
         }
         if (promoteRequested) {
             LCStageRequestPromote(LCGuestDataUUID);
-            NSLog(@"[LCStage][触摸] 副窗触摸序列已隔离，请求提升该窗口（uuid=%@）", LCGuestDataUUID);
-        }
-
-        // Decide over EVERY touch of THIS event, including endings (mirrors the host-side hook):
-        // a tracked sequence's own ended was just removed and must be delivered together with any
-        // untracked finger in the same event, otherwise gestures/buttons hang highlighted.
-        BOOL allTracked = YES;
-        BOOL anyTracked = NO;
-        for (UITouch *touch in touches) {
-            if ([LCStageSideTouches containsObject:touch]) {
-                anyTracked = YES;
-            } else {
-                allTracked = NO;
-            }
-        }
-        if (allTracked && anyTracked) {
-            // Every live touch belongs to a quarantined side-window sequence: drop the whole
-            // event so the guest app never sees it.
-            return;
-        }
-        if (anyTracked) {
-            // Mixed event: it is delivered, so release ONLY the side sequences riding in it —
-            // swallowing their later moved/ended after this delivery would split the gesture.
-            for (UITouch *touch in touches) {
-                [LCStageSideTouches removeObject:touch];
-            }
         }
     }
     [self hook_lcStage_sendEvent:event];

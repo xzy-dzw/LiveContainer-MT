@@ -95,6 +95,12 @@ static NSHashTable<UITouch *> *LCInterceptedTouches;
 // is running and every touch of the event is evaluated in that window's coordinates.
 // Returns YES when the whole event must be swallowed.
 static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
+    // New touch model: side windows are fully interactive, so touches are NEVER quarantined or
+    // swallowed here. Promotion on the first side-window touch is requested by the guest's own
+    // sendEvent hook (LCStageRequestPromote); returning NO lets began+moved+ended reach the app
+    // end-to-end (fixes hold-to-talk being cut off and side-window buttons not firing).
+    return NO;
+#if 0
     NSSet<UITouch *> *touches = event.allTouches;
     if(touches.count == 0) {
         return NO;
@@ -160,6 +166,7 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
         }
     }
     return NO;
+#endif
 }
 
 @interface UIApplication (LCSendEventHook)

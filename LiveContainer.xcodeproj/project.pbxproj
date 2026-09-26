@@ -195,6 +195,7 @@
 				"AppIconGrey60x60@2x.png",
 				"AppIconGrey76x76@2x~ipad.png",
 				Assets.xcassets,
+				"BlenderPro-Bold.ttf",
 				DefaultIcon.png,
 				Localizable.xcstrings,
 				Settings.bundle,

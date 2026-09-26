@@ -40,12 +40,10 @@
 
 @implementation DecoratedStageContainerView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if(self.tapShield && !self.tapShield.hidden) {
-        UIView* hit = [super hitTest:point withEvent:event];
-        // Any touch inside this container while the shield is active must go to the shield,
-        // never to the hosted remote view beneath it.
-        return hit ? self.tapShield : nil;
-    }
+    // New touch model: NO shield. Every live window (main and side) is interactive, so hit-test
+    // straight through to the hosted content. On the first touch to a side window the guest's own
+    // sendEvent hook asks the host to promote it; that never eats the touch, so long-press and
+    // in-window buttons work end-to-end.
     return [super hitTest:point withEvent:event];
 }
 @end
@@ -332,10 +330,10 @@
     // this window. The transparent tap shield and the interaction switch below are backstops for
     // cases where a touch still falls through to the host. Never background the side scenes
     // here: a backgrounded hosted scene freezes on its last frame, defeating the live stage.
-    BOOL interact = isMainWindow;
-    // Only flip the switches when the role actually changed: rewriting userInteractionEnabled on
-    // every layout pass (it fires while a long-press gesture is being tracked) must never be the
-    // thing that disturbs an in-flight touch sequence.
+    // New touch model: EVERY live window is interactive, not just the main one. A side window
+    // both receives its touches (hold-to-talk long-press, in-window buttons) and, on the first
+    // began, asks the host to promote itself (guest sendEvent hook). Never background side scenes.
+    BOOL interact = YES;
     if(self.appSceneVC.view.userInteractionEnabled != interact) {
         self.appSceneVC.view.userInteractionEnabled = interact;
     }
@@ -346,9 +344,9 @@
        self.appSceneVC.hostingController.sceneView.userInteractionEnabled != interact) {
         self.appSceneVC.hostingController.sceneView.userInteractionEnabled = interact;
     }
-    _tapShield.hidden = interact || maximized;
-    // Only a side window in split layout can be promoted by tapping it.
-    _promoteGesture.enabled = !maximized && !isMainWindow;
+    // No transparent shield and no tap-to-promote gesture: touches go straight to the app.
+    _tapShield.hidden = YES;
+    _promoteGesture.enabled = NO;
 
     [self applyScaleRatio];
     [self.view layoutIfNeeded];

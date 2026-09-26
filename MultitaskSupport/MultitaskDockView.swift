@@ -1018,11 +1018,9 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         let shadowPathDuration: TimeInterval = (animated && !UIAccessibility.isReduceMotionEnabled)
             ? MultitaskDockManager.layoutAnimationDuration
             : 0
-        // Corner masks swap sides on a mirror. During the spring flight they are deferred to the
-        // settle pass (a mid-flight swap draws a contour line on the shared edge); the Reduce
-        // Motion cross-dissolve has no flight — cards land instantly — so the mask must snap at
-        // once there.
-        let deferCornerMasks = mirroring && animated && !UIAccessibility.isReduceMotionEnabled
+        // Corner masks swap sides on a mirror. The handedness swap is now INSTANT (no flight),
+        // so the masks snap with the re-tile; the instant mirror branch below forces defer off.
+        var deferCornerMasks = mirroring && animated && !UIAccessibility.isReduceMotionEnabled
 
         let update = { [weak self] in
             guard let self else { return }
@@ -1085,9 +1083,9 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 // dims the app while it owns the screen.
                 self.stageBackdrop.alpha = self.isFullscreen ? 0 : 1
                 self.blockPlate.frame = MultitaskStageLayout.blockFrame(bounds: bounds, safeArea: safeArea)
-                // Only a mirror flight needs the seam plate; the settle pass runs non-mirrored and
-                // hides it again the moment the cards arrive.
-                self.blockPlate.isHidden = !mirroring
+                // Handedness now swaps instantly (no flight), so there is no mid-flight gap to
+                // cover: the seam plate stays hidden at all times and can never pop in/out.
+                self.blockPlate.isHidden = true
             }
             if mirroring {
                 UIView.performWithoutAnimation(backdropUpdates)
@@ -1169,7 +1167,17 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             }
         }
 
-        if animated && UIAccessibility.isReduceMotionEnabled {
+        if mirroring {
+            // INSTANT left/right handedness swap: re-tile in place with no spring, no alpha, no
+            // seam plate. Sliding the hosted cards through a spring exposed a black mid-flight gap
+            // and made iOS re-derive each hosted surface mid-flight (the whole-screen flicker).
+            // Swapping the cards in one non-animated frame opens no moving gap, so nothing flashes;
+            // the button glyph flip + haptic still give the press feedback. No geometry commit is
+            // armed: handedness never changes which window is main, its size, scale or fullscreen.
+            deferCornerMasks = false
+            layoutToken &+= 1
+            UIView.performWithoutAnimation { update() }
+        } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
             layoutToken &+= 1
             let token = layoutToken
@@ -2478,36 +2486,47 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
               let mainView = apps.first?.view,
               mainView.bounds.width > 1,
               mainView.bounds.height > 1,
-              let mainUUID = apps.first?.appUUID,
-              let grid = LCStageHostGuestBackdropGrid(mainUUID, 2.0) else { return }
-        let bytes = [UInt8](grid)
-        let cols = Int(LCStageBackdropGridCols)
-        let rows = Int(LCStageBackdropGridRows)
-        guard bytes.count == cols * rows else { return }
+              let window = keyWindow else { return }
+        // The main card's on-screen rect. Every chrome control that sits OUTSIDE this rect floats
+        // over the stage's own dark strip/dock surface, never over guest content — so those
+        // controls are always white on dark. Only a control whose centre actually lies over the
+        // guest card (the zoom button in fullscreen) needs the published luma grid.
+        let cardInWindow = mainView.convert(mainView.bounds, to: window)
 
+        // Grab the grid lazily: a control entirely over the stage strip needs no guest pixels.
+        var bytes: [UInt8]?
+        var cols = 0, rows = 0
         for button in allChromeButtons where !button.isHidden && button.alpha > 0.1 {
-            // Map the control centre into the main card's coordinate space. The card view hosts
-            // the guest's full-screen content scaled to fit, so card-space normalized coordinates
-            // are exactly the guest's normalized screen coordinates — which is how the guest
-            // stretched its render into the same cols×rows grid.
             let centre = CGPoint(x: button.bounds.midX, y: button.bounds.midY)
+            let centreInWindow = button.convert(centre, to: window)
+            let key = ObjectIdentifier(button)
+
+            guard cardInWindow.contains(centreInWindow) else {
+                // Over the stage's own dark strip/dock: dark surface -> white glyph.
+                guard backdropButtonDark[key] != true else { continue }
+                backdropButtonDark[key] = true
+                button.setGlyphOnDarkBackground(true, animated: true)
+                continue
+            }
+
+            // Inside the guest card: sample the cell behind it. Lazily fetch the grid once.
+            if bytes == nil {
+                guard let mainUUID = apps.first?.appUUID,
+                      let grid = LCStageHostGuestBackdropGrid(mainUUID, 2.0) else { continue }
+                let b = [UInt8](grid)
+                let c = Int(LCStageBackdropGridCols), r = Int(LCStageBackdropGridRows)
+                guard b.count == c * r else { continue }
+                bytes = b; cols = c; rows = r
+            }
             let p = button.convert(centre, to: mainView)
-            var nx = p.x / mainView.bounds.width
-            var ny = p.y / mainView.bounds.height
-            // The controls live in the blank strip ABOVE the block. Clamp to the top edge: the
-            // patch nearest a floating control is the content row directly below it, not the
-            // wrapped-around bottom row.
-            nx = min(max(nx, 0), 0.999_999)
-            ny = min(max(ny, 0), 0.999_999)
+            let nx = min(max(p.x / mainView.bounds.width, 0), 0.999_999)
+            let ny = min(max(p.y / mainView.bounds.height, 0), 0.999_999)
             let col = Int(nx * CGFloat(cols))
             let row = Int(ny * CGFloat(rows))
-            let luma = bytes[row * cols + col]
+            let luma = bytes![row * cols + col]
 
-            let key = ObjectIdentifier(button)
             let dark: Bool
             if let current = backdropButtonDark[key] {
-                // Hysteresis: once dark, stay dark until luma crosses ABOVE the light threshold;
-                // once light, stay light until it drops BELOW the dark threshold.
                 dark = current ? (luma <= Self.backdropLightByte)
                                : (luma < Self.backdropDarkByte)
             } else {
