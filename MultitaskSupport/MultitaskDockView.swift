@@ -1168,15 +1168,23 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         }
 
         if mirroring {
-            // INSTANT left/right handedness swap: re-tile in place with no spring, no alpha, no
-            // seam plate. Sliding the hosted cards through a spring exposed a black mid-flight gap
-            // and made iOS re-derive each hosted surface mid-flight (the whole-screen flicker).
-            // Swapping the cards in one non-animated frame opens no moving gap, so nothing flashes;
-            // the button glyph flip + haptic still give the press feedback. No geometry commit is
-            // armed: handedness never changes which window is main, its size, scale or fullscreen.
+            // MINIMAL left/right handedness swap: across a mirror ONLY each card's x flips — its
+            // size, scale, content and the chrome/dock/backdrop/z-order are identical. Running the
+            // full update() here re-ordered hosted layers, re-ran the SwiftUI dock layout and
+            // re-committed scene geometry, which is what flashed the whole screen and popped a
+            // block over the dock. So write ONLY the card frames and corner masks, touching
+            // nothing else, in one non-animated transaction.
             deferCornerMasks = false
             layoutToken &+= 1
-            UIView.performWithoutAnimation { update() }
+            UIView.performWithoutAnimation {
+                for (index, app) in self.apps.enumerated() {
+                    guard let view = app.view else { continue }
+                    let frame = MultitaskStageLayout.slotFrame(index, bounds: bounds, safeArea: safeArea)
+                    view.frame = frame
+                    view.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
+                    self.windowShadowCasters[app.appUUID]?.frame = frame
+                }
+            }
         } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
             layoutToken &+= 1
@@ -2488,10 +2496,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
               mainView.bounds.height > 1,
               let window = keyWindow else { return }
         // The main card's on-screen rect. Every chrome control that sits OUTSIDE this rect floats
-        // over the stage's own dark strip/dock surface, never over guest content — so those
-        // controls are always white on dark. Only a control whose centre actually lies over the
-        // guest card (the zoom button in fullscreen) needs the published luma grid.
+        // over the stage's own strip/dock — never over guest content. The strip is the dark scrim
+        // over the LAUNCHER, so its lightness follows the launcher's interface style: white glyph
+        // in dark mode (black scrim on black), black glyph in light mode (grey scrim on white).
+        // Only a control whose centre actually lies over the guest card (the zoom button in
+        // fullscreen) needs the published luma grid.
         let cardInWindow = mainView.convert(mainView.bounds, to: window)
+        let stripDark = window.traitCollection.userInterfaceStyle == .dark
 
         // Grab the grid lazily: a control entirely over the stage strip needs no guest pixels.
         var bytes: [UInt8]?
@@ -2502,10 +2513,11 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             let key = ObjectIdentifier(button)
 
             guard cardInWindow.contains(centreInWindow) else {
-                // Over the stage's own dark strip/dock: dark surface -> white glyph.
-                guard backdropButtonDark[key] != true else { continue }
-                backdropButtonDark[key] = true
-                button.setGlyphOnDarkBackground(true, animated: true)
+                // Over the stage's own strip/dock: pick the glyph color from the system interface
+                // style (dark strip -> white glyph; light grey strip -> black glyph).
+                guard backdropButtonDark[key] != stripDark else { continue }
+                backdropButtonDark[key] = stripDark
+                button.setGlyphOnDarkBackground(stripDark, animated: true)
                 continue
             }
 
