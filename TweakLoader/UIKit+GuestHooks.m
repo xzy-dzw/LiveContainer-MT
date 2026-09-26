@@ -797,6 +797,15 @@ static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, voi
 @implementation UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event {
     if (event.type == UIEventTypeTouches && event.allTouches.count > 0) {
+        // [DIAG] one-shot touch-phase trace: log began/ended/cancelled so we can see whether a
+        // main-window long-press gets a touchesCancelled inserted mid-gesture.
+        for (UITouch *t in event.allTouches) {
+            if (t.phase == UITouchPhaseBegan || t.phase == UITouchPhaseEnded ||
+                t.phase == UITouchPhaseCancelled) {
+                NSLog(@"[LCStage][TOUCH-DIAG] phase=%ld side=%d (uuid=%@)",
+                      (long)t.phase, LCStageGuestIsSideWindow(LCGuestDataUUID), LCGuestDataUUID);
+            }
+        }
         // Fast path: the overwhelmingly common case (a main-window guest, or an app that never
         // uses the stage at all). With no quarantined gesture in flight and a fresh "not a side
         // window" verdict, the event needs no set enumeration at all. The gate is bypassed the

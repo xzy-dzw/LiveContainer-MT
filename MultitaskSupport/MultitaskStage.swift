@@ -608,7 +608,10 @@ final class MultitaskStageGlassButton: UIButton {
         statusDot.backgroundColor = state.color
         statusDot.layer.cornerRadius = 3.5
         statusDot.layer.cornerCurve = .continuous
-        glass.contentView.addSubview(statusDot)
+        // The status dot was removed: the FPS number itself already recolours by state
+        // (smooth/strained/dropping), so the dot was redundant chrome. Keep the property only so
+        // the colour-state bookkeeping below still compiles; it is never shown.
+        statusDot.isHidden = true
     }
 
     private func setupLabel() {
@@ -662,17 +665,10 @@ final class MultitaskStageGlassButton: UIButton {
         } else {
             glass.layer.cornerRadius = bounds.height / 2
         }
-        let dotSize: CGFloat = 7
         let dotX: CGFloat = 11
-        statusDot.frame = CGRect(
-            x: dotX,
-            y: (bounds.height - dotSize) / 2,
-            width: dotSize,
-            height: dotSize
-        )
         label.sizeToFit()
         label.frame = CGRect(
-            x: dotX + dotSize + 6,
+            x: dotX,
             y: (bounds.height - label.bounds.height) / 2,
             width: label.bounds.width,
             height: label.bounds.height
@@ -768,16 +764,8 @@ final class MultitaskStageGlassButton: UIButton {
     private func transition(to newState: FPSState) {
         guard newState != state else { return }
         state = newState
-        statusDot.backgroundColor = newState.color
         if let value = lastShownValue {
             label.attributedText = readoutText(value: value, color: newState.color)
-        }
-        guard !UIAccessibility.isReduceMotionEnabled else {
-            return
-        }
-        UIView.transition(with: statusDot, duration: 0.3,
-                          options: [.transitionCrossDissolve, .beginFromCurrentState]) {
-            self.statusDot.backgroundColor = newState.color
         }
     }
 }
