@@ -798,12 +798,24 @@ static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, voi
 - (void)hook_lcStage_sendEvent:(UIEvent *)event {
     if (event.type == UIEventTypeTouches && event.allTouches.count > 0) {
         // [DIAG] one-shot touch-phase trace: log began/ended/cancelled so we can see whether a
-        // main-window long-press gets a touchesCancelled inserted mid-gesture.
+        // main-window long-press gets a touchesCancelled inserted mid-gesture. Written to the
+        // app-group defaults so the host can render it ON SCREEN (no Console.app needed yet).
         for (UITouch *t in event.allTouches) {
             if (t.phase == UITouchPhaseBegan || t.phase == UITouchPhaseEnded ||
                 t.phase == UITouchPhaseCancelled) {
-                NSLog(@"[LCStage][TOUCH-DIAG] phase=%ld side=%d (uuid=%@)",
-                      (long)t.phase, LCStageGuestIsSideWindow(LCGuestDataUUID), LCGuestDataUUID);
+                NSString *line = [NSString stringWithFormat:@"%@ phase=%@ side=%d",
+                    [NSDate date],
+                    t.phase == UITouchPhaseBegan ? @"BEGAN" :
+                    (t.phase == UITouchPhaseEnded ? @"ENDED" :
+                     (t.phase == UITouchPhaseCancelled ? @"CANCELLED" : @"OTHER")),
+                    LCStageGuestIsSideWindow(LCGuestDataUUID)];
+                NSLog(@"[LCStage][TOUCH-DIAG] %@", line);
+                NSUserDefaults *shared = NSUserDefaults.lcSharedDefaults;
+                NSMutableArray<NSString *> *buf = [[shared arrayForKey:@"LCStageTouchDiag"] mutableCopy] ?: [NSMutableArray array];
+                [buf addObject:line];
+                while (buf.count > 12) [buf removeObjectAtIndex:0];
+                [shared setObject:buf forKey:@"LCStageTouchDiag"];
+                [shared synchronize];
             }
         }
         // Fast path: the overwhelmingly common case (a main-window guest, or an app that never

@@ -704,6 +704,22 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     }()
     /// The stage's frame-rate readout, in the strip's trailing corner beside the close button.
     private let fpsCounter = MultitaskStageFPSCounterView(frame: .zero)
+    /// [DIAG] temporary on-screen touch-log overlay: shows the guest's BEGAN/ENDED/CANCELLED
+    /// sequence so the main-window long-press cut-off can be diagnosed without Console.app.
+    /// Removed once the cause is confirmed.
+    private let diagLabel: UILabel = {
+        let l = UILabel()
+        l.font = UIFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        l.textColor = .systemGreen
+        l.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        l.numberOfLines = 0
+        l.textAlignment = .left
+        l.layer.cornerRadius = 6
+        l.layer.masksToBounds = true
+        l.isUserInteractionEnabled = false
+        return l
+    }()
+    private var diagTimer: Timer?
     /// Every leading-cluster control in layout order, so mount/layout/visibility loops stay one line.
     private var leadingButtons: [MultitaskStageGlassButton] { [zoomButton, swapButton, homeButton] }
     /// All glass controls, for backdrop glyph-color forwarding and z-ordering.
@@ -946,6 +962,15 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             fpsCounter.removeFromSuperview()
             window.addSubview(fpsCounter)
         }
+        if diagLabel.superview !== window {
+            diagLabel.removeFromSuperview()
+            window.addSubview(diagLabel)
+            diagTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+                self?.refreshDiagLabel()
+            }
+        }
+        diagLabel.frame = CGRect(x: 12, y: bounds.height - safeArea.bottom - 150,
+                                 width: 260, height: 130)
         // The invisible 1pt PiP layer must live in a real on-screen window while the PiP channel
         // is ARMED. v4.1.2 keeps PiP a backup channel: when the toggle is off no layer,
         // timer or video session is ever created (zero overhead).
@@ -2485,6 +2510,14 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         backdropProbeTimer?.invalidate()
         backdropProbeTimer = nil
         backdropButtonDark.removeAll()
+    }
+
+    /// [DIAG] pull the guest's touch-phase buffer out of the app-group defaults and render it.
+    private func refreshDiagLabel() {
+        guard !isStageCollapsed else { diagLabel.isHidden = true; return }
+        diagLabel.isHidden = false
+        let lines = LCUtils.appGroupUserDefault.array(forKey: "LCStageTouchDiag") as? [String] ?? []
+        diagLabel.text = lines.isEmpty ? "touch diag: (tap the main window)" : lines.joined(separator: "\n")
     }
 
     private func sampleBackdropGrid() {

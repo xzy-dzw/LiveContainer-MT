@@ -32,7 +32,8 @@ import CoreText
     static let chromeSpacing: CGFloat = 4
     /// Fixed size of the FPS readout: a glass capsule with a status dot, a bold tabular
     /// value and a small superscript "FPS" unit; tightened around the smaller superscript unit.
-    static let fpsWidth: CGFloat = 80
+    // No status dot any more: width is just the '120 FPS' readout plus side padding.
+    static let fpsWidth: CGFloat = 62
     static let fpsHeight: CGFloat = 30
 
     /// Persisted left/right handedness choice. NO (default): main window on the left for
