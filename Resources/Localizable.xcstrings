@@ -18553,6 +18553,23 @@
         }
       }
     },
+    "lc.multitask.enterStage" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Multitasking"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "多任务"
+          }
+        }
+      }
+    },
     "lc.multitask.toggleHandedness" : {
       "extractionState" : "manual",
       "localizations" : {

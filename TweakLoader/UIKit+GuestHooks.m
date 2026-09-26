@@ -285,6 +285,47 @@ static BOOL LCGuestRenderLumaStats(UIView *view, CGFloat side, CGFloat *outMean,
     return YES;
 }
 
+/// Renders the guest's key window into a coarse 16×12 luma grid (raw uint8, row-major) that the
+/// host uses to tint EACH stage control according to the patch of content directly behind it.
+/// The intermediate buffer is 4×4 supersampled per cell (64×48) so the downscale filters
+/// instead of aliasing; the non-square stretch matches the host's normalized coordinate mapping.
+static NSData *LCGuestRenderBackdropGrid(UIView *view) {
+    CGSize size = view.bounds.size;
+    if (size.width < 2 || size.height < 2) { return nil; }
+    const NSInteger cols = (NSInteger)LCStageBackdropGridCols;
+    const NSInteger rows = (NSInteger)LCStageBackdropGridRows;
+    const NSInteger kScale = 4;
+    NSInteger w = cols * kScale;
+    NSInteger h = rows * kScale;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, w, h, 8, w * 4, colorSpace,
+                                             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(colorSpace);
+    if (!ctx) { return nil; }
+    CGContextScaleCTM(ctx, (CGFloat)w / size.width, (CGFloat)h / size.height);
+    [view.layer renderInContext:ctx];
+    const UInt8 *bytes = (const UInt8 *)CGBitmapContextGetData(ctx);
+    if (!bytes) { CGContextRelease(ctx); return nil; }
+    NSMutableData *out = [NSMutableData dataWithLength:(NSUInteger)(cols * rows)];
+    UInt8 *cells = (UInt8 *)out.mutableBytes;
+    for (NSInteger row = 0; row < rows; row++) {
+        for (NSInteger col = 0; col < cols; col++) {
+            uint32_t sum = 0;
+            for (NSInteger dy = 0; dy < kScale; dy++) {
+                const UInt8 *p = bytes + (((row * kScale + dy) * w) + col * kScale) * 4;
+                for (NSInteger dx = 0; dx < kScale; dx++) {
+                    // ITU-R BT.601 luma with integer weights 77/150/29 (/256).
+                    sum += (uint32_t)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
+                    p += 4;
+                }
+            }
+            cells[row * cols + col] = (UInt8)(sum / (kScale * kScale));
+        }
+    }
+    CGContextRelease(ctx);
+    return out;
+}
+
 /// Snapshots the guest's last visible frame into the App Group. Runs while the frame is
 /// still on screen (host willResignActive and the two follow-up shots during the resign
 /// transition); afterScreenUpdates:NO keeps it synchronous and cheap. Logs JPEG size and
@@ -589,21 +630,23 @@ static void UIKitGuestHooksInit() {
     [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
     NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", dataUUID, hbKey);
 
-    // MARK: - Backdrop luminance for adaptive control glyphs
+    // MARK: - Backdrop luminance grid for adaptive control glyphs
     //
     // The host cannot snapshot a hosted scene's cross-process content (it renders black), so the
-    // MAIN guest measures its own rendered content and publishes a 0..1 mean luma. The host tints
-    // the stage control glyphs white on dark video and dark on light apps. Side windows never
-    // sample (their glyphs are hidden) and the cost is a single 40x40 software render at 2Hz.
-    NSTimer *lumaTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+    // MAIN guest renders its own content into a coarse 16×12 luma grid twice per second. The host
+    // maps every stage control to the grid cell behind it and tints that control white on dark
+    // content / dark on light content — a mostly light app with a dark strip behind the controls
+    // no longer flips every glyph to the wrong colour. Side windows never sample (their glyphs
+    // are hidden); the cost is one 64×48 software render at 2Hz.
+    NSTimer *backdropGridTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
         if (!LCStageGuestIsMainWindow(LCGuestDataUUID)) { return; }
-        CGFloat mean = 0, std = 0;
-        if (LCGuestRenderLumaStats(LCGuestKeyWindow(), 40, &mean, &std)) {
-            LCStageGuestWriteBackdropLuma(LCGuestDataUUID, (double)mean);
+        NSData *grid = LCGuestRenderBackdropGrid(LCGuestKeyWindow());
+        if (grid.length > 0) {
+            LCStageGuestWriteBackdropGrid(LCGuestDataUUID, grid);
         }
     }];
-    lumaTimer.tolerance = 0.15;
-    [[NSRunLoop mainRunLoop] addTimer:lumaTimer forMode:NSRunLoopCommonModes];
+    backdropGridTimer.tolerance = 0.15;
+    [[NSRunLoop mainRunLoop] addTimer:backdropGridTimer forMode:NSRunLoopCommonModes];
 
     // MARK: - First-frame report + frozen-frame capture
     //
@@ -672,31 +715,46 @@ static void UIKitGuestHooksInit() {
     [LCGuestKeepAliveAudio.shared reconcile];
 }
 
-// Cached side-window verdict. LCStageGuestIsSideWindow() hits App Group defaults on every
-// call, and a fast scroll produces hundreds of touch events per second. Roles only change on
-// a host publish, which always arrives with the Darwin notification above; so cache for 0.5s
-// and invalidate the moment roles change. Both touch delivery and Darwin callbacks land on
-// the main thread.
-static BOOL lc_cachedIsSideWindow = NO;
-static NSTimeInterval lc_sideWindowCacheValidUntil = 0;
+// Per touch-SEQUENCE quarantine. The side/main verdict is evaluated exactly ONCE at
+// UITouchPhaseBegan and sticks to that UITouch until it ends: a role flip in the middle of a
+// gesture (another window gets promoted while a finger is held, or the host's 1Hz roles publish
+// races a quick tap) must never steal the remaining moved/ended events of a sequence that began
+// interactive. Re-evaluating per event was the cause of long-press voice messages getting cut
+// off and of controls highlighting on touch-down but never firing their action (the ended event
+// was swallowed after the roles state flipped). UIKit recycles UITouch instances, so every began
+// clears the old verdict first. The table is weak: finished touches leave by themselves.
+static NSHashTable<UITouch *> *LCStageSideTouches;
+
+// Fast-path gate for the sendEvent hot path. The overwhelmingly common case — a main-window
+// guest, or an app that never uses the stage at all — needs no per-event NSSet enumeration nor
+// weak-hash lookup: with no quarantined gesture in flight and a fresh "this is not a side window"
+// verdict, the event is delivered straight through. The cache is ONLY an entry gate: an actual
+// touch-began still re-adjudicates with LCStageGuestIsSideWindow (see below), and the Darwin
+// roles-changed callback below invalidates it the instant roles flip, so a flip to side-window
+// never outlives a single event. While a quarantined gesture is in flight (table non-empty) the
+// gate is bypassed unconditionally so sticky sequences keep being swallowed until they lift.
+static BOOL LCStageCachedIsSideWindow = NO;
+static CFAbsoluteTime LCStageCachedIsSideWindowValidUntil = 0;
 
 static BOOL LCStageGuestCachedIsSideWindow(NSString *guestUUID) {
-    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (now < lc_sideWindowCacheValidUntil) {
-        return lc_cachedIsSideWindow;
+    if (CFAbsoluteTimeGetCurrent() < LCStageCachedIsSideWindowValidUntil) {
+        return LCStageCachedIsSideWindow;
     }
-    lc_cachedIsSideWindow = LCStageGuestIsSideWindow(guestUUID);
-    lc_sideWindowCacheValidUntil = now + 0.5;
-    return lc_cachedIsSideWindow;
+    LCStageCachedIsSideWindow = LCStageGuestIsSideWindow(guestUUID);
+    LCStageCachedIsSideWindowValidUntil = CFAbsoluteTimeGetCurrent() + 0.5;
+    return LCStageCachedIsSideWindow;
 }
 
 static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *observer,
                                         CFStringRef name, const void *object,
                                         CFDictionaryRef userInfo) {
-    // Pull the host's latest role state so the next sendEvent decision is fresh, and force
-    // the cached verdict to be recomputed on the next event.
+    // Pull the host's latest role state so the NEXT touch-began verdict is fresh. Verdicts of
+    // sequences already in flight are intentionally NOT revisited (see above).
     [NSUserDefaults.lcSharedDefaults synchronize];
-    lc_sideWindowCacheValidUntil = 0;
+    // Drop the fast-path cache so the next event re-reads the just-published roles. This only
+    // invalidates (never serves) the cache, so the callback's arbitrary thread cannot race a
+    // main-thread reader on the verdict itself.
+    LCStageCachedIsSideWindowValidUntil = 0;
     // Stage active state is also the on/off switch for this guest's keep-alive audio.
     [LCGuestKeepAliveAudio.shared reconcile];
 }
@@ -738,20 +796,68 @@ static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, voi
 
 @implementation UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event {
-    // Cheap cached verdict first: allTouches enumeration runs only for guests currently staged
-    // as a side window — on the main window, and when multitasking is never used, every single
-    // touch event used to build and walk the touch set for nothing.
-    if (event.type == UIEventTypeTouches && LCStageGuestCachedIsSideWindow(LCGuestDataUUID)) {
-        // A fresh touch down in a side window is a promote request. Every
-        // event of the sequence (began/moved/ended) is dropped so the app
-        // inside never reacts to it.
-        for (UITouch *touch in event.allTouches) {
-            if (touch.phase == UITouchPhaseBegan) {
-                LCStageRequestPromote(LCGuestDataUUID);
-                break;
+    if (event.type == UIEventTypeTouches && event.allTouches.count > 0) {
+        // Fast path: the overwhelmingly common case (a main-window guest, or an app that never
+        // uses the stage at all). With no quarantined gesture in flight and a fresh "not a side
+        // window" verdict, the event needs no set enumeration at all. The gate is bypassed the
+        // instant a side-window gesture is in flight, so sticky quarantine keeps working.
+        if (LCStageSideTouches.count == 0 && !LCStageGuestCachedIsSideWindow(LCGuestDataUUID)) {
+            [self hook_lcStage_sendEvent:event];
+            return;
+        }
+        if (!LCStageSideTouches) {
+            LCStageSideTouches = [NSHashTable weakObjectsHashTable];
+        }
+        NSSet<UITouch *> *touches = event.allTouches;
+        BOOL promoteRequested = NO;
+        for (UITouch *touch in touches) {
+            // Sequences leave the table the moment they finish.
+            if (touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled) {
+                [LCStageSideTouches removeObject:touch];
+                continue;
+            }
+            if (touch.phase != UITouchPhaseBegan) { continue; }
+            // A new sequence always starts fresh: purge any verdict a recycled UITouch instance
+            // carried from an earlier sequence, then adjudicate ONCE for this whole gesture.
+            // Always a FRESH verdict (never the cached gate value) so a began is never
+            // misclassified by a 0.5s-stale cache.
+            [LCStageSideTouches removeObject:touch];
+            if (LCStageGuestIsSideWindow(LCGuestDataUUID)) {
+                [LCStageSideTouches addObject:touch];
+                // Several Began can ride one UIEvent (two fingers landing almost together); the
+                // host promotes idempotently, so request it once per event rather than per finger.
+                promoteRequested = YES;
             }
         }
-        return;
+        if (promoteRequested) {
+            LCStageRequestPromote(LCGuestDataUUID);
+            NSLog(@"[LCStage][触摸] 副窗触摸序列已隔离，请求提升该窗口（uuid=%@）", LCGuestDataUUID);
+        }
+
+        // Decide over EVERY touch of THIS event, including endings (mirrors the host-side hook):
+        // a tracked sequence's own ended was just removed and must be delivered together with any
+        // untracked finger in the same event, otherwise gestures/buttons hang highlighted.
+        BOOL allTracked = YES;
+        BOOL anyTracked = NO;
+        for (UITouch *touch in touches) {
+            if ([LCStageSideTouches containsObject:touch]) {
+                anyTracked = YES;
+            } else {
+                allTracked = NO;
+            }
+        }
+        if (allTracked && anyTracked) {
+            // Every live touch belongs to a quarantined side-window sequence: drop the whole
+            // event so the guest app never sees it.
+            return;
+        }
+        if (anyTracked) {
+            // Mixed event: it is delivered, so release ONLY the side sequences riding in it —
+            // swallowing their later moved/ended after this delivery would split the gesture.
+            for (UITouch *touch in touches) {
+                [LCStageSideTouches removeObject:touch];
+            }
+        }
     }
     [self hook_lcStage_sendEvent:event];
 }

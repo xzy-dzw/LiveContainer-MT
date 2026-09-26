@@ -113,6 +113,20 @@ import CoreText
         return (index <= 0 ? g.unit * 3 : g.unit) / bounds.width
     }
 
+    /// The footprint of the whole window block (union of every slot). The dark plate under the
+    /// cards uses it: while the cards trade sides during a left/right swap, any sub-pixel seam
+    /// between them must open onto this plate — stage darkness — never the launcher-toned host
+    /// surface behind the stage.
+    @objc static func blockFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
+        let g = geometry(bounds, safeArea)
+        return CGRect(
+            x: g.origin.x,
+            y: g.origin.y,
+            width: g.unit * CGFloat(maxWindows),
+            height: g.sideHeight * 3
+        )
+    }
+
     // MARK: Control clusters
     //
     // The chrome is FIXED to the screen edges and never follows the left/right window mirror:
@@ -200,28 +214,51 @@ import CoreText
 
 // MARK: - Stage font
 
-/// Registers the bundled Blender Pro Bold once and vends it by PostScript name. The FPS
-/// readout uses this face instead of the system font; if the font is ever missing from the
-/// bundle the calls fall back to a bold system font without crashing.
+/// Vends the bundled Blender Pro Bold face by PostScript name. Resolution runs once and tries,
+/// in order: (1) fonts auto-registered at launch through Info.plist UIAppFonts — process-scope
+/// `CTFontManagerRegisterFontsForURL` is NOT reliably visible to `UIFont(name:)` on every iOS
+/// release, which is why the FPS readout used to silently render in the system bold font;
+/// (2) an explicit process-scope registration followed by another lookup; (3) several name
+/// variants (PostScript name vs full name) in case the face is re-released under another name.
+/// Every failure path logs the installed "Blender" families so a packaging mistake is obvious
+/// from the console instead of looking like a styling choice.
 enum MultitaskStageFont {
-    private static let postScriptName = "BlenderPro-Bold"
-    private static var registration: Void = {
-        guard let url = Bundle.main.url(forResource: "BlenderPro-Bold", withExtension: "ttf") else {
-            NSLog("[LCStage] 未找到 BlenderPro-Bold.ttf，FPS 字体回退系统字体")
-            return ()
-        }
-        var error: Unmanaged<CFError>?
-        if CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error) {
-            NSLog("[LCStage] BlenderPro-Bold 字体已注册")
+    private static let resourceName = "BlenderPro-Bold"
+    private static let candidateNames = [
+        "BlenderPro-Bold",      // PostScript name
+        "Blender Pro Bold",     // Full name
+        "BlenderPro-BoldBold",  // Some repackagers append the style twice
+    ]
+
+    private static let resolvedName: String? = {
+        if let name = firstResolvableCandidate() { return name }
+        if let url = Bundle.main.url(forResource: resourceName, withExtension: "ttf") {
+            var error: Unmanaged<CFError>?
+            _ = CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error)
+            // "Already registered" (UIAppFonts beat us to it) reports as an error too; the only
+            // thing that matters is whether lookup now succeeds.
+            if let name = firstResolvableCandidate() {
+                NSLog("[LCStage] FPS 字体已解析：\(name)")
+                return name
+            }
+            NSLog("[LCStage] BlenderPro-Bold 注册/解析失败：\(error?.takeRetainedValue().localizedDescription ?? "未知错误")；已安装含 Blender 的字体族：\(UIFont.familyNames.filter { $0.localizedCaseInsensitiveContains("blender") })")
         } else {
-            NSLog("[LCStage] BlenderPro-Bold 注册失败：\(error?.takeRetainedValue().localizedDescription ?? "未知错误")")
+            NSLog("[LCStage] 未在 App 包内找到 BlenderPro-Bold.ttf，FPS 字体回退系统字体；已安装含 Blender 的字体族：\(UIFont.familyNames.filter { $0.localizedCaseInsensitiveContains("blender") })")
         }
-        return ()
+        return nil
     }()
 
+    private static func firstResolvableCandidate() -> String? {
+        for name in candidateNames where UIFont(name: name, size: 12) != nil {
+            return name
+        }
+        return nil
+    }
+
     static func bold(_ size: CGFloat) -> UIFont {
-        _ = registration
-        if let font = UIFont(name: postScriptName, size: size) { return font }
+        if let name = resolvedName, let font = UIFont(name: name, size: size) {
+            return font
+        }
         return UIFont.systemFont(ofSize: size, weight: .bold)
     }
 }
@@ -591,7 +628,11 @@ final class MultitaskStageGlassButton: UIButton {
             .typeIdentifier: kMonospacedNumbersSelector
         ]
         let styled = base.fontDescriptor.addingAttributes([.featureSettings: [feature]])
-        return UIFont(descriptor: styled, size: size)
+        let candidate = UIFont(descriptor: styled, size: size)
+        // A descriptor that asks for a feature the face does not include can make UIKit silently
+        // SUBSTITUTE another family — which is exactly how Blender Pro used to vanish from the
+        // readout. Keep the styled font only if the face survived; otherwise use the face as-is.
+        return candidate.fontName == base.fontName ? candidate : base
     }
 
     private func readoutText(value: Int?, color: UIColor) -> NSAttributedString {

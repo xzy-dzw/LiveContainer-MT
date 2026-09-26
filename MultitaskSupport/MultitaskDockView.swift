@@ -724,6 +724,11 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     /// that opens between two cards while they trade places has to read as the desktop behind them —
     /// dimmed, never the launcher's own brightness.
     private let stageBackdrop = UIView()
+    /// A single dark plate shaped exactly like the settled window block, one layer above the page
+    /// backdrop and one layer below every shadow caster and card. Cards cover it completely at
+    /// rest; it only exists to own the seam that opens between two cards trading sides during a
+    /// left/right mirror swap (that seam used to flash the launcher-toned host surface).
+    private let blockPlate = UIView()
     /// One shadow caster per window, all of them below every card.
     ///
     /// The stage used to have a single black plate behind the block, casting one shadow for all four
@@ -777,9 +782,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     /// racing the reconnecting surface and contributing its own black frame.
     private var pendingWakeGeometryCommit = false
     private var backgroundingBeganAt = Date.distantPast
-    /// Backdrop luminance sampler state for adaptive control-glyph tinting. nil = still unprobed.
+    /// Per-control backdrop sampler state for adaptive glyph tinting. Each glass control maps
+    /// its own on-screen centre into the main guest's published luma GRID, so a control tinted
+    /// by the dark strip it actually floats over stays white even when the rest of the app is
+    /// light. Keyed by button; value == "background behind this control is dark". Empty while
+    /// unprobed.
     private var backdropProbeTimer: Timer?
-    private var backdropIsDark: Bool?
+    private var backdropButtonDark: [ObjectIdentifier: Bool] = [:]
     /// YES while the stage is visually collapsed to the LiveContainer app list (back-to-LiveContainer
     /// button). Guests, keep-alive and the watchdog all keep running; only the stage surfaces and
     /// chrome are hidden. Tapping a staged app in the list re-enters and clears this flag.
@@ -819,6 +828,15 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         stageBackdrop.isHidden = true
         stageBackdrop.backgroundColor = UIColor.black.withAlphaComponent(0.22)
         windowHostingView.addSubview(stageBackdrop)
+
+        // The seam plate rides just above the page backdrop. Cards and their per-card shadow
+        // casters are always inserted above it (see shadowCaster(for:)).
+        blockPlate.isUserInteractionEnabled = false
+        blockPlate.isHidden = true
+        blockPlate.backgroundColor = UIColor.black.withAlphaComponent(0.3)
+        blockPlate.layer.cornerRadius = MultitaskStageLayout.cornerRadius
+        blockPlate.layer.cornerCurve = .continuous
+        windowHostingView.addSubview(blockPlate)
 
         // The buttons/fpsCounter are NOT attached here: the manager can be created before any
         // key window exists, in which case these would be orphaned forever. performLayout
@@ -902,12 +920,19 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     // MARK: - Stage layout
 
     @objc public func relayout(animated: Bool) {
+        relayout(animated: animated, mirroring: false)
+    }
+
+    /// Mirroring relayout (left/right swap): only the cards fly; the chrome/dock/backdrop writes
+    /// are frozen for the flight and corner masks swap after landing, so no seam or dock block
+    /// flashes during the swap.
+    func relayout(animated: Bool, mirroring: Bool) {
         DispatchQueue.main.async {
-            self.performLayout(animated: animated)
+            self.performLayout(animated: animated, mirroring: mirroring)
         }
     }
 
-    private func performLayout(animated: Bool) {
+    private func performLayout(animated: Bool, mirroring: Bool = false) {
         guard let window = keyWindow else { return }
 
         // Idempotent (re)mounting of the always-on-top views. The manager may have been born
@@ -945,6 +970,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             // have no chance to clean (it doesn't run on this path).
             windowShadowCasters.values.forEach { $0.removeFromSuperview() }
             windowShadowCasters.removeAll()
+            blockPlate.isHidden = true
             // Leave the stage page and go back to the launcher. The dock,
             // controls and stage background all leave together, so nothing is left floating on
             // top of LiveContainer's own UI.
@@ -975,6 +1001,10 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // again by reenterStage(), not by a routine layout pass.
         windowHostingView.isHidden = isStageCollapsed
         stageBackdrop.isHidden = isStageCollapsed
+        // The seam plate is only ever shown for the duration of a mirror flight; a routine
+        // layout keeps it hidden so it can never show through the unfilled slots of a stage
+        // that has fewer than four windows.
+        blockPlate.isHidden = true
         dockHost?.view.isHidden = isStageCollapsed
         if entering {
             windowHostingView.alpha = 0
@@ -988,6 +1018,11 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         let shadowPathDuration: TimeInterval = (animated && !UIAccessibility.isReduceMotionEnabled)
             ? MultitaskDockManager.layoutAnimationDuration
             : 0
+        // Corner masks swap sides on a mirror. During the spring flight they are deferred to the
+        // settle pass (a mid-flight swap draws a contour line on the shared edge); the Reduce
+        // Motion cross-dissolve has no flight — cards land instantly — so the mask must snap at
+        // once there.
+        let deferCornerMasks = mirroring && animated && !UIAccessibility.isReduceMotionEnabled
 
         let update = { [weak self] in
             guard let self else { return }
@@ -1019,7 +1054,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                     view.layer.borderWidth = 0
                 } else {
                     view.layer.cornerRadius = MultitaskStageLayout.cornerRadius
-                    view.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
+                    // While the cards trade sides, the corner mask has to swap sides too. Writing
+                    // it at the START of a spring flight draws a hard contour line along the
+                    // shared edge for the whole animation; keep the old mask in flight and let the
+                    // settle pass snap the new one the moment the cards have arrived.
+                    if !deferCornerMasks {
+                        view.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
+                    }
                     view.layer.borderWidth = MultitaskStageLayout.hairline
                 }
             }
@@ -1031,11 +1072,28 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 }
             }
             self.windowHostingView.sendSubviewToBack(self.stageBackdrop)
+            // Keep the seam plate directly above the page backdrop and below every caster/card.
+            self.windowHostingView.insertSubview(self.blockPlate, aboveSubview: self.stageBackdrop)
 
-            self.stageBackdrop.frame = bounds
-            // Fullscreen belongs to the guest app: the page surface leaves with the strip, so nothing
-            // dims the app while it owns the screen.
-            self.stageBackdrop.alpha = self.isFullscreen ? 0 : 1
+            // Page surface + seam plate. During a mirror swap these (and the chrome below) must
+            // not animate inside the cards' spring: their values are identical, yet re-writing
+            // them in the spring block made the backdrop layer and the hosting-backed dock flash
+            // as a whole block for the length of the swap.
+            let backdropUpdates = {
+                self.stageBackdrop.frame = bounds
+                // Fullscreen belongs to the guest app: the page surface leaves with the strip, so nothing
+                // dims the app while it owns the screen.
+                self.stageBackdrop.alpha = self.isFullscreen ? 0 : 1
+                self.blockPlate.frame = MultitaskStageLayout.blockFrame(bounds: bounds, safeArea: safeArea)
+                // Only a mirror flight needs the seam plate; the settle pass runs non-mirrored and
+                // hides it again the moment the cards arrive.
+                self.blockPlate.isHidden = !mirroring
+            }
+            if mirroring {
+                UIView.performWithoutAnimation(backdropUpdates)
+            } else {
+                backdropUpdates()
+            }
 
             // Every card carries its own shadow, laid out from the frames written just above so the
             // casters animate in the same block as the cards: the shadow of a window that is moving
@@ -1060,44 +1118,54 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             // Fixed chrome clusters. Zoom lives through fullscreen (it is the restore control
             // there); swap / home / close / FPS belong to the split stage only. While collapsed
             // to the launcher the whole strip is hidden.
-            let stripVisible = !self.isFullscreen && !self.isStageCollapsed
-            self.zoomButton.isHidden = self.isStageCollapsed
-            self.zoomButton.frame = MultitaskStageLayout.leadingControlFrame(0, bounds: bounds, safeArea: safeArea)
-            self.zoomButton.alpha = self.isStageCollapsed ? 0 : 1
-            self.zoomButton.isUserInteractionEnabled = !self.isStageCollapsed
-            self.zoomButton.setSymbol(self.isFullscreen
-                ? "arrow.down.right.and.arrow.up.left"
-                : "arrow.up.left.and.arrow.down.right")
-            self.zoomButton.accessibilityLabel = (self.isFullscreen
-                ? "lc.multitask.restoreWindow"
-                : "lc.multitask.zoomWindow").loc
+            let chromeUpdates = {
+                let stripVisible = !self.isFullscreen && !self.isStageCollapsed
+                self.zoomButton.isHidden = self.isStageCollapsed
+                self.zoomButton.frame = MultitaskStageLayout.leadingControlFrame(0, bounds: bounds, safeArea: safeArea)
+                self.zoomButton.alpha = self.isStageCollapsed ? 0 : 1
+                self.zoomButton.isUserInteractionEnabled = !self.isStageCollapsed
+                self.zoomButton.setSymbol(self.isFullscreen
+                    ? "arrow.down.right.and.arrow.up.left"
+                    : "arrow.up.left.and.arrow.down.right")
+                self.zoomButton.accessibilityLabel = (self.isFullscreen
+                    ? "lc.multitask.restoreWindow"
+                    : "lc.multitask.zoomWindow").loc
 
-            for (ordinal, button) in self.leadingButtons.dropFirst().enumerated() {
-                button.isHidden = !stripVisible
-                button.frame = MultitaskStageLayout.leadingControlFrame(
-                    ordinal + 1, bounds: bounds, safeArea: safeArea)
-                button.alpha = stripVisible ? 1 : 0
-                button.isUserInteractionEnabled = stripVisible
+                for (ordinal, button) in self.leadingButtons.dropFirst().enumerated() {
+                    button.isHidden = !stripVisible
+                    button.frame = MultitaskStageLayout.leadingControlFrame(
+                        ordinal + 1, bounds: bounds, safeArea: safeArea)
+                    button.alpha = stripVisible ? 1 : 0
+                    button.isUserInteractionEnabled = stripVisible
+                }
+
+                self.closeButton.isHidden = !stripVisible
+                self.closeButton.frame = MultitaskStageLayout.closeButtonFrame(bounds: bounds, safeArea: safeArea)
+                self.closeButton.alpha = stripVisible ? 1 : 0
+                self.closeButton.isUserInteractionEnabled = stripVisible
+
+                // The readout belongs to the split stage: fullscreen is the guest app's screen, so the
+                // counter leaves with the strip — and stops sampling, instead of ticking away on a
+                // number nobody can see.
+                self.fpsCounter.isHidden = !stripVisible
+                self.fpsCounter.frame = MultitaskStageLayout.fpsFrame(bounds: bounds, safeArea: safeArea)
+                self.fpsCounter.alpha = stripVisible ? 1 : 0
+                self.fpsCounter.isCounting = stripVisible
+
+                if let dockView = self.dockHost?.view {
+                    // Fullscreen means the guest app owns the whole screen, dock included.
+                    dockView.isHidden = self.isStageCollapsed
+                    dockView.alpha = self.isFullscreen ? 0 : 1
+                    dockView.frame = MultitaskStageLayout.dockFrame(bounds: bounds, safeArea: safeArea)
+                }
             }
-
-            self.closeButton.isHidden = !stripVisible
-            self.closeButton.frame = MultitaskStageLayout.closeButtonFrame(bounds: bounds, safeArea: safeArea)
-            self.closeButton.alpha = stripVisible ? 1 : 0
-            self.closeButton.isUserInteractionEnabled = stripVisible
-
-            // The readout belongs to the split stage: fullscreen is the guest app's screen, so the
-            // counter leaves with the strip — and stops sampling, instead of ticking away on a
-            // number nobody can see.
-            self.fpsCounter.isHidden = !stripVisible
-            self.fpsCounter.frame = MultitaskStageLayout.fpsFrame(bounds: bounds, safeArea: safeArea)
-            self.fpsCounter.alpha = stripVisible ? 1 : 0
-            self.fpsCounter.isCounting = stripVisible
-
-            if let dockView = self.dockHost?.view {
-                // Fullscreen means the guest app owns the whole screen, dock included.
-                dockView.isHidden = self.isStageCollapsed
-                dockView.alpha = self.isFullscreen ? 0 : 1
-                dockView.frame = MultitaskStageLayout.dockFrame(bounds: bounds, safeArea: safeArea)
+            // The chrome never moves on a mirror swap (it is fixed to the screen edges). Writing
+            // it inside the spring nevertheless re-ran the SwiftUI dock hosting layout and faded
+            // the whole dock block for the flight; freeze it instead.
+            if mirroring {
+                UIView.performWithoutAnimation(chromeUpdates)
+            } else {
+                chromeUpdates()
             }
         }
 
@@ -1201,7 +1269,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             caster.layer.shadowOffset = CGSize(width: 0, height: 6)
             caster.layer.shadowRadius = 16
             windowShadowCasters[appUUID] = caster
-            windowHostingView.insertSubview(caster, aboveSubview: stageBackdrop)
+            windowHostingView.insertSubview(caster, aboveSubview: blockPlate)
         }
 
         // The path only needs work when the card it follows changed size. Position is the layer's
@@ -1554,6 +1622,31 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // touch region has to cover the slot it sits in now. Windows that slid into side slots
         // need no work: their touches are quarantined in the guest.
         commitMainWindowGeometry()
+
+        // Second, delayed commit. On some iOS 19 builds the system's own post-animation layout
+        // pass re-derives the hosting view geometry a beat AFTER our settle push, and the touch
+        // region then describes a stale slot: controls in the split main window stay untappable
+        // until the next foreground round trip (fullscreen always worked, because its frame
+        // equals the screen and the race happens to be invisible). Re-commit once more shortly
+        // after settling, but only if nothing else moved the stage in between.
+        let gen = currentGen
+        let settleToken = layoutToken
+        let settledUUID = apps.first?.appUUID
+        let settledFullscreen = isFullscreen
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self else { return }
+            guard self.isStagePresented, !self.isStageCollapsed,
+                  self.apps.first?.appUUID == settledUUID,
+                  self.isFullscreen == settledFullscreen,
+                  self.pendingGeometryGeneration == gen,
+                  self.lastSettledGeneration == gen,
+                  // A mirror swap (or any newer animated pass) bumps layoutToken without bumping
+                  // the geometry generation; it must not be met by this push — re-committing the
+                  // hosted scene mid-flight reconnects the render surface and brings the black
+                  // flash the mirror pass exists to avoid.
+                  self.layoutToken == settleToken else { return }
+            self.commitMainWindowGeometry()
+        }
     }
 
     /// Re-pushes the MAIN window's settled geometry into its hosted scene.
@@ -1584,6 +1677,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         stopBackdropProbe()
         // No stage on screen: every guest keeps its own touches again.
         publishStageRoles(active: false)
+        notifyCollapsedStateChanged()
         UIView.animate(withDuration: 0.2, animations: {
             self.windowHostingView.alpha = 0
             self.dockHost?.view.alpha = 0
@@ -2178,7 +2272,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         apps.insert(app, at: 0)
         // The new main window's content (and therefore its backdrop luma) is different; drop the
         // hysteresis state so its first published sample decides the glyph color immediately.
-        backdropIsDark = nil
+        backdropButtonDark.removeAll()
         // Flip touch ownership immediately: the old main starts quarantining
         // and the new main releases touches while the promotion animates.
         publishStageRoles(active: true)
@@ -2206,7 +2300,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             pendingGeometryGeneration += 1
         }
         // The promoted window brings a different backdrop; re-probe its glyph colour immediately.
-        backdropIsDark = nil
+        backdropButtonDark.removeAll()
 
         // The layout pass removes the orphaned card (removeOrphanWindowViews) and springs the
         // remaining cards into place in one motion — there is never a frame of empty black page.
@@ -2241,7 +2335,9 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     @objc func toggleLayoutHandedness() {
         MultitaskStageLayout.isMirrored.toggle()
         switchFeedback.impactOccurred()
-        relayout(animated: true)
+        // Mirror pass: cards fly through the spring, chrome/dock/plate stay frozen and corner
+        // masks swap only after landing — no junction seam or dock-block flash mid-swap.
+        relayout(animated: true, mirroring: true)
         // A half-turn on the glyph reads as the two halves physically swapping places.
         guard !UIAccessibility.isReduceMotionEnabled else { return }
         let flip = CASpringAnimation(keyPath: "transform.rotation.y")
@@ -2273,11 +2369,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             guard self.isStageCollapsed else { return }
             self.windowHostingView.isHidden = true
             self.stageBackdrop.isHidden = true
+            self.blockPlate.isHidden = true
             self.dockHost?.view.isHidden = true
             self.fpsCounter.isHidden = true
             self.fpsCounter.isCounting = false
             self.allChromeButtons.forEach { $0.isHidden = true }
             self.stopBackdropProbe()
+            self.notifyCollapsedStateChanged()
         })
     }
 
@@ -2288,7 +2386,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         if let uuid, let index = apps.firstIndex(where: { $0.appUUID == uuid }), index > 0 {
             let app = apps.remove(at: index)
             apps.insert(app, at: 0)
-            backdropIsDark = nil
+            backdropButtonDark.removeAll()
         }
         guard isStageCollapsed else {
             relayout(animated: true)
@@ -2298,6 +2396,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         startBackdropProbe()
         windowHostingView.isHidden = false
         stageBackdrop.isHidden = false
+        blockPlate.isHidden = true
         dockHost?.view.isHidden = false
         // Start from 0; the layout pass's own spring eases every surface back to its settled alpha.
         windowHostingView.alpha = 0
@@ -2314,25 +2413,52 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             self.windowHostingView.alpha = 1
         }
         publishStageRoles(active: true)
+        notifyCollapsedStateChanged()
+    }
+
+    // MARK: - Launcher re-entry
+
+    /// Posted whenever the stage collapses to the launcher, re-enters, or is dismissed. The
+    /// LiveContainer app list observes it to show/hide the "enter multitasking" toolbar button.
+    public static let collapsedStateChangedNotification = Notification.Name("LCStageCollapsedStateChanged")
+
+    /// YES while a live stage is folded away behind the LiveContainer app list: guests keep
+    /// running and the user can jump straight back onto the stage.
+    @objc public var hasCollapsedStage: Bool {
+        isStagePresented && isStageCollapsed && !apps.isEmpty
+    }
+
+    /// Re-enters the folded stage from the LiveContainer app list without changing which guest
+    /// owns the main slot.
+    @objc public func reenterStageFromLauncher() {
+        reenterStage(promote: nil)
+    }
+
+    private func notifyCollapsedStateChanged() {
+        NotificationCenter.default.post(name: Self.collapsedStateChangedNotification, object: nil)
     }
 
     // MARK: - Adaptive control-glyph backdrop sampling
     //
     // A hosted scene's cross-process pixels render black in every host-side snapshot, so the host
-    // cannot measure what is behind the controls. The MAIN guest instead publishes the mean luma
-    // of its own rendered content (TweakLoader, 2Hz); the host polls it and flips the glyphs
-    // between white (dark video) and near-black (light UI) with a hysteresis band so mid-greys
-    // never make them oscillate.
+    // cannot measure what is behind the controls. The MAIN guest instead publishes a coarse 16×12
+    // luma grid of its own rendered content (TweakLoader, 2Hz). Every control maps its on-screen
+    // centre into the main card's coordinate space, reads the single grid cell behind it and tints
+    // itself white on dark content / near-black on light content, with a per-control hysteresis
+    // band so mid-greys never make one glyph oscillate. Whole-screen mean used to mis-tint every
+    // button of a mostly light app whose top strip was dark.
 
-    private static let backdropDarkThreshold = 0.42
-    private static let backdropLightThreshold = 0.58
+    /// Luma bytes (0...255) bounding the per-control hysteresis band.
+    private static let backdropDarkByte: UInt8 = 107   // 0.42
+    private static let backdropLightByte: UInt8 = 148  // 0.58
+    private static let backdropMidByte: UInt8 = 128
 
     private func startBackdropProbe() {
         guard backdropProbeTimer == nil else { return }
         // Probe immediately so the first decision doesn't wait a full period.
-        DispatchQueue.main.async { [weak self] in self?.sampleBackdropLuma() }
+        DispatchQueue.main.async { [weak self] in self?.sampleBackdropGrid() }
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.sampleBackdropLuma()
+            self?.sampleBackdropGrid()
         }
         timer.tolerance = 0.15
         RunLoop.main.add(timer, forMode: .common)
@@ -2342,32 +2468,55 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     private func stopBackdropProbe() {
         backdropProbeTimer?.invalidate()
         backdropProbeTimer = nil
-        backdropIsDark = nil
+        backdropButtonDark.removeAll()
     }
 
-    private func sampleBackdropLuma() {
+    private func sampleBackdropGrid() {
         guard isStagePresented,
               !isStageCollapsed,
               UIApplication.shared.applicationState == .active,
-              let mainUUID = apps.first?.appUUID else { return }
-        let luma = LCStageHostGuestBackdropLuma(mainUUID, 2.0)
-        // Missing or stale (guest without TweakLoader, or just promoted): keep the current glyph
-        // color; the white initial value already handles a never-reported guest on dark video.
-        guard luma >= 0 else { return }
-        let dark: Bool
-        if let current = backdropIsDark {
-            // Hysteresis: once decided, the opposite threshold has to be crossed to flip back.
-            if current {
-                dark = luma <= Self.backdropLightThreshold
+              let mainView = apps.first?.view,
+              mainView.bounds.width > 1,
+              mainView.bounds.height > 1,
+              let mainUUID = apps.first?.appUUID,
+              let grid = LCStageHostGuestBackdropGrid(mainUUID, 2.0) else { return }
+        let bytes = [UInt8](grid)
+        let cols = Int(LCStageBackdropGridCols)
+        let rows = Int(LCStageBackdropGridRows)
+        guard bytes.count == cols * rows else { return }
+
+        for button in allChromeButtons where !button.isHidden && button.alpha > 0.1 {
+            // Map the control centre into the main card's coordinate space. The card view hosts
+            // the guest's full-screen content scaled to fit, so card-space normalized coordinates
+            // are exactly the guest's normalized screen coordinates — which is how the guest
+            // stretched its render into the same cols×rows grid.
+            let centre = CGPoint(x: button.bounds.midX, y: button.bounds.midY)
+            let p = button.convert(centre, to: mainView)
+            var nx = p.x / mainView.bounds.width
+            var ny = p.y / mainView.bounds.height
+            // The controls live in the blank strip ABOVE the block. Clamp to the top edge: the
+            // patch nearest a floating control is the content row directly below it, not the
+            // wrapped-around bottom row.
+            nx = min(max(nx, 0), 0.999_999)
+            ny = min(max(ny, 0), 0.999_999)
+            let col = Int(nx * CGFloat(cols))
+            let row = Int(ny * CGFloat(rows))
+            let luma = bytes[row * cols + col]
+
+            let key = ObjectIdentifier(button)
+            let dark: Bool
+            if let current = backdropButtonDark[key] {
+                // Hysteresis: once dark, stay dark until luma crosses ABOVE the light threshold;
+                // once light, stay light until it drops BELOW the dark threshold.
+                dark = current ? (luma <= Self.backdropLightByte)
+                               : (luma < Self.backdropDarkByte)
             } else {
-                dark = luma < Self.backdropDarkThreshold
+                dark = luma < Self.backdropMidByte
             }
-        } else {
-            dark = luma < 0.5
+            guard backdropButtonDark[key] != dark else { continue }
+            backdropButtonDark[key] = dark
+            button.setGlyphOnDarkBackground(dark, animated: true)
         }
-        guard dark != backdropIsDark else { return }
-        backdropIsDark = dark
-        allChromeButtons.forEach { $0.setGlyphOnDarkBackground(dark, animated: true) }
     }
 
     // MARK: - Dock taps

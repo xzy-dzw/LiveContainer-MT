@@ -72,7 +72,11 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     @State private var isNavigationActive = false
     
     @State private var helpPresent = false
-    
+
+    /// Whether a multitask stage is folded away behind the app list (back-to-LiveContainer).
+    /// When YES the top toolbar shows a one-tap entrance straight back onto the stage.
+    @State private var canReenterStage = false
+
     @State private var customSortViewPresent = false
     
     @EnvironmentObject private var sharedModel : SharedModel
@@ -209,6 +213,15 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 if !didAppear {
                     onAppear()
                 }
+                if #available(iOS 16.0, *) {
+                    canReenterStage = MultitaskDockManager.shared.hasCollapsedStage
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(
+                for: MultitaskDockManager.collapsedStateChangedNotification)) { _ in
+                if #available(iOS 16.0, *) {
+                    canReenterStage = MultitaskDockManager.shared.hasCollapsedStage
+                }
             }
             
             .navigationTitle("lc.appList.myApps".loc)
@@ -251,6 +264,16 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
 
                 }
                 
+                ToolbarItem(placement: .topBarTrailing) {
+                    if #available(iOS 16.0, *), canReenterStage {
+                        Button {
+                            MultitaskDockManager.shared.reenterStageFromLauncher()
+                        } label: {
+                            Label("lc.multitask.enterStage".loc, systemImage: "rectangle.split.2x1")
+                        }
+                    }
+                }
+
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("lc.appList.openLink".loc, systemImage: "link", action: {
                         Task { await onOpenWebViewTapped() }

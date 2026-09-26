@@ -99,11 +99,17 @@ static NSString * const LCStageIPCLaunchCountKeyPrefix = @"LCGuestLaunchCount.";
 /// Guest-written timestamp keys, one per data container.
 static NSString * const LCStageIPCFrameReadyKeyPrefix = @"LCGuestFrameReady.";
 
-/// Guest-written mean backdrop luminance (0..1 double) of the MAIN window's rendered content,
-/// sampled a few times per second by the main guest itself. The host cannot snapshot a hosted
-/// scene's cross-process pixels (they render black), so the control glyphs' adaptive color is
-/// driven by this value. Stale (>2s) or missing values make the host fall back to white glyphs.
-static NSString * const LCStageIPCBackdropLumaKeyPrefix = @"LCGuestBackdropLuma.";
+/// Guest-published coarse luminance GRID of the MAIN window's rendered content, sampled a few
+/// times per second by the main guest itself. The host cannot snapshot a hosted scene's
+/// cross-process pixels (they render black), so adaptive control colours are driven by this
+/// grid: each control maps its own on-screen position into guest coordinates and reads the
+/// patch behind it, instead of guessing from a single whole-screen mean (a mostly light app
+/// with a dark strip behind the controls used to get dark glyphs on a dark background).
+/// Payload: cols*rows raw uint8 luma bytes (0..255), row-major. A .t sibling holds the write
+/// time; stale (>2s) or missing data makes the host keep the glyph colour it already has.
+static const NSUInteger LCStageBackdropGridCols = 16;
+static const NSUInteger LCStageBackdropGridRows = 12;
+static NSString * const LCStageIPCBackdropGridKeyPrefix = @"LCGuestBackdropGrid.";
 
 /// Role state older than this many seconds is treated as missing. The host
 /// republishes roughly once per second while the stage is on screen, so a
@@ -264,7 +270,7 @@ static inline NSInteger LCStageHostGuestLaunchCount(NSString *guestUUID) {
 }
 
 /// Guest: YES when this guest is currently the interactive main window and the role state is
-/// fresh. The backdrop luminance sampler runs only in that guest.
+/// fresh. The backdrop luminance grid sampler runs only in that guest.
 static inline BOOL LCStageGuestIsMainWindow(NSString *guestUUID) {
     if (guestUUID.length == 0) { return NO; }
     NSUserDefaults *defaults = LCStageSharedDefaults();
@@ -272,30 +278,35 @@ static inline BOOL LCStageGuestIsMainWindow(NSString *guestUUID) {
     return [[defaults stringForKey:LCStageIPCMainUUIDKey] isEqualToString:guestUUID];
 }
 
-/// Guest (main window only): publishes the mean luminance of its currently rendered content.
-static inline void LCStageGuestWriteBackdropLuma(NSString *guestUUID, double luma) {
-    if (guestUUID.length == 0) { return; }
+/// Guest (main window only): publishes a coarse luminance grid of its rendered content.
+/// `grid` must contain exactly LCStageBackdropGridCols*LCStageBackdropGridRows raw uint8 luma
+/// bytes (0..255), row-major. No synchronize/notification: this is a 2Hz advisory value;
+/// the host polls.
+static inline void LCStageGuestWriteBackdropGrid(NSString *guestUUID, NSData *grid) {
+    if (guestUUID.length == 0 || grid.length == 0) { return; }
     NSUserDefaults *defaults = LCStageSharedDefaults();
-    NSString *lumaKey = [LCStageIPCBackdropLumaKeyPrefix stringByAppendingString:guestUUID];
-    [defaults setDouble:luma forKey:lumaKey];
-    [defaults setDouble:CFAbsoluteTimeGetCurrent() forKey:[lumaKey stringByAppendingString:@".t"]];
-    // No synchronize/notification: this is a 2Hz advisory value; the host polls.
+    NSString *gridKey = [LCStageIPCBackdropGridKeyPrefix stringByAppendingString:guestUUID];
+    [defaults setObject:grid forKey:gridKey];
+    [defaults setDouble:CFAbsoluteTimeGetCurrent() forKey:[gridKey stringByAppendingString:@".t"]];
 }
 
-/// Host: reads the main guest's latest backdrop luminance. Returns -1 when missing or older than
-/// `maxAgeSeconds` (dead/injected-off guest), in which case the host keeps white glyphs.
-static inline double LCStageHostGuestBackdropLuma(NSString *guestUUID, NSTimeInterval maxAgeSeconds) {
-    if (guestUUID.length == 0) { return -1.0; }
+/// Host: reads the main guest's latest backdrop luminance grid. Returns nil when missing,
+/// malformed, or older than `maxAgeSeconds` (dead/injected-off guest), in which case the host
+/// keeps the glyph colours it already has.
+static inline NSData *_Nullable LCStageHostGuestBackdropGrid(NSString *guestUUID,
+                                                             NSTimeInterval maxAgeSeconds) {
+    if (guestUUID.length == 0) { return nil; }
     NSUserDefaults *defaults = LCStageSharedDefaults();
     // The guest writes without synchronize (2Hz advisory); force a cross-process refresh so we
     // read the latest sample instead of the host's cached copy.
     [defaults synchronize];
-    NSString *lumaKey = [LCStageIPCBackdropLumaKeyPrefix stringByAppendingString:guestUUID];
-    if ([defaults objectForKey:lumaKey] == nil) { return -1.0; }
-    NSString *ageKey = [lumaKey stringByAppendingString:@".t"];
-    double writtenAt = [defaults doubleForKey:ageKey];
-    if (writtenAt <= 0 || CFAbsoluteTimeGetCurrent() - writtenAt > maxAgeSeconds) { return -1.0; }
-    return [defaults doubleForKey:lumaKey];
+    NSString *gridKey = [LCStageIPCBackdropGridKeyPrefix stringByAppendingString:guestUUID];
+    NSData *grid = [defaults dataForKey:gridKey];
+    NSUInteger expected = LCStageBackdropGridCols * LCStageBackdropGridRows;
+    if (grid.length != (NSInteger)expected) { return nil; }
+    double writtenAt = [defaults doubleForKey:[gridKey stringByAppendingString:@".t"]];
+    if (writtenAt <= 0 || CFAbsoluteTimeGetCurrent() - writtenAt > maxAgeSeconds) { return nil; }
+    return grid;
 }
 
 /// Path of the frozen-frame JPEG one guest stores right before resigning
