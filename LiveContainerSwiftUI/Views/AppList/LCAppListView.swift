@@ -77,6 +77,12 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
     /// When YES the top toolbar shows a one-tap entrance straight back onto the stage.
     @State private var canReenterStage = false
 
+    /// Matches MultitaskDockManager.collapsedStateChangedNotification by literal name on purpose:
+    /// MultitaskDockManager is iOS 16+, and a .onReceive(for:) argument is evaluated outside any
+    /// `if #available` guard, which fails to build against the iOS 15 deployment target. On iOS 15
+    /// the stage never exists, so this name simply never fires.
+    private let collapsedStageNotificationName = Notification.Name("LCStageCollapsedStateChanged")
+
     @State private var customSortViewPresent = false
     
     @EnvironmentObject private var sharedModel : SharedModel
@@ -218,7 +224,7 @@ struct LCAppListView : View, LCAppBannerDelegate, LCAppModelDelegate {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(
-                for: MultitaskDockManager.collapsedStateChangedNotification)) { _ in
+                for: collapsedStageNotificationName)) { _ in
                 if #available(iOS 16.0, *) {
                     canReenterStage = MultitaskDockManager.shared.hasCollapsedStage
                 }
