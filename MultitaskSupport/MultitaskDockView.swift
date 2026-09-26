@@ -1209,6 +1209,12 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                     view.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
                     self.windowShadowCasters[app.appUUID]?.frame = frame
                 }
+                // Lay out the re-tiled containers in the SAME transaction: otherwise the outer
+                // container moves but the (autolayout) remote content lags one frame, which is the
+                // whole-screen flash and the card sliding over the dock on the swap.
+                for app in self.apps {
+                    app.view?.layoutIfNeeded()
+                }
             }
         } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
