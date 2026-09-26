@@ -969,7 +969,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 self?.refreshDiagLabel()
             }
         }
-        diagLabel.frame = CGRect(x: 12, y: bounds.height - safeArea.bottom - 150,
+        diagLabel.frame = CGRect(x: 12, y: window.bounds.height - window.safeAreaInsets.bottom - 150,
                                  width: 260, height: 130)
         // The invisible 1pt PiP layer must live in a real on-screen window while the PiP channel
         // is ARMED. v4.1.2 keeps PiP a backup channel: when the toggle is off no layer,
