@@ -12,6 +12,10 @@
 @property(nonatomic) int pid;
 @property(nonatomic) bool isAppTerminationRequested;
 @property(nonatomic) bool didReportExit;
+/// Last scene-geometry key pushed to the hosted scene (slot size + scale + fullscreen). A
+/// left/right mirror only translates the window: pushing an identical settings.frame while
+/// the cross-process surface is sliding made it flash black, so identical geometry is skipped.
+@property(nonatomic, copy) NSString* lastPushedGeometryKey;
 @property(nonatomic) UITapGestureRecognizer* promoteGesture;
 /// Sits above the guest while this window is a side window, so the app inside never sees a touch
 /// and the tap that should promote the window is always caught here.
@@ -163,7 +167,10 @@
     UIImageView* icon = [[UIImageView alloc] initWithFrame:CGRectZero];
     icon.translatesAutoresizingMaskIntoConstraints = NO;
     icon.contentMode = UIViewContentModeScaleAspectFit;
-    icon.layer.cornerRadius = 12;
+    // iOS 26 squircle: 26.67% continuous radius, exactly the mask used by home-screen/dock
+    // icons. A fixed 12pt radius left the artwork's squarer white corners peeking outside the
+    // squircle contour (the white rim seen around PPT-style icons). 54pt edge × 0.2667 ≈ 14.4.
+    icon.layer.cornerRadius = 54.0 * 0.2667;
     icon.layer.cornerCurve = kCACornerCurveContinuous;
     icon.clipsToBounds = YES;
     [placeholder addSubview:icon];
@@ -326,9 +333,17 @@
     // cases where a touch still falls through to the host. Never background the side scenes
     // here: a backgrounded hosted scene freezes on its last frame, defeating the live stage.
     BOOL interact = isMainWindow;
-    self.appSceneVC.view.userInteractionEnabled = interact;
-    self.appSceneVC.contentView.userInteractionEnabled = interact;
-    if(self.appSceneVC.usesHostingControllerAPI) {
+    // Only flip the switches when the role actually changed: rewriting userInteractionEnabled on
+    // every layout pass (it fires while a long-press gesture is being tracked) must never be the
+    // thing that disturbs an in-flight touch sequence.
+    if(self.appSceneVC.view.userInteractionEnabled != interact) {
+        self.appSceneVC.view.userInteractionEnabled = interact;
+    }
+    if(self.appSceneVC.contentView.userInteractionEnabled != interact) {
+        self.appSceneVC.contentView.userInteractionEnabled = interact;
+    }
+    if(self.appSceneVC.usesHostingControllerAPI &&
+       self.appSceneVC.hostingController.sceneView.userInteractionEnabled != interact) {
         self.appSceneVC.hostingController.sceneView.userInteractionEnabled = interact;
     }
     _tapShield.hidden = interact || maximized;
@@ -337,6 +352,15 @@
 
     [self applyScaleRatio];
     [self.view layoutIfNeeded];
+
+    // Skip the scene settings push when nothing but the position changed. The left/right
+    // mirror keeps slot size, scale and fullscreen state identical; re-pushing the same
+    // settings.frame mid-slide briefly reconnects the cross-process render surface and showed
+    // up as a black flash across the app during the swap animation.
+    NSString *geometryKey = [NSString stringWithFormat:@"%.2f_%.2f_%.4f_%d",
+                             frame.size.width, frame.size.height, _scaleRatio, maximized];
+    BOOL geometryChanged = ![geometryKey isEqualToString:_lastPushedGeometryKey];
+    _lastPushedGeometryKey = geometryKey;
 
     if(maximizedChanged && self.appSceneVC.presenter && !self.appSceneVC.usesHostingControllerAPI) {
         // Legacy presenter path: push the whole settings block (insets included) right away.
@@ -347,7 +371,7 @@
     didUpdateFromSettings:self.appSceneVC.presenter.scene.settings.mutableCopy
        transitionContext:nil
      lifecycleActionType:0];
-    } else {
+    } else if(geometryChanged) {
         [self.appSceneVC updateFrameWithSettingsBlock:nil];
     }
 }

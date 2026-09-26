@@ -285,10 +285,13 @@ static BOOL LCGuestRenderLumaStats(UIView *view, CGFloat side, CGFloat *outMean,
     return YES;
 }
 
-/// Snapshots the guest's last visible frame into the App Group. Runs on
-/// willResignActive while the frame is still on screen; afterScreenUpdates:NO
-/// keeps it synchronous and cheap. Logs JPEG size and pixel stats so a black/broken
-/// capture is obvious from the logs instead of looking like a guest bug.
+/// Snapshots the guest's last visible frame into the App Group. Runs while the frame is
+/// still on screen (host willResignActive and the two follow-up shots during the resign
+/// transition); afterScreenUpdates:NO keeps it synchronous and cheap. Logs JPEG size and
+/// pixel stats so a black/broken capture is obvious from the logs instead of looking like a
+/// guest bug. A re-shot that comes back as a fully dead buffer (near-zero mean AND variance —
+/// the cross-process surface already torn down) never replaces an earlier good frame, so the
+/// last real composited frame is what the host shows on wake.
 static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
     if (dataUUID.length == 0) { return; }
     UIWindow *window = LCGuestKeyWindow();
@@ -303,12 +306,19 @@ static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
         NSLog(@"[LCStage][闪黑] 冻结帧拍照失败：JPEG 编码为空（uuid=%@）", dataUUID);
         return;
     }
+    CGFloat mean = 0, std = 0;
+    LCGuestRenderLumaStats(window, 40, &mean, &std);
     NSString *path = LCStageFrozenFramePath(dataUUID);
+    BOOL hasPreviousFrame = [NSFileManager.defaultManager fileExistsAtPath:path];
+    BOOL deadBuffer = (mean < 0.005 && std < 0.005);
+    if (deadBuffer && hasPreviousFrame) {
+        NSLog(@"[LCStage][闪黑] 延迟补拍命中已销毁的渲染缓冲（亮度=%.3f 噪点=%.3f），保留上一张真实冻结帧",
+              mean, std);
+        return;
+    }
     [NSFileManager.defaultManager createDirectoryAtPath:path.stringByDeletingLastPathComponent
                             withIntermediateDirectories:YES attributes:nil error:nil];
     [jpeg writeToFile:path atomically:YES];
-    CGFloat mean = 0, std = 0;
-    LCGuestRenderLumaStats(window, 40, &mean, &std);
     NSLog(@"[LCStage][闪黑] 冻结帧已写入：%lu 字节，平均亮度=%.3f 标准差=%.3f",
           (unsigned long)jpeg.length, mean, std);
 }
@@ -698,6 +708,17 @@ static void LCStageHostBackgroundingCallback(CFNotificationCenterRef center, voi
     // hosting (so YouTube-style apps keep playing), so the host tells us directly: freeze the
     // last frame and arm keep-alive BEFORE suspension begins.
     LCGuestCaptureFrozenFrame(LCGuestDataUUID);
+    // The first shot can predate the FINAL composited frame of the resign/lock transition (it
+    // fires at willResignActive, before the screen has finished dimming). Re-shoot twice as the
+    // transition settles so the cover shown on wake really is the last frame the user saw; a
+    // shot landing after the surface is torn down is detected and discarded inside the capture.
+    static const NSTimeInterval kReshootDelays[] = {0.15, 0.4};
+    for (NSUInteger i = 0; i < sizeof(kReshootDelays) / sizeof(kReshootDelays[0]); i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kReshootDelays[i] * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            LCGuestCaptureFrozenFrame(LCGuestDataUUID);
+        });
+    }
     [LCGuestKeepAliveAudio.shared armForBackground];
 }
 

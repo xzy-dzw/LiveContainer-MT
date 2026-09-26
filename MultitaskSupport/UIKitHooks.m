@@ -75,6 +75,15 @@ void hook_FBScene_performUpdateWithoutActivation(FBScene* self, SEL _cmd, void (
 // upstream of that channel: swallowing a touch there means the guest app never sees it. The
 // hook asks the multitask stage whether a new touch began inside one of the side slots; if so
 // the whole touch sequence is swallowed and the window is promoted to the main slot instead.
+//
+// Interception state is tracked PER TOUCH SEQUENCE:
+//   - only a UITouch whose BEGAN phase hit a side slot is ever quarantined;
+//   - the old verdict is dropped at every began before re-evaluating, because UIKit can hand
+//     the same UITouch instance to a later sequence — without this a recycled instance kept
+//     stealing brand-new touches in the MAIN window (e.g. WeChat's press-and-hold-to-talk);
+//   - ended/cancelled touches leave the table immediately;
+//   - a mixed event releases only the sequences it contains instead of nuking the whole table.
+//
 // NOTE: the hook selectors have no implementation of their own — they are registered with
 // class_addMethod below and method_exchangeImplementations swaps them with the original
 // sendEvent, so calling hook_xxx_sendEvent: from inside the hook dispatches to the original
@@ -91,44 +100,64 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
         return NO;
     }
     if(@available(iOS 16.0, *)) {
+        if(!LCInterceptedTouches) {
+            LCInterceptedTouches = [NSHashTable weakObjectsHashTable];
+        }
+
         for(UITouch *touch in touches) {
-            if(touch.phase != UITouchPhaseBegan) continue;
-            if(window == nil) {
-                if(touch.window == nil) continue; // not bound yet, the UIWindow hook gets it
-                CGPoint location = [touch locationInView:touch.window];
-                if([MultitaskDockManager.shared interceptTouchAtLocation:location inWindow:touch.window]) {
-                    if(!LCInterceptedTouches) {
-                        LCInterceptedTouches = [NSHashTable weakObjectsHashTable];
-                    }
-                    [LCInterceptedTouches addObject:touch];
-                }
-            } else {
-                if(touch.window != nil && touch.window != window) continue;
-                CGPoint location = [touch locationInView:window];
-                if([MultitaskDockManager.shared interceptTouchAtLocation:location inWindow:window]) {
-                    if(!LCInterceptedTouches) {
-                        LCInterceptedTouches = [NSHashTable weakObjectsHashTable];
-                    }
-                    [LCInterceptedTouches addObject:touch];
-                }
+            // Sequences leave the table the moment they finish.
+            if(touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled) {
+                [LCInterceptedTouches removeObject:touch];
+                continue;
+            }
+            if(touch.phase != UITouchPhaseBegan) {
+                continue;
+            }
+            // A new sequence always starts untrusted: purge any verdict an earlier sequence left
+            // on this (possibly recycled) UITouch instance before re-evaluating its location.
+            [LCInterceptedTouches removeObject:touch];
+
+            UIWindow *hitTestWindow = window ?: touch.window;
+            if(hitTestWindow == nil) {
+                continue; // not bound yet at the UIApplication level; the UIWindow hook gets it
+            }
+            if(window != nil && touch.window != nil && touch.window != window) {
+                continue; // event bound to a different window than the one dispatching
+            }
+            CGPoint location = [touch locationInView:hitTestWindow];
+            if([MultitaskDockManager.shared interceptTouchAtLocation:location inWindow:hitTestWindow]) {
+                [LCInterceptedTouches addObject:touch];
+                NSLog(@"[LCStage][触摸] 新触摸落在副窗区域，拦截本序列并提升该窗口");
             }
         }
+
+        // Decide over EVERY touch of THIS event, including endings. A tracked sequence's own
+        // ended was just removed from the table above (it must be delivered: the guest never got
+        // its began); and an untracked ended/cancelled — e.g. the main-window finger lifting
+        // while a quarantined side finger still moves — must veto the swallow, or that guest
+        // never receives touchesEnded and its gesture/button hangs highlighted.
         BOOL allTracked = YES;
+        BOOL anyTracked = NO;
         for(UITouch *touch in touches) {
-            if(![LCInterceptedTouches containsObject:touch]) {
+            if([LCInterceptedTouches containsObject:touch]) {
+                anyTracked = YES;
+            } else {
                 allTracked = NO;
-                break;
             }
         }
-        if(allTracked) {
-            // The whole event belongs to an intercepted sequence: drop it so the guest never
-            // receives it. The table holds touches weakly, so entries evaporate on their own
-            // once UIKit releases the ended touches.
+        if(allTracked && anyTracked) {
+            // Every live touch in the event belongs to a quarantined sequence: drop the event
+            // so the side guest never sees it.
             return YES;
         }
-        // Mixed event (an intercepted sequence plus an unrelated touch): give up on the
-        // interception and deliver everything, a half-swallowed sequence would be worse.
-        [LCInterceptedTouches removeAllObjects];
+        // Mixed event: this one is delivered, so release ONLY the side sequences that ride in
+        // it (swallowing their later moved/ended after this delivery would split the gesture).
+        // Sequences not present in this event keep their quarantine.
+        if(anyTracked) {
+            for(UITouch *touch in touches) {
+                [LCInterceptedTouches removeObject:touch];
+            }
+        }
     }
     return NO;
 }

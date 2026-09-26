@@ -2,8 +2,9 @@
 //  MultitaskStage.swift
 //  LiveContainer
 //
-//  1 main + 3 side window stage layout, the pair of glass window controls that live in the blank
-//  strip above the main window, and the stage's FPS readout.
+//  1 main + 3 side window stage layout, the glass controls that live in the blank strip above
+//  the main window (zoom / left-right swap / back-to-LiveContainer on the leading side, FPS
+//  readout + close on the trailing side), and the stage's FPS readout.
 //
 
 import Foundation
@@ -17,23 +18,19 @@ import CoreText
     /// Main window plus three side windows.
     @objc static let maxWindows = 4
 
-    /// Blank strip above the window block that hosts the main window's controls. Tall enough for
+    /// Blank strip above the window block that hosts the window controls. Tall enough for
     /// the HIG minimum hit target (44pt), so the controls never have to overlap a window.
     static let controlsHeight: CGFloat = 44
     /// Hit target of one window control, and the side of the glass circle it draws.
     static let controlSize: CGFloat = 44
-    /// Gap between the two controls' hit targets: close enough that the pair reads as one piece of
-    /// chrome, wide enough that a thumb never lands on both at once.
+    /// Gap between two controls' hit targets: close enough that a cluster reads as one piece
+    /// of chrome, wide enough that a thumb never lands on two at once.
     static let controlSpacing: CGFloat = 6
-    /// Combined width of the control pair.
-    static var controlsWidth: CGFloat { controlSize * 2 + controlSpacing }
-    /// Keeps the controls off the very edge of the screen, aligned with the main window's edge.
-    static let controlLeadingInset: CGFloat = 12
-    /// Trailing inset of the FPS readout, measured from the far edge of the strip.
-    static let fpsTrailingInset: CGFloat = 12
-    /// Gap between the FPS capsule and the handedness toggle beside it.
+    /// Inset of both control clusters from the screen's leading/trailing edge.
+    static let controlEdgeInset: CGFloat = 12
+    /// Gap between the FPS capsule and the close button beside it.
     static let chromeSpacing: CGFloat = 4
-    /// Fixed size of the FPS readout: a glass capsule with a status dot, a square tabular
+    /// Fixed size of the FPS readout: a glass capsule with a status dot, a bold tabular
     /// value and a small superscript "FPS" unit; tightened around the smaller superscript unit.
     static let fpsWidth: CGFloat = 80
     static let fpsHeight: CGFloat = 30
@@ -116,65 +113,47 @@ import CoreText
         return (index <= 0 ? g.unit * 3 : g.unit) / bounds.width
     }
 
-    /// The window controls live in the blank strip right above the MAIN window's outer edge: the
-    /// leading edge in left-handed layout, the trailing edge in right-handed layout.
-    ///
-    /// Fullscreen shows ONLY the restore control (closing requires shrinking back to the split
-    /// stage first), and the single control steps to the screen edge the main window now reaches.
-    /// The width collapses with it, so the single circle keeps the same edge alignment.
-    @objc static func controlsFrame(bounds: CGRect, safeArea: UIEdgeInsets, fullscreen: Bool) -> CGRect {
-        let g = geometry(bounds, safeArea)
-        let width = fullscreen ? controlSize : controlsWidth
-        let edgeX: CGFloat
-        if fullscreen {
-            // The main window now reaches the screen boundary.
-            edgeX = isMirrored
-                ? bounds.width - controlLeadingInset - width
-                : controlLeadingInset
-        } else {
-            // Split stage: hug the main window's outer side.
-            edgeX = isMirrored
-                ? g.origin.x + g.unit * 3 - controlLeadingInset - width
-                : g.origin.x + controlLeadingInset
-        }
-        return CGRect(
-            x: edgeX,
-            y: safeArea.top + (controlsHeight - controlSize) / 2,
-            width: width,
+    // MARK: Control clusters
+    //
+    // The chrome is FIXED to the screen edges and never follows the left/right window mirror:
+    // muscle memory for "close is top-right, zoom is top-left" must survive a layout swap.
+    //   Leading cluster (top-left), in order: zoom, left/right swap, back-to-LiveContainer.
+    //   Trailing cluster (top-right): the FPS capsule with the close button immediately to its
+    //   right at the screen edge — keeping the destructive control far from zoom prevents the
+    //   accidental "meant to zoom, killed the app" tap.
+    // Fullscreen shows only zoom; every other control retracts.
+
+    private static func controlY(_ safeArea: UIEdgeInsets) -> CGFloat {
+        safeArea.top + (controlsHeight - controlSize) / 2
+    }
+
+    /// - Parameter ordinal: 0 = zoom, 1 = swap, 2 = back-to-LiveContainer.
+    @objc static func leadingControlFrame(_ ordinal: Int, bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
+        CGRect(
+            x: controlEdgeInset + CGFloat(ordinal) * (controlSize + controlSpacing),
+            y: controlY(safeArea),
+            width: controlSize,
             height: controlSize
         )
     }
 
-    /// The FPS readout hugs the screen edge OPPOSITE the controls (the side-window side), on the
-    /// same line: right edge in left-handed layout, left edge in right-handed layout.
+    /// Close sits at the trailing edge in split layout; off-screen when fullscreen.
+    @objc static func closeButtonFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
+        CGRect(
+            x: bounds.width - controlEdgeInset - controlSize,
+            y: controlY(safeArea),
+            width: controlSize,
+            height: controlSize
+        )
+    }
+
+    /// FPS capsule hugs the close button on its left, on the same line.
     @objc static func fpsFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
-        let x: CGFloat
-        if isMirrored {
-            x = fpsTrailingInset
-        } else {
-            x = max(0, bounds.width - fpsTrailingInset - fpsWidth)
-        }
-        return CGRect(
-            x: x,
+        CGRect(
+            x: bounds.width - controlEdgeInset - controlSize - chromeSpacing - fpsWidth,
             y: safeArea.top + (controlsHeight - fpsHeight) / 2,
             width: fpsWidth,
             height: fpsHeight
-        )
-    }
-
-    /// The handedness toggle sits immediately toward screen center from the FPS capsule (to the
-    /// RIGHT of the FPS in mirrored layout, to its left otherwise), so the pair reads as one
-    /// instrument cluster in either handedness.
-    @objc static func handednessFrame(bounds: CGRect, safeArea: UIEdgeInsets) -> CGRect {
-        let fps = fpsFrame(bounds: bounds, safeArea: safeArea)
-        let x = isMirrored
-            ? fps.maxX + chromeSpacing
-            : fps.minX - chromeSpacing - controlSize
-        return CGRect(
-            x: x,
-            y: safeArea.top + (controlsHeight - controlSize) / 2,
-            width: controlSize,
-            height: controlSize
         )
     }
 
@@ -219,14 +198,83 @@ import CoreText
     }
 }
 
-// MARK: - Window controls
+// MARK: - Stage font
 
-@objc protocol MultitaskStageControlsDelegate: AnyObject {
-    func stageControlsDidTapClose()
-    func stageControlsDidTapZoom()
+/// Registers the bundled Blender Pro Bold once and vends it by PostScript name. The FPS
+/// readout uses this face instead of the system font; if the font is ever missing from the
+/// bundle the calls fall back to a bold system font without crashing.
+enum MultitaskStageFont {
+    private static let postScriptName = "BlenderPro-Bold"
+    private static var registration: Void = {
+        guard let url = Bundle.main.url(forResource: "BlenderPro-Bold", withExtension: "ttf") else {
+            NSLog("[LCStage] 未找到 BlenderPro-Bold.ttf，FPS 字体回退系统字体")
+            return ()
+        }
+        var error: Unmanaged<CFError>?
+        if CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error) {
+            NSLog("[LCStage] BlenderPro-Bold 字体已注册")
+        } else {
+            NSLog("[LCStage] BlenderPro-Bold 注册失败：\(error?.takeRetainedValue().localizedDescription ?? "未知错误")")
+        }
+        return ()
+    }()
+
+    static func bold(_ size: CGFloat) -> UIFont {
+        _ = registration
+        if let font = UIFont(name: postScriptName, size: size) { return font }
+        return UIFont.systemFont(ofSize: size, weight: .bold)
+    }
 }
 
-/// One of the stage's two glass window controls.
+// MARK: - Swap glyph
+
+/// Draws the left/right swap glyph as a template image: two window panes (the wide main pane
+/// and the narrow side pane) with a horizontal double arrow between them. One glance reads
+/// "the two windows exchange sides"; drawn programmatically so its weight exactly matches the
+/// 16pt semibold system symbols beside it and it never depends on a SF Symbols version.
+enum MultitaskStageSwapGlyph {
+    static func makeImage() -> UIImage {
+        let size = CGSize(width: 22, height: 15)
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { context in
+            let cg = context.cgContext
+            let tint = UIColor.white
+            cg.setStrokeColor(tint.cgColor)
+            cg.setFillColor(tint.cgColor)
+            cg.setLineWidth(1.4)
+            cg.setLineCap(.round)
+            cg.setLineJoin(.round)
+
+            // Wide main pane on the left, narrow side pane on the right.
+            let mainPane = CGRect(x: 0.7, y: 1.6, width: 9.6, height: 11.8)
+            let sidePane = CGRect(x: 16.0, y: 1.6, width: 5.3, height: 11.8)
+            cg.addPath(CGPath(roundedRect: mainPane, cornerWidth: 2.2, cornerHeight: 2.2, transform: nil))
+            cg.addPath(CGPath(roundedRect: sidePane, cornerWidth: 1.6, cornerHeight: 1.6, transform: nil))
+            cg.strokePath()
+
+            // Horizontal double arrow in the gap.
+            let midY: CGFloat = 7.5
+            cg.move(to: CGPoint(x: 11.6, y: midY))
+            cg.addLine(to: CGPoint(x: 14.4, y: midY))
+            cg.strokePath()
+            // Left arrowhead.
+            cg.move(to: CGPoint(x: 11.6, y: midY))
+            cg.addLine(to: CGPoint(x: 12.9, y: midY - 1.4))
+            cg.move(to: CGPoint(x: 11.6, y: midY))
+            cg.addLine(to: CGPoint(x: 12.9, y: midY + 1.4))
+            // Right arrowhead.
+            cg.move(to: CGPoint(x: 14.4, y: midY))
+            cg.addLine(to: CGPoint(x: 13.1, y: midY - 1.4))
+            cg.move(to: CGPoint(x: 14.4, y: midY))
+            cg.addLine(to: CGPoint(x: 13.1, y: midY + 1.4))
+            cg.strokePath()
+        }.withRenderingMode(.alwaysTemplate)
+    }
+}
+
+// MARK: - Glass window control
+
+/// One of the stage's glass window controls.
 ///
 /// The control answers on the way down instead of the way up: the glass takes its pressed look and
 /// the whole control scales the moment the finger lands, so a tap can never feel dead. Releasing
@@ -240,11 +288,10 @@ final class MultitaskStageGlassButton: UIButton {
     private let pressedTint: UIColor?
 
     /// The visible circle stays smaller than the 44pt hit target, so the strip reads as light
-    /// chrome instead of two heavy discs.
+    /// chrome instead of heavy discs.
     private static let circleSize: CGFloat = 34
-    /// A 16pt semibold symbol inside a 34pt circle: the same glyph-to-circle proportion the system's
-    /// own circular controls use, so the pair carries the weight of the two glass buttons without the
-    /// symbols looking lost in them.
+    /// A 16pt semibold symbol inside a 34pt circle: the same glyph-to-circle proportion the
+    /// system's own circular controls use.
     private static let glyphConfiguration = UIImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
 
     private let glass = UIVisualEffectView(effect: nil)
@@ -255,13 +302,26 @@ final class MultitaskStageGlassButton: UIButton {
     /// backdrop-luma sampler. Starts dark: white is the safe choice before the first sample arrives.
     private var glyphOnDark = true
     private var isPressed = false
+    /// Last symbol name applied, so the per-layout-pass setSymbol call is a no-op unless the
+    /// zoom/restore glyph actually has to morph.
+    private var currentSymbolName: String?
 
     init(symbol: String, pressedTint: UIColor?) {
+        self.pressedTint = pressedTint
+        self.currentSymbolName = symbol
+        super.init(frame: .zero)
+        backgroundColor = .clear
+        setupGlass()
+        setupGlyph(UIImage(systemName: symbol, withConfiguration: Self.glyphConfiguration))
+    }
+
+    /// Used by the custom-drawn swap glyph (template image, tinted like a system symbol).
+    init(glyphImage: UIImage, pressedTint: UIColor?) {
         self.pressedTint = pressedTint
         super.init(frame: .zero)
         backgroundColor = .clear
         setupGlass()
-        setupGlyph(symbol)
+        setupGlyph(glyphImage)
     }
 
     required init?(coder: NSCoder) {
@@ -271,6 +331,8 @@ final class MultitaskStageGlassButton: UIButton {
     /// Swaps the glyph with the system's own symbol transition, so expand and restore morph into
     /// each other instead of blinking to the other arrow.
     func setSymbol(_ symbol: String) {
+        guard symbol != currentSymbolName else { return }
+        currentSymbolName = symbol
         guard let image = UIImage(systemName: symbol, withConfiguration: Self.glyphConfiguration) else { return }
         if #available(iOS 17.0, *) {
             glyph.setSymbolImage(image, contentTransition: .replace)
@@ -321,8 +383,8 @@ final class MultitaskStageGlassButton: UIButton {
         glass.layer.borderColor = UIColor.label.withAlphaComponent(0.12).cgColor
     }
 
-    private func setupGlyph(_ symbol: String) {
-        glyph.image = UIImage(systemName: symbol, withConfiguration: Self.glyphConfiguration)
+    private func setupGlyph(_ image: UIImage?) {
+        glyph.image = image
         // White until the first backdrop sample: a dark glyph can vanish on a black video, a white
         // one always survives on the translucent glass.
         glyph.tintColor = .white
@@ -408,152 +470,18 @@ final class MultitaskStageGlassButton: UIButton {
     }
 }
 
-/// The stage's window chrome: two glass controls in the blank strip above the main window's leading
-/// edge — close on the left, zoom/restore on the right, the order the hand already knows from a
-/// window's title bar, with the destructive action where it is expected.
-///
-/// macOS puts three colored dots inside a window's title bar. On a phone that reads wrong — the dots
-/// are small, they color the stage chrome in someone else's accent color, and a title bar would
-/// steal a whole strip of the guest app's screen. So the stage keeps two HIG sized (44pt) controls,
-/// and they never live inside a window: the pair sits in the blank strip above the main window's
-/// leading edge and stays exactly there, in both layouts. The strip is the controls' home and the
-/// window grows underneath it — chrome that slides while a window resizes reads as the button coming
-/// apart under the finger, so the window is the only thing that moves.
-@objc class MultitaskStageControlsView: UIView {
-    @objc weak var delegate: MultitaskStageControlsDelegate?
-
-    /// Fullscreen mode: the close control is retracted entirely. Closing now requires shrinking the
-    /// window back to the split stage first — fullscreen is the guest app's screen, and a
-    /// destructive button has no business floating over it.
-    @objc var isFullscreen: Bool = false {
-        didSet {
-            guard isFullscreen != oldValue else { return }
-            updateZoomControl()
-            updateCloseVisibility(animated: true)
-        }
-    }
-
-    private let closeButton = MultitaskStageGlassButton(
-        symbol: "xmark",
-        // Translucent red, not solid: the glass under it still shows through, so the control reads
-        // as a red piece of glass rather than a red sticker.
-        pressedTint: UIColor.systemRed.withAlphaComponent(0.82)
-    )
-    private let zoomButton = MultitaskStageGlassButton(
-        symbol: "arrow.up.left.and.arrow.down.right",
-        pressedTint: nil
-    )
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        backgroundColor = .clear
-        closeButton.accessibilityLabel = "lc.multitask.closeWindow".loc
-        zoomButton.accessibilityLabel = "lc.multitask.zoomWindow".loc
-        closeButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
-        zoomButton.addTarget(self, action: #selector(zoomTapped), for: .touchUpInside)
-        addSubview(closeButton)
-        addSubview(zoomButton)
-        updateZoomControl()
-        updateCloseVisibility(animated: false)
-    }
-
-    @objc private func closeTapped() {
-        delegate?.stageControlsDidTapClose()
-    }
-
-    @objc private func zoomTapped() {
-        delegate?.stageControlsDidTapZoom()
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    /// Expand while the stage shows the split layout, restore while the main window is fullscreen.
-    /// The glyph morphs between the two arrows, so the control shows where the window is going
-    /// rather than only what it is now.
-    private func updateZoomControl() {
-        zoomButton.setSymbol(isFullscreen
-            ? "arrow.down.right.and.arrow.up.left"
-            : "arrow.up.left.and.arrow.down.right")
-        zoomButton.accessibilityLabel = (isFullscreen ? "lc.multitask.restoreWindow" : "lc.multitask.zoomWindow").loc
-    }
-
-    /// Fades and shrinks the close control out of the strip in fullscreen; the restore control
-    /// slides to its edge-aligned slot. The layout's own width collapses with the animation
-    /// (the host's controlsFrame hands us the single-button width).
-    private func updateCloseVisibility(animated: Bool) {
-        let collapsed = isFullscreen
-        let changes = {
-            self.closeButton.alpha = collapsed ? 0 : 1
-            self.closeButton.transform = collapsed
-                ? CGAffineTransform(scaleX: 0.4, y: 0.4)
-                : .identity
-            // The restore button hugs the outer edge in both layouts: the left edge of the pair in
-            // split mode, and the only slot in fullscreen.
-            self.layoutButtons()
-        }
-        closeButton.isUserInteractionEnabled = !collapsed
-        guard animated && !UIAccessibility.isReduceMotionEnabled else {
-            changes()
-            return
-        }
-        UIView.animate(withDuration: 0.32, delay: 0,
-                       usingSpringWithDamping: 0.82, initialSpringVelocity: 0,
-                       options: [.beginFromCurrentState, .allowUserInteraction],
-                       animations: changes)
-    }
-
-    /// Forwards the backdrop-derived glyph color to both buttons (the hidden close one included, so
-    /// it is already the right color the instant it returns in split mode).
-    @objc func applyBackdropDark(_ dark: Bool, animated: Bool) {
-        closeButton.setGlyphOnDarkBackground(dark, animated: animated)
-        zoomButton.setGlyphOnDarkBackground(dark, animated: animated)
-    }
-
-    private func layoutButtons() {
-        let size = MultitaskStageLayout.controlSize
-        let top = (bounds.height - size) / 2
-        if MultitaskStageLayout.isMirrored {
-            // The view's frame hugs the screen's trailing edge: that edge is the OUTER side, so the
-            // restore control goes last (x = width - size) and close sits toward screen center.
-            zoomButton.frame = CGRect(x: bounds.width - size, y: top, width: size, height: size)
-            closeButton.frame = CGRect(x: 0, y: top, width: size, height: size)
-        } else {
-            // Leading edge of the screen is outer: restore leads, close trails toward center.
-            zoomButton.frame = CGRect(x: 0, y: top, width: size, height: size)
-            closeButton.frame = CGRect(
-                x: size + MultitaskStageLayout.controlSpacing,
-                y: top,
-                width: size,
-                height: size
-            )
-        }
-    }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        layoutButtons()
-    }
-
-    /// Only the two buttons are tappable; the strip itself stays invisible to touches, so nothing on
-    /// the stage is ever covered by this view.
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        let hit = super.hitTest(point, with: event)
-        return hit === self ? nil : hit
-    }
-}
 
 // MARK: - FPS readout
 
 /// The stage's frame rate readout at the far end of the blank strip above the windows.
 ///
 /// Design language: the same Liquid Glass capsule as the window controls, but the NUMBER is the
-/// hero — SF Rounded bold with tabular monospaced digits (soft, friendly glyphs that still never
-/// shift width), large enough to glance at, tinted by the health colour (green/amber/red). Every
-/// time the integer changes it does a quick spring "heartbeat" pop, so a locked 120 reads as a
-/// calm steady pulse and a struggling stage visibly stutters. A 7pt status dot carries the same
-/// meaning for peripheral vision. The capsule hides entirely in fullscreen.
+/// hero — Blender Pro Bold with tabular monospaced digits when available (a distinctive,
+/// technical face that still never shifts width), large enough to glance at, tinted by the
+/// health colour (green/amber/red). Every time the integer changes it does a quick spring
+/// "heartbeat" pop, so a locked 120 reads as a calm steady pulse and a struggling stage
+/// visibly stutters. A 7pt status dot carries the same meaning for peripheral vision. The
+/// capsule hides entirely in fullscreen.
 @objc class MultitaskStageFPSCounterView: UIView {
     private let glass = UIVisualEffectView(effect: nil)
     private let statusDot = UIView()
@@ -652,11 +580,12 @@ final class MultitaskStageGlassButton: UIButton {
         glass.contentView.addSubview(label)
     }
 
-    /// The default SF Pro design (square, straight-sided — deliberately NOT SF Rounded) with the
-    /// monospaced-numbers feature: an instrument readout should read technical and stay put as the
-    /// digits change ("120" → "119" never jiggles the capsule).
-    private func squareTabularFont(size: CGFloat, weight: UIFont.Weight) -> UIFont {
-        let base = UIFont.systemFont(ofSize: size, weight: weight)
+    /// Blender Pro Bold for both the hero number and the "FPS" unit, with the monospaced-
+    /// numbers feature when the face includes it (a measurement readout must never shift
+    /// width as "120" becomes "119"). Falls back inside MultitaskStageFont if the font file
+    /// is missing from the bundle.
+    private func readoutFont(size: CGFloat) -> UIFont {
+        let base = MultitaskStageFont.bold(size)
         let feature: [UIFontDescriptor.FeatureKey: Any] = [
             .featureIdentifier: kNumberSpacingType,
             .typeIdentifier: kMonospacedNumbersSelector
@@ -668,14 +597,14 @@ final class MultitaskStageGlassButton: UIButton {
     private func readoutText(value: Int?, color: UIColor) -> NSAttributedString {
         let digits = value.map(String.init) ?? "--"
         let result = NSMutableAttributedString(string: digits, attributes: [
-            .font: squareTabularFont(size: Self.valueFontSize, weight: .heavy),
+            .font: readoutFont(size: Self.valueFontSize),
             .kern: 0.3,
             .foregroundColor: color,
         ])
         // Uppercase "FPS" as a true superscript: small caps-height glyphs riding the top of the
         // digits (positive baseline offset), one tone quieter — the notation of a measurement unit.
         let unit = NSAttributedString(string: " FPS", attributes: [
-            .font: squareTabularFont(size: Self.unitFontSize, weight: .bold),
+            .font: readoutFont(size: Self.unitFontSize),
             .kern: 0.4,
             .foregroundColor: UIColor.secondaryLabel,
             .baselineOffset: Self.unitBaselineOffset,
