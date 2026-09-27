@@ -1027,7 +1027,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             : 0
         // Corner masks swap sides on a mirror. The handedness swap is now INSTANT (no flight),
         // so the masks snap with the re-tile; the instant mirror branch below forces defer off.
-        var deferCornerMasks = mirroring && animated && !UIAccessibility.isReduceMotionEnabled
 
         let update = { [weak self] in
             guard let self else { return }
@@ -1059,13 +1058,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                     view.layer.borderWidth = 0
                 } else {
                     view.layer.cornerRadius = MultitaskStageLayout.cornerRadius
-                    // While the cards trade sides, the corner mask has to swap sides too. Writing
-                    // it at the START of a spring flight draws a hard contour line along the
-                    // shared edge for the whole animation; keep the old mask in flight and let the
-                    // settle pass snap the new one the moment the cards have arrived.
-                    if !deferCornerMasks {
-                        view.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
-                    }
+                    view.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
                     view.layer.borderWidth = MultitaskStageLayout.hairline
                 }
             }
