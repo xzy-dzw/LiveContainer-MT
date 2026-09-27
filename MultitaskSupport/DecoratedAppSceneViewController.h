@@ -55,4 +55,10 @@ API_AVAILABLE(ios(16.0))
 /// Lifts only the frozen last-frame cover, leaving a launch placeholder (cold start
 /// still in progress) untouched. Used as the foreground-recovery backstop.
 - (void)hideFrozenFrameAnimated:(BOOL)animated;
+
+/// Swap cover: show the guest's frozen last frame if a JPEG exists, otherwise fall back to the
+/// icon placeholder so the surface re-attach never flashes raw black. Pair with hideSwapCover.
+- (void)showSwapCoverAtPath:(NSString*)path withIcon:(nullable UIImage*)icon appName:(NSString*)appName;
+/// Lift whichever cover showSwapCover placed.
+- (void)hideSwapCoverAnimated:(BOOL)animated;
 @end

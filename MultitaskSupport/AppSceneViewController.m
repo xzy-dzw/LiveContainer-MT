@@ -291,10 +291,13 @@
             settings.deviceOrientation = UIDevice.currentDevice.orientation;
             settings.interfaceOrientation = self.view.window.windowScene.interfaceOrientation;
             CGRect frame = self.view.frame;
-            // [FIX] The scene renders at the ACTUAL slot size now (no contentView transform any
-            // more), so the remote touch region BackBoard derives matches the on-screen footprint
-            // 1:1. Previously we divided by scaleRatio to render at full resolution and shrink via
-            // a transform, which skewed the coordinate round-trip and killed long-press gestures.
+            // [LOCAL CHANGE] Keep this in sync when merging upstream.
+            // The guest app always renders at its original resolution and is scaled down by
+            // contentView.transform afterwards, so the scene size must be the unscaled size.
+            if(self.scaleRatio > 0) {
+                frame.size.width /= self.scaleRatio;
+                frame.size.height /= self.scaleRatio;
+            }
             if(UIInterfaceOrientationIsLandscape(settings.interfaceOrientation)) {
                 CGSize size = frame.size;
                 frame.size.width = size.height;

@@ -292,6 +292,24 @@
     });
 }
 
+- (void)showSwapCoverAtPath:(NSString *)path withIcon:(UIImage *)icon appName:(NSString *)appName {
+    [self showFrozenFrameAtPath:path];
+    if(!self.frozenFrameView.hidden) { return; }  // covered by the real last frame
+    // No frozen JPEG (fresh session, never backgrounded): fall back to the icon placeholder so
+    // the cross-process surface re-attach never exposes the pure-black container backing.
+    [self configureLaunchPlaceholderWithIcon:icon appName:appName];
+    self.launchPlaceholder.alpha = 1;
+    self.launchPlaceholder.hidden = NO;
+}
+
+- (void)hideSwapCoverAnimated:(BOOL)animated {
+    [self hideFrozenFrameAnimated:animated];
+    if(!self.launchPlaceholder.hidden) {
+        // We fell back to the icon placeholder for this swap: lift it too.
+        [self hideContentCoversAnimated:animated];
+    }
+}
+
 - (void)hideFrozenFrameAnimated:(BOOL)animated {
     dispatch_async(dispatch_get_main_queue(), ^{
         if(self.frozenFrameView.hidden) { return; }
@@ -379,15 +397,10 @@
 - (void)applyScaleRatio {
     CGFloat ratio = _scaleRatio > 0 ? _scaleRatio : 1.0;
     self.appSceneVC.scaleRatio = ratio;
-    // [FIX] Do NOT scale the hosting view with a CATransform. BackBoard derives the remote touch
-    // region from the hosting view's on-screen geometry; a non-identity transform makes bounds
-    // (full-screen) disagree with the actual slot footprint, and the coordinate round-trip has
-    // enough error to silently kill long-press gesture recognizers (no touchesCancelled fires).
-    // The scene now renders at the slot size directly (see AppSceneViewController.m).
     if(self.appSceneVC.usesHostingControllerAPI) {
-        self.appSceneVC.contentView.transform = CGAffineTransformIdentity;
+        self.appSceneVC.contentView.transform = CGAffineTransformMakeScale(ratio, ratio);
     } else {
-        self.appSceneVC.contentView.layer.sublayerTransform = CATransform3DIdentity;
+        self.appSceneVC.contentView.layer.sublayerTransform = CATransform3DMakeScale(ratio, ratio, 1.0);
     }
 }
 
@@ -545,8 +558,11 @@
             settings.safeAreaInsetsPortrait = UIEdgeInsetsZero;
         }
 
-        // [FIX] Render at the actual slot size (no scaling transform), keeping remote touch 1:1.
+        // The guest always renders at the phone's original resolution; the slot only scales it.
         CGRect frame = self.view.frame;
+        CGFloat ratio = self.scaleRatio > 0 ? self.scaleRatio : 1.0;
+        frame.size.width /= ratio;
+        frame.size.height /= ratio;
 
         if(UIInterfaceOrientationIsLandscape(baseSettings.interfaceOrientation)) {
             settings.frame = CGRectMake(0, 0, frame.size.height, frame.size.width);

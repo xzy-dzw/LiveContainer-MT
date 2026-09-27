@@ -2365,15 +2365,15 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     /// iPhone has no public API for detecting which hand holds the device, so this is an explicit
     /// toggle; the choice persists across launches via MultitaskStageLayout.isMirrored.
     @objc func toggleLayoutHandedness() {
-        // [FIX Bug2] Cover every jumping card with the guest's own last frozen frame for the swap
-        // duration. When the hosting view jumps half a screen, the cross-process surface tears
-        // down and re-attaches, and for one frame the pure-black container backing shows through
-        // (the whole-screen black flash). A host-side snapshot would itself be black, so we use the
-        // guest self-captured JPEG, shown in a local UIImageView that never goes through the remote
-        // surface.
+        // [FIX Bug2] Cover every jumping card before the swap. When the hosting view jumps half a
+        // screen the cross-process surface tears down and re-attaches, exposing the pure-black card
+        // backing for a frame. The cover is the guest's own last frame if a JPEG exists, else the
+        // app icon — never a host snapshot (those render black). hideSwapCover lifts whichever.
         for app in apps {
             if let d = app.view?._viewDelegate() as? DecoratedAppSceneViewController {
-                d.showFrozenFrame(atPath: LCStageFrozenFramePath(app.appUUID))
+                d.showSwapCover(atPath: LCStageFrozenFramePath(app.appUUID),
+                                withIcon: app.appInfo?.iconIsDarkIcon(false),
+                                appName: app.appName)
             }
         }
         MultitaskStageLayout.isMirrored.toggle()
@@ -2381,11 +2381,12 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // Mirror pass: cards fly through the spring, chrome/dock/plate stay frozen and corner
         // masks swap only after landing — no junction seam or dock-block flash mid-swap.
         relayout(animated: true, mirroring: true)
-        // Fade the frozen covers out once the re-attached surface has drawn its first real frame.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+        // Lift the covers once the re-attached surface has settled. Hard backstop at 0.6s; the
+        // frame-ready signal (if any) would dismiss earlier, but B keeps it simple.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard let self else { return }
             for app in self.apps {
-                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.hideContentCovers(animated: true)
+                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.hideSwapCover(animated: true)
             }
         }
         // A half-turn on the glyph reads as the two halves physically swapping places.
