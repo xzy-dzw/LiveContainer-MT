@@ -1216,7 +1216,8 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 for (index, app) in self.apps.enumerated() where index > 0 {
                     (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.appSceneVC.contentView.isUserInteractionEnabled = false
                 }
-                self.commitMainWindowGeometry()
+                // No geometry push: a mirror flip changes size/scale, and re-pushing settings forces
+                // a cross-process surface reconnect and window relayout that resets the dock glass.
             }
         } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
@@ -2396,18 +2397,10 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // no frozen-frame cover needed — a smooth path gives the render server a valid position
         // every frame, so there is no black hole to cover.
         relayout(animated: true, mirroring: true)
-        // A half-turn on the glyph reads as the two halves physically swapping places. Use a
-        // UIKit spring (interruptible, respects Reduce Motion) instead of a hand-rolled
-        // CASpringAnimation on the layer, which could not be interrupted and stacked on rapid taps.
-        guard !UIAccessibility.isReduceMotionEnabled else { return }
-        swapFlipAngle += .pi
-        UIView.animate(withDuration: MultitaskDockManager.layoutAnimationDuration,
-                       delay: 0,
-                       usingSpringWithDamping: 1.0,
-                       initialSpringVelocity: 0,
-                       options: [.beginFromCurrentState, .allowUserInteraction]) {
-            self.swapButton.layer.transform = CATransform3DMakeRotation(self.swapFlipAngle, 0, 1, 0)
-        }
+        // No rotation on the button's layer: the button embeds a UIVisualEffectView, and a 3D
+        // transform on its layer forces the render server to recompute the shared window backdrop
+        // filter, re-sampling (and flickering) the dock's glass on every tap. The cards gliding
+        // already convey the swap.
     }
 
     /// Collapses the stage back to the LiveContainer app list. Nothing is terminated: guests keep
