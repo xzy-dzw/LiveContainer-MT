@@ -1220,9 +1220,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             // region at the new slot. Skipping this leaves the scene describing the old slot, which
             // is why main-window touches (long-press "hold to talk") land at the wrong coordinates
             // and never start recording. No foreground blip: this only pushes settings.
-            if let mainApp = self.apps.first {
-                mainApp.decorated?.appSceneVC.commitHostedGeometry()
-            }
+            self.commitMainWindowGeometry()
         } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
             layoutToken &+= 1
