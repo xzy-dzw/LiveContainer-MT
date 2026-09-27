@@ -2410,7 +2410,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self else { return }
             for app in self.apps {
-                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.hideContentCoversAnimated(true)
+                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.hideContentCovers(animated: true)
             }
         }
         // A half-turn on the glyph reads as the two halves physically swapping places.
