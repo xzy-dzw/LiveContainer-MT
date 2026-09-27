@@ -18,11 +18,8 @@ struct LCMultitaskSettingView: View {
     // v4.1.2: audio/PiP are backup channels, OFF by default (a one-time migration flips existing
     // users off as well). Location stays the only default-on channel.
     @AppStorage("LCStageKeepAliveAudio", store: LCUtils.appGroupUserDefault) var keepAliveAudio = false
-    @AppStorage("LCAutoRecoverGuest", store: LCUtils.appGroupUserDefault) var autoRecoverGuest = true
     @AppStorage("LCStageKeepAlivePiP", store: LCUtils.appGroupUserDefault) var keepAlivePiP = false
     @AppStorage("LCStageKeepAliveLocation", store: LCUtils.appGroupUserDefault) var keepAliveLocation = true
-    // Foreground pinning / lifecycle masking. Missing key defaults to ON in both host and guests.
-    @AppStorage("LCStageScenePinning", store: LCUtils.appGroupUserDefault) var scenePinning = true
 
     var body: some View {
         List {
@@ -57,14 +54,6 @@ struct LCMultitaskSettingView: View {
                     Toggle(isOn: $redirectURLToHost) {
                         Text("lc.settings.redirectURLToHost".loc)
                     }
-                    Toggle(isOn: $scenePinning) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("lc.settings.scenePinning".loc)
-                            Text("lc.settings.scenePinning.detail".loc)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
                     Toggle(isOn: $keepAliveLocation) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("lc.settings.stageKeepAliveLocation".loc)
@@ -76,14 +65,6 @@ struct LCMultitaskSettingView: View {
                     .onChange(of: keepAliveLocation) { _ in
                         if #available(iOS 16.0, *) {
                             MultitaskDockManager.shared.applyKeepAliveSettings()
-                        }
-                    }
-                    Toggle(isOn: $autoRecoverGuest) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("lc.settings.autoRecoverGuest".loc)
-                            Text("lc.settings.autoRecoverGuest.detail".loc)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
                         }
                     }
                 }

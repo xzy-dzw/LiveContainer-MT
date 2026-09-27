@@ -10,10 +10,6 @@ API_AVAILABLE(ios(16.0))
 @property(nonatomic) CGFloat scaleRatio;
 @property(nonatomic, copy) void (^pidAvailableHandler)(NSNumber *pid, NSError *error);
 
-/// YES while the stage watchdog is relaunching a jetsam'd guest into this slot. While set, the
-/// guest exit callback neither removes the slot nor schedules a relaunch — the old card view is
-/// kept (covered by the frozen frame) until the freshly launched guest replaces it.
-@property(nonatomic) BOOL isRecoveringGuest;
 - (instancetype)initWindowName:(NSString*)windowName bundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID rootVC:(UIViewController*)rootVC;
 
 /// Places this window into its stage slot. The guest app always renders at the phone's
@@ -33,11 +29,7 @@ API_AVAILABLE(ios(16.0))
 /// "launching" instead of an empty black card.
 - (void)configureLaunchPlaceholderWithIcon:(nullable UIImage *)icon appName:(NSString *)appName;
 
-/// Recovery variant of the launch placeholder: icon + "recovering…" + spinner over the frozen
-/// last frame while a killed guest is relaunched into the same slot.
-- (void)showRecoveryCoverWithIcon:(nullable UIImage *)icon appName:(NSString *)appName;
-
-/// Shows the guest's frozen last frame (JPEG path) over the recovering scene.
+/// Shows the guest's frozen last frame (JPEG path) over the frozen scene.
 /// No-op when the file is missing or unreadable; the previous cover (if any) is kept.
 - (void)showFrozenFrameAtPath:(NSString *)path;
 

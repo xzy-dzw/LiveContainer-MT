@@ -472,10 +472,9 @@ static NSSet<NSString *> *LCStageMaskedLifecycleNames(void) {
 static BOOL LCStageGuestHasActivatedOnce = NO;
 
 static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
-    if (name.length == 0 || ![LCStageMaskedLifecycleNames() containsObject:name]) { return NO; }
-    if (!LCStageGuestHasActivatedOnce) { return NO; }
-    if (!LCStageGuestPinningEnabled()) { return NO; }
-    return LCStageGuestIsStageActive();
+    // Foreground pinning / lifecycle masking removed: never suppress the guest's own lifecycle
+    // broadcasts (the "lock page state" feature is gone).
+    return NO;
 }
 
 @interface NSNotificationCenter (LCStageLifecycleMask)
@@ -500,9 +499,6 @@ static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
 
 @implementation UIScene (LCStageLifecycleMask)
 - (UISceneActivationState)hook_lc_activationState {
-    if (LCStageGuestPinningEnabled() && LCStageGuestIsStageActive()) {
-        return UISceneActivationStateForegroundActive;
-    }
     return [self hook_lc_activationState];
 }
 @end
@@ -513,9 +509,6 @@ static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
 
 @implementation UIApplication (LCStageLifecycleMask)
 - (UIApplicationState)hook_lc_applicationState {
-    if (LCStageGuestPinningEnabled() && LCStageGuestIsStageActive()) {
-        return UIApplicationStateActive;
-    }
     return [self hook_lc_applicationState];
 }
 @end
@@ -709,10 +702,6 @@ static void UIKitGuestHooksInit() {
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
         swizzle(UIApplication.class, @selector(sendEvent:), @selector(hook_lcStage_sendEvent:));
-        // Pin split-mode main-window touches to their BEGAN location so geometry re-push
-        // drift cannot push a long-press past its 10pt tolerance (see UITouch (LCTouchAnchor)).
-        swizzle(UITouch.class, @selector(locationInView:), @selector(lc_locationInView:));
-        swizzle(UITouch.class, @selector(previousLocationInView:), @selector(lc_previousLocationInView:));
     });
     // The stage may already be active by the time TweakLoader loads (guest launched straight
     // into a stage slot); reconcile once instead of waiting for the next roles change.
@@ -794,89 +783,6 @@ static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, voi
     [[LCFrameReadySignaler shared] arm];
 }
 
-#pragma mark - Touch coordinate anchoring (split-mode long-press fix)
-//
-// In split mode the host re-pushes scene geometry mid-gesture (viewWillLayoutSubviews
-// debounce, settle commit, system post-layout pass), which makes BackBoard re-derive the
-// touch region. The same physical finger then maps to a slightly different guest coordinate
-// on each MOVED, and the accumulated drift can exceed UILongPressGestureRecognizer's 10pt
-// tolerance → the gesture silently fails (no touchesCancelled, exactly what the on-screen
-// diagnostic showed: BEGAN → ENDED with no CANCELLED).
-//
-// Fix: pin a main-window touch to its BEGAN location while it moves < 12pt. A real drag
-// exceeds 12pt and is left untouched. Fullscreen has no drift but anchoring is harmless there
-// (anchor == real location). Only the main-window guest sets anchors; side touches are
-// swallowed by quarantine and classic mode never sets them.
-
-static char kLCTouchAnchorKey;
-static char kLCTouchAnchorReleasedKey;
-
-static void LCTouchSetAnchor(UITouch *touch, CGPoint windowPoint) {
-    objc_setAssociatedObject(touch, &kLCTouchAnchorKey,
-                             [NSValue valueWithCGPoint:windowPoint],
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(touch, &kLCTouchAnchorReleasedKey, nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-static void LCTouchClearAnchor(UITouch *touch) {
-    objc_setAssociatedObject(touch, &kLCTouchAnchorKey, nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(touch, &kLCTouchAnchorReleasedKey, nil,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-static void LCTouchReleaseAnchor(UITouch *touch) {
-    // Permanently stop anchoring this touch: it moved enough to be a real drag.
-    objc_setAssociatedObject(touch, &kLCTouchAnchorReleasedKey, @YES,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-@interface UITouch (LCTouchAnchor)
-- (CGPoint)lc_locationInView:(UIView *)view;
-- (CGPoint)lc_previousLocationInView:(UIView *)view;
-@end
-
-@implementation UITouch (LCTouchAnchor)
-
-- (CGPoint)lc_locationInView:(UIView *)view {
-    CGPoint original = [self lc_locationInView:view]; // original implementation (swizzled)
-    NSValue *anchorValue = objc_getAssociatedObject(self, &kLCTouchAnchorKey);
-    if (!anchorValue ||
-        [objc_getAssociatedObject(self, &kLCTouchAnchorReleasedKey) boolValue]) {
-        return original;
-    }
-    CGPoint anchorWindow = [anchorValue CGPointValue];
-    CGPoint anchorInView = view ? [view convertPoint:anchorWindow fromView:nil] : anchorWindow;
-    CGFloat dx = original.x - anchorInView.x;
-    CGFloat dy = original.y - anchorInView.y;
-    if (dx * dx + dy * dy < 144.0) { // 12pt squared: slightly above system 10pt tolerance
-        return anchorInView;
-    }
-    // Moved beyond threshold → real drag, release anchor permanently for this touch.
-    LCTouchReleaseAnchor(self);
-    return original;
-}
-
-- (CGPoint)lc_previousLocationInView:(UIView *)view {
-    CGPoint original = [self lc_previousLocationInView:view];
-    NSValue *anchorValue = objc_getAssociatedObject(self, &kLCTouchAnchorKey);
-    if (!anchorValue ||
-        [objc_getAssociatedObject(self, &kLCTouchAnchorReleasedKey) boolValue]) {
-        return original;
-    }
-    CGPoint anchorWindow = [anchorValue CGPointValue];
-    CGPoint anchorInView = view ? [view convertPoint:anchorWindow fromView:nil] : anchorWindow;
-    CGFloat dx = original.x - anchorInView.x;
-    CGFloat dy = original.y - anchorInView.y;
-    if (dx * dx + dy * dy < 144.0) {
-        return anchorInView;
-    }
-    return original;
-}
-
-@end
-
 @interface UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event;
 @end
@@ -884,20 +790,6 @@ static void LCTouchReleaseAnchor(UITouch *touch) {
 @implementation UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event {
     if (event.type == UIEventTypeTouches && event.allTouches.count > 0) {
-        // Anchor management: record BEGAN location for main-window guests, clear on end.
-        // The actual coordinate pinning happens in the UITouch (LCTouchAnchor) swizzle below.
-        // Only the interactive main window needs this; side touches are quarantined and
-        // classic mode never publishes a main UUID.
-        if (LCStageGuestIsMainWindow(LCGuestDataUUID)) {
-            for (UITouch *touch in event.allTouches) {
-                if (touch.phase == UITouchPhaseBegan) {
-                    LCTouchSetAnchor(touch, [touch locationInView:nil]);
-                } else if (touch.phase == UITouchPhaseEnded ||
-                           touch.phase == UITouchPhaseCancelled) {
-                    LCTouchClearAnchor(touch);
-                }
-            }
-        }
         // Fast path: the overwhelmingly common case (a main-window guest, or an app that never
         // uses the stage at all). With no quarantined gesture in flight and a fresh "not a side
         // window" verdict, the event needs no set enumeration at all. The gate is bypassed the

@@ -82,14 +82,6 @@ static NSString * const LCStageIPCPiPKeepAliveKey = @"LCStageKeepAlivePiP";
 /// not really powered. Requires "Always" location authorization.
 static NSString * const LCStageIPCLocationKeepAliveKey = @"LCStageKeepAliveLocation";
 
-/// App Group Bool written by the host's multitask settings page. When YES (default, read by both
-/// host and guests), the host RE-PINS every staged guest scene (foreground=YES,
-/// deactivationReasons=0) while it is backgrounded/locked, and guests suppress their own
-/// UIScene lifecycle broadcasts and clamp their visible activation state. This is what keeps an
-/// app like Instagram from navigating back to its feed on foreground return. A missing key
-/// defaults to YES; turning it off restores the pre-v4.1.2 lifecycle behavior.
-static NSString * const LCStageIPCPinningKey = @"LCStageScenePinning";
-
 /// Guest-written monotonic launch counter, one key per data container (plus a ".pid" sibling).
 /// The host logs these values at window entry / foreground return / interruption: a counter that
 /// stays flat across a lock/unlock cycle proves the guest process (and therefore its UI state)
@@ -238,13 +230,6 @@ static inline CFAbsoluteTime LCStageHostFrameReadyAt(NSString *guestUUID) {
     NSUserDefaults *defaults = LCStageSharedDefaults();
     [defaults synchronize];
     return [defaults doubleForKey:[LCStageIPCFrameReadyKeyPrefix stringByAppendingString:guestUUID]];
-}
-
-/// Guest: whether foreground pinning / lifecycle masking is enabled. Missing key defaults to YES.
-static inline BOOL LCStageGuestPinningEnabled(void) {
-    NSUserDefaults *defaults = LCStageSharedDefaults();
-    if ([defaults objectForKey:LCStageIPCPinningKey] == nil) { return YES; }
-    return [defaults boolForKey:LCStageIPCPinningKey];
 }
 
 /// Guest: bumps this container's monotonic launch counter and records the live pid. Runs exactly

@@ -136,22 +136,12 @@ class AppInfoProvider {
     @objc let appName: String
     @objc let appUUID: String
     let appInfo: LCAppInfo?
-    /// The card view. `var` because an in-place recovery (guest killed by the system) swaps the
-    /// freshly relaunched DecoratedVC's view in without changing the model's slot/order.
+    /// The card view.
     var view: UIView?
     /// When this window entered the stage. The watchdog never judges a window that is still
     /// inside the guest-start grace window (see pruneDeadWindows(allowHeartbeatPrune:)): a
     /// freshly launched guest needs a moment before it writes its first heartbeat.
-    /// Reset on recovery so the relaunched guest gets a fresh grace window.
     var addedAt = Date()
-    /// YES while a jetsam'd/dead guest is being relaunched into this same slot. While set, the
-    /// old card stays on screen showing the recovery cover, launch pre-checks allow the
-    /// relaunch, and the old guest's exit callback must not remove the slot.
-    var isRecovering = false
-    /// Recovery attempts since the window was last healthy. Capped at 1 to avoid relaunch loops
-    /// under sustained memory pressure; reset to 0 once the new guest reports a heartbeat.
-    var recoveryAttempts = 0
-    var recoveryBeganAt = Date.distantPast
     /// Pending lazy launch-cover show (0.3s after window entry). Cancelled the moment the guest
     /// reports a real frame, so fast launches never flash the spinner at all.
     var placeholderWorkItem: DispatchWorkItem?
@@ -773,11 +763,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     private var lastFrameReadyAt: [String: Double] = [:]
     /// Whether the stage currently keeps the screen on and the host alive in the background.
     private var isKeepAliveActive = false
-    /// YES between host willResignActive and willEnterForeground while foreground pinning is on: the
-    /// escalating re-pin scheduler is running.
-    private var isPinningForeground = false
-    private var foregroundPinningTimer: Timer?
-    /// Set at foreground return when pinning handled the background stay; the main window's geometry commit
+    /// Set at foreground return when the main window's geometry commit
     /// is then deferred until the pixel-verified frame-ready reveal (or a 3s backstop) instead of
     /// racing the reconnecting surface and contributing its own black frame.
     private var pendingWakeGeometryCommit = false
@@ -805,9 +791,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     /// suppressed for a grace window after that, because suspension freezes every guest timer
     /// and a fresh resume would otherwise look like all four guests died at once.
     private var lastHostWakeAt = Date()
-    /// A dead guest is allowed this long to relaunch into its slot before the slot is dropped.
-    private static let recoveryTimeout: TimeInterval = 25
-
     private static let layoutAnimationDuration: TimeInterval = 0.4
     /// Accumulating y-rotation of the swap button glyph, so rapid taps keep turning the same way.
     private var swapFlipAngle: CGFloat = 0
@@ -1413,7 +1396,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     private func pruneDeadWindows(allowHeartbeatPrune: Bool = true) -> Bool {
         let now = Date()
         var deadUUIDs: Set<String> = []
-        var recoverUUIDs: Set<String> = []
         if allowHeartbeatPrune {
             let absoluteNow = CFAbsoluteTimeGetCurrent()
             for app in apps {
@@ -1421,8 +1403,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 // boot, and the heartbeat key may hold a previous run's timestamp until the new
                 // guest writes its own (write-addressed keys survive in the App Group).
                 guard now.timeIntervalSince(app.addedAt) > Self.guestStartGrace else { continue }
-                // A recovery is already in flight: recoveryTimeout is enforced in watchdogTick.
-                if app.isRecovering { continue }
 
                 // Every guest writes a heartbeat once per second (UIKit+GuestHooks.m).
                 let hbKey = "LCGuestHeartbeat.\(app.appUUID)"
@@ -1438,12 +1418,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                     guard let last = LCUtils.appGroupUserDefault.object(forKey: hbKey) as? Double else { return false }
                     return absoluteNow - last <= 10
                 }()
-                // After a successful recovery the attempts counter clears on the first fresh
-                // heartbeat, so a window can be recovered again after it has truly come back once.
-                if app.recoveryAttempts > 0, heartbeatFresh {
-                    app.recoveryAttempts = 0
-                    NSLog("[LCStage][恢复] 窗口 \(app.appUUID)（\(app.appName)）重启后心跳恢复，救援成功")
-                }
 
                 let definitelyDead: Bool
                 if LCUtils.appGroupUserDefault.object(forKey: hbKey) != nil {
@@ -1454,79 +1428,22 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                     definitelyDead = app.appInfo != nil && !processAlive
                 }
                 guard definitelyDead else { continue }
-                if canRecoverInPlace(app) {
-                    recoverUUIDs.insert(app.appUUID)
-                } else {
-                    deadUUIDs.insert(app.appUUID)
-                }
+                deadUUIDs.insert(app.appUUID)
             }
         }
 
         // A terminated window's view can be detached before its model left the
-        // array (lost removal callback). Never for a recovering slot — its view is kept by design.
+        // array (lost removal callback).
         for app in apps where app.view?.window == nil {
-            if app.isRecovering { continue }
             deadUUIDs.insert(app.appUUID)
         }
 
-        for uuid in recoverUUIDs {
-            beginRecovery(uuid: uuid)
-        }
-        guard !deadUUIDs.isEmpty else { return !recoverUUIDs.isEmpty }
+        guard !deadUUIDs.isEmpty else { return false }
         NSLog("[LCStage] pruning \(deadUUIDs.count) window(s): \(deadUUIDs)")
         for uuid in deadUUIDs {
             tearDownWindow(uuid, reason: "unresponsive guest")
         }
         return true
-    }
-
-    /// Whether a dead window may be silently relaunched into its own slot instead of being torn
-    /// down. Requires the toggle, an identifiable app (its data is kept by dataUUID) and no
-    /// recovery already in flight; capped at one attempt per outage to avoid relaunch loops.
-    private func canRecoverInPlace(_ app: DockAppModel) -> Bool {
-        guard LCUtils.appGroupUserDefault.bool(forKey: "LCAutoRecoverGuest") else { return false }
-        guard !app.isRecovering, app.recoveryAttempts < 1 else { return false }
-        if let path = app.appInfo?.relativeBundlePath, !path.isEmpty { return true }
-        return false
-    }
-
-    /// Jetsam-proofing is impossible (4 guest appexes share 6GB RAM) — the goal is that a kill
-    /// becomes invisible: keep the slot, cover the frozen last frame, relaunch the same app with
-    /// the SAME container UUID in place, and let the frame-ready signal reveal the new guest.
-    private func beginRecovery(uuid: String) {
-        guard let app = apps.first(where: { $0.appUUID == uuid }) else { return }
-        guard let bundleId = app.appInfo?.relativeBundlePath, !bundleId.isEmpty else {
-            tearDownWindow(uuid, reason: "recover: missing bundle id")
-            return
-        }
-        app.isRecovering = true
-        app.recoveryAttempts += 1
-        app.recoveryBeganAt = Date()
-
-        let decorated = app.view?._viewDelegate() as? DecoratedAppSceneViewController
-        // Freeze the visual: last frame first (best), recovery spinner on top of it either way.
-        let framePath = LCStageFrozenFramePath(uuid)
-        decorated?.showFrozenFrame(atPath: framePath)
-        decorated?.showRecoveryCover(withIcon: app.appInfo?.iconIsDarkIcon(false), appName: app.appName)
-        // Tear down the DEAD scene/extension remnants WITHOUT touching the card view. Must happen
-        // while isRecoveringGuest is set, so the late exit callback never removes this slot.
-        decorated?.isRecoveringGuest = true
-        decorated?.appSceneVC.appTerminationCleanUp()
-
-        NSLog("[LCStage][恢复] 窗口 \(uuid)（\(app.appName)）guest 已被系统回收，原位静默重启…")
-        MultitaskRelaunchManager.recoverGuest(bundleId: bundleId, dataUUID: uuid)
-    }
-
-    /// Called when the in-place relaunch could not even be started. The slot is dropped so the
-    /// stage stays consistent; the user can reopen the app from the dock.
-    @objc func recoveryFailed(uuid: String, reason: String) {
-        if !Thread.isMainThread {
-            DispatchQueue.main.async { [weak self] in self?.recoveryFailed(uuid: uuid, reason: reason) }
-            return
-        }
-        guard let app = apps.first(where: { $0.appUUID == uuid }), app.isRecovering else { return }
-        NSLog("[LCStage][恢复] 窗口 \(uuid) 恢复失败（\(reason)），移除窗口")
-        tearDownWindow(uuid, reason: "recovery failed: \(reason)")
     }
 
     /// Removes a window completely: terminates the guest process (which also destroys its hosted
@@ -1616,12 +1533,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         } else {
             // Keep the role timestamp fresh even without layout changes.
             publishStageRoles(active: true)
-        }
-        // Recovery timeout: a relaunch that never produces a guest must not leave the slot
-        // spinning behind a frozen frame forever.
-        for app in apps where app.isRecovering
-            && Date().timeIntervalSince(app.recoveryBeganAt) > Self.recoveryTimeout {
-            recoveryFailed(uuid: app.appUUID, reason: "relaunch timeout")
         }
         // Frame-ready polling: a Darwin notification can be coalesced away while the host is
         // waking, so actively reconcile once per second in the foreground.
@@ -1779,14 +1690,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         return defaults.bool(forKey: LCStageIPCLocationKeepAliveKey)
     }
 
-    /// Foreground pinning / lifecycle-masking master switch (host re-pin + guest broadcast masking
-    /// both honor it). Missing key defaults to ON; the settings page lets users escape to legacy.
-    private var scenePinningEnabled: Bool {
-        let defaults = LCUtils.appGroupUserDefault
-        if defaults.object(forKey: LCStageIPCPinningKey) == nil { return true }
-        return defaults.bool(forKey: LCStageIPCPinningKey)
-    }
-
     /// One-time v4.1.2 migration: existing users ran audio + PiP + location. Real-device testing
     /// proved location alone sufficient, so the first launch after upgrade explicitly turns the other two OFF
     /// (the code stays; a user can flip them right back on). A marker key makes this run once.
@@ -1918,19 +1821,12 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // 2) Locally cover every card with whatever frozen frame already exists (from the last
         //    round) immediately, so even the resign animation itself never shows a black gap.
         coverCardsWithFrozenFrames()
-        // 3) Foreground pinning: re-assert foreground on every scene THIS SAME FRAME, before the
-        //    system's deactivation lands, then keep re-pinning throughout the background. This is the
-        //    root-cause fix for both "Instagram bounces to its feed" and the black flash: a scene
-        //    that is never deactivated never rebuilds its cross-process render surface.
-        if scenePinningEnabled {
-            beginForegroundPinning()
-        }
-        // 4) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
+        // 3) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
         if keepAlivePiPEnabled {
             StagePiPKeepAlive.shared.nudgeStart()
         }
         logGuestStates(context: "宿主即将后台/锁屏")
-        NSLog("[LCStage][闪黑] 宿主即将后台/锁屏：已通知 \(apps.count) 个 guest 拍照并盖上冻结帧，前台钉住=\(scenePinningEnabled)")
+        NSLog("[LCStage][闪黑] 宿主即将后台/锁屏：已通知 \(apps.count) 个 guest 拍照并盖上冻结帧")
     }
 
     @objc private func appDidEnterBackground() {
@@ -1961,54 +1857,8 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         }
     }
 
-    /// Re-pins every staged guest scene and logs which scenes were not foremost anymore. Runs on the
-    /// escalating background scheduler (immediate, 0.2s, 0.5s, 1s, then 1/s).
-    @objc func pinAllStagedScenesForeground(reason: String) {
-        for app in apps {
-            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-            let scene = vc.appSceneVC
-            let wasForemost = scene?.lcIsSceneForegroundActive() ?? false
-            scene?.lcPinForeground()
-            if !wasForemost {
-                NSLog("[LCStage][场景] 重钉前台（\(reason)）：\(app.appName) 此前已失活，已补推 foreground=YES")
-            }
-        }
-    }
-
-    private func beginForegroundPinning() {
-        guard !isPinningForeground else { return }
-        isPinningForeground = true
-        NSLog("[LCStage][场景] 前台钉住开始：对 \(apps.count) 个场景立即重钉")
-        pinAllStagedScenesForeground(reason: "锁屏当帧")
-        for delay in [0.2, 0.5, 1.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self, self.isPinningForeground else { return }
-                self.pinAllStagedScenesForeground(reason: "后台 \(delay)s")
-            }
-        }
-        // Then once per second for as long as we stay out of the foreground app state. The
-        // location assertion keeps us runnable, so this timer really fires in the background.
-        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self, self.isPinningForeground,
-                  UIApplication.shared.applicationState != .active else { return }
-            self.pinAllStagedScenesForeground(reason: "后台周期 1s")
-        }
-        timer.tolerance = 0.2
-        RunLoop.main.add(timer, forMode: .common)
-        foregroundPinningTimer = timer
-    }
-
-    private func endForegroundPinning() {
-        guard isPinningForeground else { return }
-        isPinningForeground = false
-        foregroundPinningTimer?.invalidate()
-        foregroundPinningTimer = nil
-        NSLog("[LCStage][场景] 前台钉住结束（宿主回前台）")
-    }
-
     @objc private func appWillEnterForeground() {
         endBackgroundTaskIfNeeded()
-        endForegroundPinning()
         lastHostWakeAt = Date()
         // Guests' own didBecomeActive is stripped under hosting; tell them to re-arm frame-ready.
         LCStageNotifyHostForegrounding()
@@ -2023,37 +1873,17 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         coverCardsWithFrozenFrames(freshSince: freshSince)
         logGuestStates(context: "宿主回前台")
 
-        if scenePinningEnabled {
-            // The pinning scheduler held every scene foreground while we were away. Push ONLY the
-            // scenes the system actually managed to deactivate anyway — a blanket re-push used to
-            // manufacture the exact reactivation transition that bounces apps back to their feed.
-            for app in apps {
-                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-                if vc.appSceneVC?.lcIsSceneForegroundActive() != true {
-                    NSLog("[LCStage][场景] 回前台：\(app.appName) 钉住失败已失活，补推一次前台")
-                    vc.appSceneVC?.setHostedSceneForeground(true)
-                }
-            }
-            // The main window's geometry commit waits until the covers are lifted on pixel-verified real
-            // frames; the geometry itself hasn't changed, so the touch region moving a few hundred ms late
-            // is invisible.
-            pendingWakeGeometryCommit = true
-            scheduleWakeGeometryBackstop()
-        } else {
-            // Escape hatch: pre-v4.1.2 behavior for users who turned pinning off.
-            for app in apps {
-                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-                vc.appSceneVC.setHostedSceneForeground(true)
-            }
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.performLayout(animated: false)
-                self.lastSettledFullscreen = self.isFullscreen
-                self.lastSettledMainUUID = self.apps.first?.appUUID
-                self.lastSettledGeneration = self.pendingGeometryGeneration
-                self.commitMainWindowGeometry()
-            }
+        // Re-assert foreground on every staged scene. The main window's geometry commit is then
+        // DEFERRED until the main guest's pixel-verified frame-ready report lifts its cover (or the
+        // 3s backstop fires): committing immediately used to race the reconnecting cross-process
+        // surface and contribute its own black frame. The frozen-frame cover above stays up the
+        // whole time, so the user only ever sees the app's real last picture until the new frame.
+        for app in apps {
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            vc.appSceneVC.setHostedSceneForeground(true)
         }
+        pendingWakeGeometryCommit = true
+        scheduleWakeGeometryBackstop()
         // Backstop ONLY for guests that cannot report frame-ready (TweakLoader injection off):
         // they never took a snapshot either, but if a stale cover exists it must not stick
         // forever. TweakLoader guests are always revealed by their own frame-ready signal.
@@ -2121,14 +1951,8 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
     @objc public func addRunningAppWithInfo(_ appInfo: LCAppInfo?, appUUID: String, view: UIView?) {
         guard isDockEnabled() else { return }
-        // Same container already on stage: either a duplicate launch (ignore, as before) or a
-        // watchdog-triggered in-place recovery (swap the freshly launched guest into the slot).
-        if let existing = apps.first(where: { $0.appUUID == appUUID }) {
-            if existing.isRecovering {
-                replaceRecoveredWindow(existing, appInfo: appInfo, newView: view)
-            }
-            return
-        }
+        // Same container already on stage: a duplicate launch — ignore it.
+        if apps.contains(where: { $0.appUUID == appUUID }) { return }
         // Single choke point for the maxWindows guard — every entry path flows through here.
         guard apps.count < MultitaskStageLayout.maxWindows else { return }
 
@@ -2202,46 +2026,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             insertWindow()
         } else {
             DispatchQueue.main.async(execute: insertWindow)
-        }
-    }
-
-    /// Swaps the freshly relaunched guest into a slot whose previous guest was jetsam'd. The
-    /// DockAppModel stays (same slot, same order); only its view/decorated controller changes.
-    private func replaceRecoveredWindow(_ model: DockAppModel, appInfo: LCAppInfo?, newView: UIView?) {
-        let apply = {
-            NSLog("[LCStage][恢复] 窗口 \(model.appUUID)（\(model.appName)）新 guest 已接入，原位替换卡片")
-            model.placeholderWorkItem?.cancel()
-            model.placeholderWorkItem = nil
-            model.view?.removeFromSuperview()
-            model.view = newView
-            // Fresh grace window for the new guest (heartbeat/frame timing all restarts).
-            model.addedAt = Date()
-            model.isRecovering = false
-            self.clearStaleGuestState(model.appUUID)
-            // The slot must stay covered NOW: the new guest has not rendered a frame yet, and
-            // unlike a cold start there is no 0.3s lazy delay — the recovery cover is already up.
-            if let decorated = newView?._viewDelegate() as? DecoratedAppSceneViewController {
-                decorated.configureLaunchPlaceholder(
-                    withIcon: appInfo?.iconIsDarkIcon(false),
-                    appName: model.appName
-                )
-            }
-            self.relayout(animated: false)
-            self.lastSettledFullscreen = self.isFullscreen
-            self.lastSettledMainUUID = self.apps.first?.appUUID
-            // The new guest has never received role state; force-publish immediately instead of
-            // waiting up to a second for the watchdog's refresh.
-            self.publishRolesIfChanged(active: self.isDockEnabled(), uuid: self.apps.first?.appUUID, force: true)
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.lastSettledGeneration = self.pendingGeometryGeneration
-                self.commitMainWindowGeometry()
-            }
-        }
-        if Thread.isMainThread {
-            apply()
-        } else {
-            DispatchQueue.main.async(execute: apply)
         }
     }
 
@@ -2647,11 +2431,6 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         let check: () -> String? = {
             guard manager.isDockEnabled() else { return nil }
             if let index = manager.apps.firstIndex(where: { $0.appUUID == uuid }) {
-                // The watchdog's in-place recovery relaunches the SAME container on purpose;
-                // the slot is waiting for this exact guest, so let it through.
-                if manager.apps[index].isRecovering {
-                    return nil
-                }
                 // The container is already on stage: if the stage was collapsed to the launcher,
                 // bring it back; otherwise just promote the window to the main slot.
                 if manager.isStageCollapsed {
