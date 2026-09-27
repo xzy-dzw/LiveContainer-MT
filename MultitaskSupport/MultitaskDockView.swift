@@ -1192,7 +1192,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             // frame (non-interactive surfaces were held at their cached slot and snapped on landing,
             // which flashed the side column).
             for (index, app) in self.apps.enumerated() where index > 0 {
-                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.appSceneVC.contentView.userInteractionEnabled = true
+                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.appSceneVC.contentView.isUserInteractionEnabled = true
             }
             UIView.animate(
                 withDuration: MultitaskDockManager.layoutAnimationDuration,
@@ -1214,7 +1214,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 // (side touches are quarantined in-guest; pushing every window's geometry stacked
                 // XPC transactions and reset the dock's live blur).
                 for (index, app) in self.apps.enumerated() where index > 0 {
-                    (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.appSceneVC.contentView.userInteractionEnabled = false
+                    (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.appSceneVC.contentView.isUserInteractionEnabled = false
                 }
                 self.commitMainWindowGeometry()
             }
