@@ -1221,7 +1221,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             // is why main-window touches (long-press "hold to talk") land at the wrong coordinates
             // and never start recording. No foreground blip: this only pushes settings.
             if let mainApp = self.apps.first {
-                mainApp.appSceneVC.commitHostedGeometry()
+                mainApp.decorated?.appSceneVC.commitHostedGeometry()
             }
         } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
