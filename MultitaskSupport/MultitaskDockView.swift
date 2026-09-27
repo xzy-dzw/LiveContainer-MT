@@ -1202,10 +1202,14 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 guard let self, self.layoutToken == token else { return }
                 for (index, app) in self.apps.enumerated() {
                     app.view?.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
+                    // Push geometry for EVERY window, not just the main one. BackBoard records the
+                    // surface position via an explicit XPC push, not by sampling the layer tree;
+                    // leaving the side windows at their old recorded position made the system
+                    // re-sync (and flash) the side column on the next frame. Size is unchanged, so
+                    // this is metadata-only and reallocates no IOSurface.
+                    (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
+                        .appSceneVC.commitHostedGeometry()
                 }
-                // Geometry push after the spring lands: re-derive the main window's touch region at
-                // its new slot. No foreground blip, only settings.
-                self.commitMainWindowGeometry()
             }
         } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
