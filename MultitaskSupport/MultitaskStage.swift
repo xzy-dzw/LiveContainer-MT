@@ -197,18 +197,22 @@ import CoreText
     /// the side stack rounds its left two.
     static func maskedCorners(_ index: Int, count: Int) -> CACornerMask {
         if count <= 1 { return allCorners }
+        // The side column only spans the whole block height when all 3 side windows are present.
+        // Otherwise its bottom edge floats mid-block, so the bottom outer corner belongs to the
+        // block only when the column is filled (count == 4: main + 3 sides).
+        let sideColumnFilled = (count == 4)
         if !isMirrored {
             if index <= 0 { return [.layerMinXMinYCorner, .layerMinXMaxYCorner] }
             var corners: CACornerMask = []
             if index == 1 { corners.insert(.layerMaxXMinYCorner) }
-            if index == count - 1 { corners.insert(.layerMaxXMaxYCorner) }
+            if sideColumnFilled && index == count - 1 { corners.insert(.layerMaxXMaxYCorner) }
             return corners
         }
         // Mirrored: main window on the right.
         if index <= 0 { return [.layerMaxXMinYCorner, .layerMaxXMaxYCorner] }
         var corners: CACornerMask = []
         if index == 1 { corners.insert(.layerMinXMinYCorner) }
-        if index == count - 1 { corners.insert(.layerMinXMaxYCorner) }
+        if sideColumnFilled && index == count - 1 { corners.insert(.layerMinXMaxYCorner) }
         return corners
     }
 }

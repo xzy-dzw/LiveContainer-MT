@@ -1175,15 +1175,25 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         }
 
         if mirroring {
-            // Left/right handedness swap: across a mirror ONLY each card's x flips — size, scale,
-            // content, chrome, dock, backdrop and z-order are identical. Animate the card frames
-            // CONTINUOUSLY on an Apple-standard spring: the render server samples the hosting view
-            // at every frame, so a smooth path has no missing position and the remote surface tracks
-            // along without a black hole (an instant half-screen jump left no valid mid position,
-            // which is what flashed the whole screen). Push geometry only once the spring lands.
-            deferCornerMasks = true
+            // Left/right handedness swap: across a mirror ONLY each card's x flips. Animate the card
+            // frames CONTINUOUSLY on an Apple-standard spring so the render server samples a valid
+            // hosting position every frame and the remote surface tracks along (an instant jump left
+            // no valid mid position and flashed).
             layoutToken &+= 1
             let token = layoutToken
+            // Corner masks are decided the moment handedness flips: set them BEFORE the flight so
+            // the cards are already rounded on the correct outer edge while they glide, instead of
+            // snapping to rounded corners only after landing.
+            for (index, app) in self.apps.enumerated() {
+                app.view?.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
+            }
+            // Side windows are non-interactive at rest; during the flight briefly make them
+            // interactive so the render server treats their surfaces as live and tracks them every
+            // frame (non-interactive surfaces were held at their cached slot and snapped on landing,
+            // which flashed the side column).
+            for (index, app) in self.apps.enumerated() where index > 0 {
+                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.appSceneVC.contentView.userInteractionEnabled = true
+            }
             UIView.animate(
                 withDuration: MultitaskDockManager.layoutAnimationDuration,
                 delay: 0,
@@ -1200,16 +1210,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 }
             ) { [weak self] _ in
                 guard let self, self.layoutToken == token else { return }
-                for (index, app) in self.apps.enumerated() {
-                    app.view?.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
-                    // Push geometry for EVERY window, not just the main one. BackBoard records the
-                    // surface position via an explicit XPC push, not by sampling the layer tree;
-                    // leaving the side windows at their old recorded position made the system
-                    // re-sync (and flash) the side column on the next frame. Size is unchanged, so
-                    // this is metadata-only and reallocates no IOSurface.
-                    (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?
-                        .appSceneVC.commitHostedGeometry()
+                // Restore side windows to non-interactive, then push only the main window's geometry
+                // (side touches are quarantined in-guest; pushing every window's geometry stacked
+                // XPC transactions and reset the dock's live blur).
+                for (index, app) in self.apps.enumerated() where index > 0 {
+                    (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.appSceneVC.contentView.userInteractionEnabled = false
                 }
+                self.commitMainWindowGeometry()
             }
         } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
