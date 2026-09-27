@@ -292,24 +292,6 @@
     });
 }
 
-- (void)showSwapCoverAtPath:(NSString *)path withIcon:(UIImage *)icon appName:(NSString *)appName {
-    [self showFrozenFrameAtPath:path];
-    if(!self.frozenFrameView.hidden) { return; }  // covered by the real last frame
-    // No frozen JPEG (fresh session, never backgrounded): fall back to the icon placeholder so
-    // the cross-process surface re-attach never exposes the pure-black container backing.
-    [self configureLaunchPlaceholderWithIcon:icon appName:appName];
-    self.launchPlaceholder.alpha = 1;
-    self.launchPlaceholder.hidden = NO;
-}
-
-- (void)hideSwapCoverAnimated:(BOOL)animated {
-    [self hideFrozenFrameAnimated:animated];
-    if(!self.launchPlaceholder.hidden) {
-        // We fell back to the icon placeholder for this swap: lift it too.
-        [self hideContentCoversAnimated:animated];
-    }
-}
-
 - (void)hideFrozenFrameAnimated:(BOOL)animated {
     dispatch_async(dispatch_get_main_queue(), ^{
         if(self.frozenFrameView.hidden) { return; }

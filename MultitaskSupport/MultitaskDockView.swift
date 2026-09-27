@@ -809,6 +809,8 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     private static let recoveryTimeout: TimeInterval = 25
 
     private static let layoutAnimationDuration: TimeInterval = 0.4
+    /// Accumulating y-rotation of the swap button glyph, so rapid taps keep turning the same way.
+    private var swapFlipAngle: CGFloat = 0
 
     override init() {
         super.init()
@@ -1173,34 +1175,38 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         }
 
         if mirroring {
-            // MINIMAL left/right handedness swap: across a mirror ONLY each card's x flips — its
-            // size, scale, content and the chrome/dock/backdrop/z-order are identical. Running the
-            // full update() here re-ordered hosted layers, re-ran the SwiftUI dock layout and
-            // re-committed scene geometry, which is what flashed the whole screen and popped a
-            // block over the dock. So write ONLY the card frames and corner masks, touching
-            // nothing else, in one non-animated transaction.
-            deferCornerMasks = false
+            // Left/right handedness swap: across a mirror ONLY each card's x flips — size, scale,
+            // content, chrome, dock, backdrop and z-order are identical. Animate the card frames
+            // CONTINUOUSLY on an Apple-standard spring: the render server samples the hosting view
+            // at every frame, so a smooth path has no missing position and the remote surface tracks
+            // along without a black hole (an instant half-screen jump left no valid mid position,
+            // which is what flashed the whole screen). Push geometry only once the spring lands.
+            deferCornerMasks = true
             layoutToken &+= 1
-            UIView.performWithoutAnimation {
+            let token = layoutToken
+            UIView.animate(
+                withDuration: MultitaskDockManager.layoutAnimationDuration,
+                delay: 0,
+                usingSpringWithDamping: 1.0,
+                initialSpringVelocity: 0,
+                options: [.beginFromCurrentState, .allowUserInteraction],
+                animations: {
+                    for (index, app) in self.apps.enumerated() {
+                        guard let view = app.view else { continue }
+                        let frame = MultitaskStageLayout.slotFrame(index, bounds: bounds, safeArea: safeArea)
+                        view.frame = frame
+                        self.windowShadowCasters[app.appUUID]?.frame = frame
+                    }
+                }
+            ) { [weak self] _ in
+                guard let self, self.layoutToken == token else { return }
                 for (index, app) in self.apps.enumerated() {
-                    guard let view = app.view else { continue }
-                    let frame = MultitaskStageLayout.slotFrame(index, bounds: bounds, safeArea: safeArea)
-                    view.frame = frame
-                    view.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
-                    self.windowShadowCasters[app.appUUID]?.frame = frame
+                    app.view?.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
                 }
-                // Lay out the re-tiled containers in the SAME transaction: otherwise the outer
-                // container moves but the (autolayout) remote content lags one frame, which is the
-                // whole-screen flash and the card sliding over the dock on the swap.
-                for app in self.apps {
-                    app.view?.layoutIfNeeded()
-                }
+                // Geometry push after the spring lands: re-derive the main window's touch region at
+                // its new slot. No foreground blip, only settings.
+                self.commitMainWindowGeometry()
             }
-            // Push the settled geometry into the MAIN hosted scene so BackBoard re-derives its touch
-            // region at the new slot. Skipping this leaves the scene describing the old slot, which
-            // is why main-window touches (long-press "hold to talk") land at the wrong coordinates
-            // and never start recording. No foreground blip: this only pushes settings.
-            self.commitMainWindowGeometry()
         } else if animated && UIAccessibility.isReduceMotionEnabled {
             armGeometryCommitIfNeeded()
             layoutToken &+= 1
@@ -2365,39 +2371,24 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     /// iPhone has no public API for detecting which hand holds the device, so this is an explicit
     /// toggle; the choice persists across launches via MultitaskStageLayout.isMirrored.
     @objc func toggleLayoutHandedness() {
-        // [FIX Bug2] Cover every jumping card before the swap. When the hosting view jumps half a
-        // screen the cross-process surface tears down and re-attaches, exposing the pure-black card
-        // backing for a frame. The cover is the guest's own last frame if a JPEG exists, else the
-        // app icon — never a host snapshot (those render black). hideSwapCover lifts whichever.
-        for app in apps {
-            if let d = app.view?._viewDelegate() as? DecoratedAppSceneViewController {
-                d.showSwapCover(atPath: LCStageFrozenFramePath(app.appUUID),
-                                withIcon: app.appInfo?.iconIsDarkIcon(false),
-                                appName: app.appName)
-            }
-        }
         MultitaskStageLayout.isMirrored.toggle()
         switchFeedback.impactOccurred()
-        // Mirror pass: cards fly through the spring, chrome/dock/plate stay frozen and corner
-        // masks swap only after landing — no junction seam or dock-block flash mid-swap.
+        // Cards glide to their new slots on a continuous spring (see performLayout mirror branch);
+        // no frozen-frame cover needed — a smooth path gives the render server a valid position
+        // every frame, so there is no black hole to cover.
         relayout(animated: true, mirroring: true)
-        // Lift the covers once the re-attached surface has settled. Hard backstop at 0.6s; the
-        // frame-ready signal (if any) would dismiss earlier, but B keeps it simple.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-            guard let self else { return }
-            for app in self.apps {
-                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.hideSwapCover(animated: true)
-            }
-        }
-        // A half-turn on the glyph reads as the two halves physically swapping places.
+        // A half-turn on the glyph reads as the two halves physically swapping places. Use a
+        // UIKit spring (interruptible, respects Reduce Motion) instead of a hand-rolled
+        // CASpringAnimation on the layer, which could not be interrupted and stacked on rapid taps.
         guard !UIAccessibility.isReduceMotionEnabled else { return }
-        let flip = CASpringAnimation(keyPath: "transform.rotation.y")
-        flip.fromValue = 0
-        flip.toValue = CGFloat.pi
-        flip.damping = 12
-        flip.stiffness = 180
-        flip.duration = 0.4
-        swapButton.layer.add(flip, forKey: "swapFlip")
+        swapFlipAngle += .pi
+        UIView.animate(withDuration: MultitaskDockManager.layoutAnimationDuration,
+                       delay: 0,
+                       usingSpringWithDamping: 1.0,
+                       initialSpringVelocity: 0,
+                       options: [.beginFromCurrentState, .allowUserInteraction]) {
+            self.swapButton.layer.transform = CATransform3DMakeRotation(self.swapFlipAngle, 0, 1, 0)
+        }
     }
 
     /// Collapses the stage back to the LiveContainer app list. Nothing is terminated: guests keep
