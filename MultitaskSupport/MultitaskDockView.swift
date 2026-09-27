@@ -980,6 +980,11 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         if let dockView = dockHost?.view, dockView.superview !== window {
             dockView.removeFromSuperview()
             window.addSubview(dockView)
+            // [FIX] Follow window-bounds transitions automatically: the mirroring branch deliberately
+            // does NOT write dock.frame (that re-triggers SwiftUI hosting layout and faded the dock),
+            // so without autoresizing the dock kept a stale/narrow frame during transition states and
+            // looked half-covered from the right.
+            dockView.autoresizingMask = [.flexibleWidth, .flexibleTopMargin]
         }
 
         let bounds = window.bounds
@@ -2385,11 +2390,29 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     /// iPhone has no public API for detecting which hand holds the device, so this is an explicit
     /// toggle; the choice persists across launches via MultitaskStageLayout.isMirrored.
     @objc func toggleLayoutHandedness() {
+        // [FIX Bug2] Cover every jumping card with the guest's own last frozen frame for the swap
+        // duration. When the hosting view jumps half a screen, the cross-process surface tears
+        // down and re-attaches, and for one frame the pure-black container backing shows through
+        // (the whole-screen black flash). A host-side snapshot would itself be black, so we use the
+        // guest self-captured JPEG, shown in a local UIImageView that never goes through the remote
+        // surface.
+        for app in apps {
+            if let d = app.view?._viewDelegate() as? DecoratedAppSceneViewController {
+                d.showFrozenFrame(atPath: LCStageFrozenFramePath(app.appUUID))
+            }
+        }
         MultitaskStageLayout.isMirrored.toggle()
         switchFeedback.impactOccurred()
         // Mirror pass: cards fly through the spring, chrome/dock/plate stay frozen and corner
         // masks swap only after landing — no junction seam or dock-block flash mid-swap.
         relayout(animated: true, mirroring: true)
+        // Fade the frozen covers out once the re-attached surface has drawn its first real frame.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self else { return }
+            for app in self.apps {
+                (app.view?._viewDelegate() as? DecoratedAppSceneViewController)?.hideContentCoversAnimated(true)
+            }
+        }
         // A half-turn on the glyph reads as the two halves physically swapping places.
         guard !UIAccessibility.isReduceMotionEnabled else { return }
         let flip = CASpringAnimation(keyPath: "transform.rotation.y")

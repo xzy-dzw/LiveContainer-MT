@@ -379,10 +379,15 @@
 - (void)applyScaleRatio {
     CGFloat ratio = _scaleRatio > 0 ? _scaleRatio : 1.0;
     self.appSceneVC.scaleRatio = ratio;
+    // [FIX] Do NOT scale the hosting view with a CATransform. BackBoard derives the remote touch
+    // region from the hosting view's on-screen geometry; a non-identity transform makes bounds
+    // (full-screen) disagree with the actual slot footprint, and the coordinate round-trip has
+    // enough error to silently kill long-press gesture recognizers (no touchesCancelled fires).
+    // The scene now renders at the slot size directly (see AppSceneViewController.m).
     if(self.appSceneVC.usesHostingControllerAPI) {
-        self.appSceneVC.contentView.transform = CGAffineTransformMakeScale(ratio, ratio);
+        self.appSceneVC.contentView.transform = CGAffineTransformIdentity;
     } else {
-        self.appSceneVC.contentView.layer.sublayerTransform = CATransform3DMakeScale(ratio, ratio, 1.0);
+        self.appSceneVC.contentView.layer.sublayerTransform = CATransform3DIdentity;
     }
 }
 
@@ -540,11 +545,8 @@
             settings.safeAreaInsetsPortrait = UIEdgeInsetsZero;
         }
 
-        // The guest always renders at the phone's original resolution; the slot only scales it.
+        // [FIX] Render at the actual slot size (no scaling transform), keeping remote touch 1:1.
         CGRect frame = self.view.frame;
-        CGFloat ratio = self.scaleRatio > 0 ? self.scaleRatio : 1.0;
-        frame.size.width /= ratio;
-        frame.size.height /= ratio;
 
         if(UIInterfaceOrientationIsLandscape(baseSettings.interfaceOrientation)) {
             settings.frame = CGRectMake(0, 0, frame.size.height, frame.size.width);
