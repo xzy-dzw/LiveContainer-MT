@@ -1279,10 +1279,18 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             }
         }
 
-        allChromeButtons.forEach { window.bringSubviewToFront($0) }
-        window.bringSubviewToFront(fpsCounter)
-        if let dockView = dockHost?.view {
-            window.bringSubviewToFront(dockView)
+        // z-order reorder only when we actually add/remove window subviews. A pure mirror flip
+        // touches no window-level subviews (cards live inside windowHostingView), so the dock and
+        // buttons already sit on top; re-running bringSubviewToFront anyway rewrites the window's
+        // subview array and invalidates the dock's backdrop blur render-server sampling, producing
+        // a 1-2 frame fallback texture that reads as a flicker — invisible on a single swap, but
+        // obvious during rapid swaps.
+        if !mirroring {
+            allChromeButtons.forEach { window.bringSubviewToFront($0) }
+            window.bringSubviewToFront(fpsCounter)
+            if let dockView = dockHost?.view {
+                window.bringSubviewToFront(dockView)
+            }
         }
 
         // Tell every guest who the main window is. Side windows quarantine
