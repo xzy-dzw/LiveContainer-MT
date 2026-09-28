@@ -690,11 +690,16 @@ final class MultitaskStageGlassButton: UIButton {
         windowStart = 0
         lastShownValue = nil
         let link = CADisplayLink(target: self, selector: #selector(sampleTick))
-        // Intentionally do NOT set preferredFrameRateRange: the counter only needs timestamp deltas
-        // to count frames, and pinning minimum:60 / preferred:120 here would force the whole display
-        // to stay on ProMotion high refresh for the stage's lifetime even while idle. Leaving it
-        // unset lets the system's VRR drop the refresh rate when nothing is animating.
-        // .common so the readout keeps sampling while the dock is scrolled or a window dragged.
+        // Declare ProMotion capability for the whole host process. This displayLink lives for as
+        // long as the stage is on screen, and its range tells the system the process (and every
+        // guest window inside it) may negotiate up to 120Hz. Without an explicit maximum here the
+        // system falls back to 60Hz for the process even when a guest (Xiaohongshu / Douyin) asks
+        // for 120. minimum:30 lets VRR drop to 30Hz on static content to save power; preferred:120
+        // lets scrolling hit the panel's peak. The link is invalidated when the stage closes, so
+        // single-app mode is unaffected.
+        if #available(iOS 15.0, *) {
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 120)
+        }
         link.add(to: .main, forMode: .common)
         self.link = link
     }
