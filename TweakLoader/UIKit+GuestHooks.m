@@ -47,7 +47,7 @@ static NSString *LCGuestResolveDataUUID(void) {
     return handoff.length ? handoff : @"";
 }
 
-#pragma mark - Frozen frame + frame-ready signalling
+#pragma mark - Frame-ready signalling
 
 #pragma mark - Guest keep-alive audio
 //
@@ -65,7 +65,6 @@ static NSString *LCGuestResolveDataUUID(void) {
 @property(nonatomic, assign) BOOL running;
 @property(nonatomic, assign) BOOL wantsRunning;
 @property(nonatomic, strong) id interruptionBeganObserver;
-@property(nonatomic, strong) id interruptionEndedObserver;
 @property(nonatomic, strong) id resetObserver;
 + (instancetype)shared;
 /// Stage disappeared entirely: stop and release the session.
@@ -218,10 +217,8 @@ static NSString *LCGuestResolveDataUUID(void) {
 - (void)unregisterObservers {
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     if (self.interruptionBeganObserver) { [center removeObserver:self.interruptionBeganObserver]; }
-    if (self.interruptionEndedObserver) { [center removeObserver:self.interruptionEndedObserver]; }
     if (self.resetObserver) { [center removeObserver:self.resetObserver]; }
     self.interruptionBeganObserver = nil;
-    self.interruptionEndedObserver = nil;
     self.resetObserver = nil;
 }
 
@@ -258,7 +255,7 @@ static UIWindow *LCGuestKeyWindow(void) {
 /// Renders a view into a tiny side x side 32bpp RGBA8 buffer and computes mean luminance plus
 /// its standard deviation. A blank system buffer is ~(0,0); a dark video frame is black-ish but
 /// noisy, so mean OR stddev crossing the thresholds is what separates "real content" from "black
-/// nothing". Used both to verify frozen-frame captures and to verify post-unlock frames.
+/// nothing". Used to verify post-activation frames before reporting frame-ready.
 static BOOL LCGuestRenderLumaStats(UIView *view, CGFloat side, CGFloat *outMean, CGFloat *outStd) {
     CGSize size = view.bounds.size;
     if (size.width < 2 || size.height < 2) { return NO; }
@@ -332,44 +329,6 @@ static NSData *LCGuestRenderBackdropGrid(UIView *view) {
     return out;
 }
 
-/// Snapshots the guest's last visible frame into the App Group. Runs while the frame is
-/// still on screen (host willResignActive and the two follow-up shots during the resign
-/// transition); afterScreenUpdates:NO keeps it synchronous and cheap. Logs JPEG size and
-/// pixel stats so a black/broken capture is obvious from the logs instead of looking like a
-/// guest bug. A re-shot that comes back as a fully dead buffer (near-zero mean AND variance —
-/// the cross-process surface already torn down) never replaces an earlier good frame, so the
-/// last real composited frame is what the host shows on wake.
-static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
-    if (dataUUID.length == 0) { return; }
-    UIWindow *window = LCGuestKeyWindow();
-    CGRect bounds = window.bounds;
-    if (bounds.size.width < 2 || bounds.size.height < 2) { return; }
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithBounds:bounds];
-    UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
-        [window drawViewHierarchyInRect:bounds afterScreenUpdates:NO];
-    }];
-    NSData *jpeg = UIImageJPEGRepresentation(image, 0.7);
-    if (jpeg.length == 0) {
-        NSLog(@"[LCStage][闪黑] 冻结帧拍照失败：JPEG 编码为空（uuid=%@）", dataUUID);
-        return;
-    }
-    CGFloat mean = 0, std = 0;
-    LCGuestRenderLumaStats(window, 40, &mean, &std);
-    NSString *path = LCStageFrozenFramePath(dataUUID);
-    BOOL hasPreviousFrame = [NSFileManager.defaultManager fileExistsAtPath:path];
-    BOOL deadBuffer = (mean < 0.005 && std < 0.005);
-    if (deadBuffer && hasPreviousFrame) {
-        NSLog(@"[LCStage][闪黑] 延迟补拍命中已销毁的渲染缓冲（亮度=%.3f 噪点=%.3f），保留上一张真实冻结帧",
-              mean, std);
-        return;
-    }
-    [NSFileManager.defaultManager createDirectoryAtPath:path.stringByDeletingLastPathComponent
-                            withIntermediateDirectories:YES attributes:nil error:nil];
-    [jpeg writeToFile:path atomically:YES];
-    NSLog(@"[LCStage][闪黑] 冻结帧已写入：%lu 字节，平均亮度=%.3f 标准差=%.3f",
-          (unsigned long)jpeg.length, mean, std);
-}
-
 /// Pixel-verified frame-ready: every second display tick after arming, the key window is sampled
 /// as a 40x40 thumbnail. Two CONSECUTIVE samples with mean luminance >0.02 OR stddev >0.01 count
 /// as real content (a blank system buffer is ~(0,0); a dark video is black but noisy), and only
@@ -415,8 +374,6 @@ static void LCGuestCaptureFrozenFrame(NSString *dataUUID) {
     self.done = YES;
     [self.link invalidate];
     self.link = nil;
-    NSLog(@"[LCStage][闪黑] 像素验真通过（%@，耗时 %.2fs，连续真实帧=%ld），上报 frame-ready",
-          reason, CFAbsoluteTimeGetCurrent() - self.armedAt, (long)self.goodFrames);
     LCStageGuestMarkFrameReady(LCGuestDataUUID);
 }
 
@@ -563,7 +520,6 @@ static void UIKitGuestHooksInit() {
                                                 usingBlock:^(NSNotification *note) {
         if (!LCStageGuestHasActivatedOnce) {
             LCStageGuestHasActivatedOnce = YES;
-            NSLog(@"[LCStage][场景] guest 首次激活完成，生命周期屏蔽已武装（uuid=%@）", LCGuestDataUUID);
         }
     }];
 
@@ -604,27 +560,9 @@ static void UIKitGuestHooksInit() {
     // never created, so the guest pays zero renderInContext: cost during scrolling.
 
 
-    // MARK: - First-frame report + frozen-frame capture
+    // MARK: - First-frame report
     //
-    // A hosted scene shows a black card until the guest's first frame reaches
-    // the host. The guest therefore (1) tells the host when real frames are on
-    // screen after every activation, and (2) snapshots its last frame before
-    // resigning active, so after unlock the host can cover the recovering
-    // scene with a still of THIS app instead of a black flash.
-    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillResignActiveNotification
-                                                    object:nil queue:nil
-                                                usingBlock:^(NSNotification *note) {
-        LCGuestCaptureFrozenFrame(LCGuestDataUUID);
-    }];
-    // Earliest in-process moment the scene is about to deactivate, captured independently of the
-    // host's Darwin snapshot request. When lifecycle masking is ON this broadcast is swallowed at
-    // the post boundary (so this observer does not run either — the host's Darwin request takes
-    // the snapshot); when the user has turned masking OFF, this is the backup capture channel.
-    [NSNotificationCenter.defaultCenter addObserverForName:UISceneWillDeactivateNotification
-                                                    object:nil queue:nil
-                                                usingBlock:^(NSNotification *note) {
-        LCGuestCaptureFrozenFrame(LCGuestDataUUID);
-    }];
+    // Tell the host when real frames are on screen after every activation.
     [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
                                                     object:nil queue:nil
                                                 usingBlock:^(NSNotification *note) {
@@ -730,21 +668,7 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
 static void LCStageHostBackgroundingCallback(CFNotificationCenterRef center, void *observer,
                                              CFStringRef name, const void *object,
                                              CFDictionaryRef userInfo) {
-    // Runs at host willResignActive. The guest's own lifecycle notifications are removed under
-    // hosting (so YouTube-style apps keep playing), so the host tells us directly: freeze the
-    // last frame and arm keep-alive BEFORE suspension begins.
-    LCGuestCaptureFrozenFrame(LCGuestDataUUID);
-    // The first shot can predate the FINAL composited frame of the resign/lock transition (it
-    // fires at willResignActive, before the screen has finished dimming). Re-shoot twice as the
-    // transition settles so the cover shown on wake really is the last frame the user saw; a
-    // shot landing after the surface is torn down is detected and discarded inside the capture.
-    static const NSTimeInterval kReshootDelays[] = {0.15, 0.4};
-    for (NSUInteger i = 0; i < sizeof(kReshootDelays) / sizeof(kReshootDelays[0]); i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kReshootDelays[i] * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            LCGuestCaptureFrozenFrame(LCGuestDataUUID);
-        });
-    }
+    // Runs at host willResignActive. Arm keep-alive audio BEFORE suspension begins.
     [LCGuestKeepAliveAudio.shared armForBackground];
 }
 
@@ -792,9 +716,6 @@ static void LCStageStopBackdropCallback(CFNotificationCenterRef center, void *ob
                                         CFDictionaryRef userInfo) {
     LCGuestStopBackdropSampling();
 }
-
-#pragma mark - Lifecycle broadcast masking (foreground pinning)
-
 
 @interface UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event;

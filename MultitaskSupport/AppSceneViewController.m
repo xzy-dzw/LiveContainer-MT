@@ -9,7 +9,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import "LiveContainerSwiftUI-Swift.h"
 #import "../LiveContainerSwiftUI/Utilities/LCUtils.h"
-#import "PiPManager.h"
 #import "Localization.h"
 #import "LCSharedUtils.h"
 #import "utils.h"
@@ -147,12 +146,9 @@
         settings.cornerRadiusConfiguration = [[PrivClass(BSCornerRadiusConfiguration) alloc] initWithTopLeft:self.view.layer.cornerRadius bottomLeft:self.view.layer.cornerRadius bottomRight:self.view.layer.cornerRadius topRight:self.view.layer.cornerRadius];
         settings.displayConfiguration = UIScreen.mainScreen.displayConfiguration;
         settings.foreground = YES;
-        //settings.interruptionPolicy = 2; // reconnect
         settings.level = 1;
         settings.persistenceIdentifier = self.dataUUID;
         settings.statusBarDisabled = !self.isNativeWindow;
-        //settings.previewMaximumSize =
-        //settings.deviceOrientationEventsEnabled = YES;
         if(!self.usesHostingControllerAPI) {
             settings.safeAreaInsetsPortrait = self.view.safeAreaInsets;
         }
@@ -472,12 +468,6 @@
     }];
 }
 
-- (BOOL)lc_isSceneForegroundActive {
-    if(!self.presenter) { return NO; }
-    UIApplicationSceneSettings *settings = self.presenter.scene.settings;
-    return [settings isForeground] && [settings deactivationReasons] == 0;
-}
-
 - (void)lc_pinForeground {
     if(!self.presenter || _shouldIgnoreSceneUpdates) { return; }
     if(!self.usesHostingControllerAPI) {
@@ -494,11 +484,10 @@
 /// NSExtension request interruptions arrive TRANSIENTLY on lock screen and app switches. The old
 /// code tore the hosted scene (FBScene + hosting controller) down unconditionally the moment one
 /// arrived; when the extension reconnected on unlock the guest UI cold-started — Instagram bounced
-/// from a profile page back to its feed — and the frozen-frame cover made it look like the app had
-/// refreshed itself. We now let the dust settle for half a second and verify the guest process
-/// with getpgid (the same ground-truth check the watchdog uses): a live process keeps its scene
-/// (and gets a re-pin), only a confirmed-dead process is cleaned up. appTerminationCleanUp is
-/// idempotent, so the real cancellation callback racing us stays harmless.
+/// from a profile page back to its feed. We now let the dust settle for half a second and verify
+/// the guest process with getpgid (the same ground-truth check the watchdog uses): a live process
+/// keeps its scene (and gets a re-pin), only a confirmed-dead process is cleaned up.
+/// appTerminationCleanUp is idempotent, so the real cancellation callback racing us stays harmless.
 - (void)handleExtensionInterruption {
     const int pidAtInterrupt = _pid;
     BOOL aliveAtInterrupt = self.isAppRunning;

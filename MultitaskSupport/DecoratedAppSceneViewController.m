@@ -2,7 +2,6 @@
 #import "LiveContainerSwiftUI-Swift.h"
 #import "AppSceneViewController.h"
 #import "UIKitPrivate+MultitaskSupport.h"
-#import "PiPManager.h"
 #import "VirtualWindowsHostView.h"
 #import "../LiveContainer/Localization.h"
 #import "utils.h"
@@ -25,8 +24,6 @@
 @property(nonatomic, strong) UIImageView* placeholderIcon;
 @property(nonatomic, strong) UILabel* placeholderName;
 @property(nonatomic, strong) UIActivityIndicatorView* placeholderSpinner;
-/// The guest's last frame, shown over the scene while it recovers after unlock.
-@property(nonatomic, strong) UIImageView* frozenFrameView;
 @end
 
 /// The remote hosting view behind this window delivers touches through a system-level channel,
@@ -128,26 +125,10 @@
     [self setupContentCovers];
 }
 
-#pragma mark - Content covers (launch placeholder + frozen frame)
+#pragma mark - Content covers (launch placeholder)
 
 - (void)setupContentCovers {
     UIView* container = self.view;
-
-    // Frozen frame sits directly above the guest content.
-    UIImageView* frozen = [[UIImageView alloc] initWithFrame:CGRectZero];
-    frozen.translatesAutoresizingMaskIntoConstraints = NO;
-    frozen.hidden = YES;
-    frozen.userInteractionEnabled = NO;
-    frozen.contentMode = UIViewContentModeScaleAspectFill;
-    frozen.clipsToBounds = YES;
-    [container insertSubview:frozen belowSubview:_tapShield];
-    [NSLayoutConstraint activateConstraints:@[
-        [frozen.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
-        [frozen.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
-        [frozen.topAnchor constraintEqualToAnchor:container.topAnchor],
-        [frozen.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
-    ]];
-    _frozenFrameView = frozen;
 
     // Launch placeholder: black cover with the app's icon, name and a spinner —
     // what the home screen shows while an app launches, instead of a black void.
@@ -211,9 +192,8 @@
     dispatch_async(dispatch_get_main_queue(), ^{
         self.placeholderIcon.image = icon;
         self.placeholderName.text = appName;
-        // Re-arm the cover for a fresh launch even if a previous one was hidden.
-        // The recovery variant uses a translucent background over a frozen frame; a cold start
-        // cover must be opaque black again.
+        // Re-arm the cover for a fresh launch even if a previous one was hidden:
+        // always an opaque black cold-start cover.
         self.launchPlaceholder.backgroundColor = UIColor.blackColor;
         self.launchPlaceholder.hidden = NO;
         self.launchPlaceholder.alpha = 1;
@@ -221,82 +201,17 @@
     });
 }
 
-- (void)showFrozenFrameAtPath:(NSString*)path {
-    [self showFrozenFrameAtPath:path notOlderThan:0];
-}
-
-- (void)showFrozenFrameAtPath:(NSString*)path notOlderThan:(NSTimeInterval)minModified {
-    void (^show)(void) = ^{
-        if(minModified > 0) {
-            NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
-            NSTimeInterval modified = attrs.fileModificationDate.timeIntervalSince1970;
-            // Small tolerance for the cross-process write landing just after our clock read.
-            if(!attrs || modified + 0.1 < minModified) {
-                NSLog(@"[LCStage][闪黑] 冻结帧不够新鲜（mdate=%.3f 阈值=%.3f），保留现有遮罩",
-                      modified, minModified);
-                return;
-            }
-        }
-        UIImage* image = [[UIImage alloc] initWithContentsOfFile:path];
-        if(!image) {
-            // Loading failed: keep whatever cover is already showing. The black container backing
-            // must never be exposed while the hosted surface is reconnected.
-            NSLog(@"[LCStage][闪黑] 冻结帧读取失败（%@），保留现有遮罩", path.lastPathComponent);
-            return;
-        }
-        self.frozenFrameView.image = image;
-        self.frozenFrameView.hidden = NO;
-        self.frozenFrameView.alpha = 1;
-    };
-    if(NSThread.isMainThread) {
-        show();
-    } else {
-        dispatch_async(dispatch_get_main_queue(), show);
-    }
-}
-
 - (void)hideContentCoversAnimated:(BOOL)animated {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if(self.launchPlaceholder.hidden && self.frozenFrameView.hidden) { return; }
-        void (^changes)(void) = ^{
-            self.launchPlaceholder.alpha = 0;
-            self.frozenFrameView.alpha = 0;
-        };
-        void (^done)(BOOL) = ^(BOOL finished) {
-            self.launchPlaceholder.hidden = YES;
-            self.frozenFrameView.hidden = YES;
-            self.frozenFrameView.image = nil;
-            [self.placeholderSpinner stopAnimating];
-        };
-        if(animated) {
-            [UIView animateWithDuration:0.25 delay:0
-                                options:UIViewAnimationOptionBeginFromCurrentState
-                             animations:changes completion:done];
-        } else {
-            changes();
-            done(YES);
-        }
-    });
+    if(self.launchPlaceholder.hidden) { return; }
+    [UIView animateWithDuration:animated ? 0.25 : 0 animations:^{
+        self.launchPlaceholder.alpha = 0;
+    } completion:^(BOOL finished) {
+        self.launchPlaceholder.hidden = YES;
+        self.launchPlaceholder.alpha = 1;
+        [self.placeholderSpinner stopAnimating];
+    }];
 }
 
-- (void)hideFrozenFrameAnimated:(BOOL)animated {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if(self.frozenFrameView.hidden) { return; }
-        void (^changes)(void) = ^{ self.frozenFrameView.alpha = 0; };
-        void (^done)(BOOL) = ^(BOOL finished) {
-            self.frozenFrameView.hidden = YES;
-            self.frozenFrameView.image = nil;
-        };
-        if(animated) {
-            [UIView animateWithDuration:0.25 delay:0
-                                options:UIViewAnimationOptionBeginFromCurrentState
-                             animations:changes completion:done];
-        } else {
-            changes();
-            done(YES);
-        }
-    });
-}
 
 - (void)tapPromoteWindow {
     [MultitaskDockManager.shared promoteWindowForUUID:self.dataUUID];

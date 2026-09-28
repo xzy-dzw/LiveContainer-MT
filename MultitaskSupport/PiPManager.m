@@ -63,7 +63,6 @@ static PiPManager* sharedInstance = nil;
         self.pipVideoCallViewController.preferredContentSize = vc.view.bounds.size;
         if(vc.usesHostingControllerAPI) {
             self.pipVideoCallContentView = [[UIView alloc] initWithFrame:self.pipVideoCallViewController.view.bounds];
-            //self.pipVideoCallContentView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
             self.pipVideoCallContentView.layer.anchorPoint = CGPointMake(0, 0);
             self.pipVideoCallContentView.layer.position = CGPointMake(0, 0);
             [self.pipVideoCallViewController.view addSubview:self.pipVideoCallContentView];

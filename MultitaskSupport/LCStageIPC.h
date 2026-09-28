@@ -49,7 +49,7 @@ static NSString * const LCStagePromoteRequestNotificationName =
     @"com.kdt.livecontainer.stage.promoteRequest";
 /// Posted by a guest after it rendered real frames following an activation
 /// (cold start AND every foreground return). The host then fades its launch
-/// placeholder / frozen-frame cover out. Payload: LCGuestFrameReady.<uuid>.
+/// placeholder out. Payload: LCGuestFrameReady.<uuid>.
 static NSString * const LCStageFrameReadyNotificationName =
     @"com.kdt.livecontainer.stage.frameReady";
 /// Posted by the host at UIApplicationWillResignActive while the stage is on
@@ -147,8 +147,7 @@ static inline void LCStagePublishRoles(BOOL active, NSString *_Nullable mainUUID
 }
 
 /// Host: tells every staged guest that the host is about to resign active
-/// (screen lock / user switched to another app). Guests use it to snapshot
-/// their frozen frame and to arm keep-alive audio.
+/// (screen lock / user switched to another app). Guests arm keep-alive audio.
 static inline void LCStageNotifyHostBackgrounding(void) {
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          (__bridge CFStringRef)LCStageHostBackgroundingNotificationName,
@@ -330,15 +329,6 @@ static inline NSData *_Nullable LCStageHostGuestBackdropGrid(NSString *guestUUID
     return grid;
 }
 
-/// Path of the frozen-frame JPEG one guest stores right before resigning
-/// active, and the host shows while its hosted scene recovers after unlock.
-static inline NSString *LCStageFrozenFramePath(NSString *guestUUID) {
-    NSString *directory = [[[NSUserDefaults lcAppGroupPath]
-                            stringByAppendingPathComponent:@"LiveContainer"]
-                           stringByAppendingPathComponent:@"StageFrozenFrames"];
-    return [directory stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"%@.jpg", guestUUID]];
-}
 
 NS_ASSUME_NONNULL_END
 

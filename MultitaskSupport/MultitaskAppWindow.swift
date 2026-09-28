@@ -45,7 +45,6 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
     @Binding var show: Bool
     let bundleId: String
     let dataUUID: String
-    let initSize: CGSize
     let onAppInitialize: (Int32, Error?) -> Void
     
     class Coordinator: NSObject, AppSceneViewControllerDelegate {
@@ -87,7 +86,6 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
         
         func appSceneVC(_ vc: AppSceneViewController!, didUpdateFrom settings: UIMutableApplicationSceneSettings!, transitionContext context: Any!, lifecycleActionType actionType: UInt32) {
             settings.interruptionPolicy = 0
-            //settings.peripheryInsets = vc.view.window?.safeAreaInsets ?? .zero
             vc.presenter.scene.updateSettings(settings, withTransitionContext: context, completion: nil)
             // Not sure what actionType 2 is, but it's only set when this scene enters foreground, so we can pass URL scheme here
             if actionType == 2, let launchUrl = UserDefaults.standard.string(forKey: "launchAppUrlScheme") {
@@ -140,7 +138,7 @@ struct MultitaskAppWindow: View {
         let isVirtualWindowMode = multitaskMode == .virtualWindow
         if show, let appInfo {
             GeometryReader { geometry in
-                AppSceneViewSwiftUI(show: $show, bundleId: appInfo.bundleId, dataUUID: appInfo.dataUUID, initSize: geometry.size,
+                AppSceneViewSwiftUI(show: $show, bundleId: appInfo.bundleId, dataUUID: appInfo.dataUUID,
                                     onAppInitialize: { pid, error in
                     DispatchQueue.main.async {
                         if error == nil {

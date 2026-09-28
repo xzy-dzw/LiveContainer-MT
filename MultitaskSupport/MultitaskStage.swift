@@ -243,7 +243,6 @@ enum MultitaskStageFont {
             // "Already registered" (UIAppFonts beat us to it) reports as an error too; the only
             // thing that matters is whether lookup now succeeds.
             if let name = firstResolvableCandidate() {
-                NSLog("[LCStage] FPS 字体已解析：\(name)")
                 return name
             }
             NSLog("[LCStage] BlenderPro-Bold 注册/解析失败：\(error?.takeRetainedValue().localizedDescription ?? "未知错误")；已安装含 Blender 的字体族：\(UIFont.familyNames.filter { $0.localizedCaseInsensitiveContains("blender") })")
@@ -522,11 +521,9 @@ final class MultitaskStageGlassButton: UIButton {
 /// technical face that still never shifts width), large enough to glance at, tinted by the
 /// health colour (green/amber/red). Every time the integer changes it does a quick spring
 /// "heartbeat" pop, so a locked 120 reads as a calm steady pulse and a struggling stage
-/// visibly stutters. A 7pt status dot carries the same meaning for peripheral vision. The
-/// capsule hides entirely in fullscreen.
+/// visibly stutters. The capsule hides entirely in fullscreen.
 @objc class MultitaskStageFPSCounterView: UIView {
     private let glass = UIVisualEffectView(effect: nil)
-    private let statusDot = UIView()
     private let label = UILabel()
     private var link: CADisplayLink?
     private var framesInWindow = 0
@@ -575,7 +572,6 @@ final class MultitaskStageGlassButton: UIButton {
         isUserInteractionEnabled = false
         backgroundColor = .clear
         setupMaterial()
-        setupStatusDot()
         setupLabel()
     }
 
@@ -606,17 +602,6 @@ final class MultitaskStageGlassButton: UIButton {
     private func addRim() {
         glass.layer.borderWidth = MultitaskStageLayout.hairline
         glass.layer.borderColor = UIColor.label.withAlphaComponent(0.10).cgColor
-    }
-
-    private func setupStatusDot() {
-        statusDot.isUserInteractionEnabled = false
-        statusDot.backgroundColor = state.color
-        statusDot.layer.cornerRadius = 3.5
-        statusDot.layer.cornerCurve = .continuous
-        // The status dot was removed: the FPS number itself already recolours by state
-        // (smooth/strained/dropping), so the dot was redundant chrome. Keep the property only so
-        // the colour-state bookkeeping below still compiles; it is never shown.
-        statusDot.isHidden = true
     }
 
     private func setupLabel() {
@@ -765,7 +750,7 @@ final class MultitaskStageGlassButton: UIButton {
         }
     }
 
-    /// State changes recolour both the dot (cross-dissolve) and, immediately, the number.
+    /// State changes recolour the number immediately.
     private func transition(to newState: FPSState) {
         guard newState != state else { return }
         state = newState

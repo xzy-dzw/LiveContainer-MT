@@ -52,10 +52,6 @@ API_AVAILABLE(ios(16.0))
 /// Set foreground state on the hosted scene. Used to suspend side windows while the app is
 /// backgrounded (so iOS does not kill them for memory pressure) and to wake them back up.
 - (void)setHostedSceneForeground:(BOOL)foreground;
-/// YES while the hosted scene is foreground AND carries no deactivation reasons — the state
-/// foreground pinning maintains. The stage reads this on foreground return to decide whether a
-/// scene needs any explicit wake-up push at all.
-- (BOOL)lc_isSceneForegroundActive NS_SWIFT_NAME(lcIsSceneForegroundActive());
 /// Re-asserts foreground=YES and clears every deactivation reason on the hosted scene. On the
 /// iOS 18+ hosting path it pushes through the scene settings channel (the same proven channel
 /// PiP uses); on the legacy presenter path it also strips the extension's host-lifecycle
