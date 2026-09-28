@@ -768,6 +768,11 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     /// racing the reconnecting surface and contributing its own black frame.
     private var pendingWakeGeometryCommit = false
     private var backgroundingBeganAt = Date.distantPast
+    /// Escalating re-pin scheduler: immediately, 0.2/0.5/1s after resign, then every 1s while
+    /// backgrounded. The location assertion keeps us runnable in the background, so the timer
+    /// really fires. Keeps every scene foreground so iOS never sends DidEnterBackground to guests.
+    private var isPinningForeground = false
+    private var foregroundPinningTimer: Timer?
     /// Per-control backdrop sampler state for adaptive glyph tinting. Each glass control maps
     /// its own on-screen centre into the main guest's published luma GRID, so a control tinted
     /// by the dark strip it actually floats over stays white even when the rest of the app is
@@ -1587,6 +1592,40 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         }
     }
 
+    @objc func pinAllStagedScenesForeground(reason: String) {
+        for app in apps {
+            guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+            vc.appSceneVC.lcPinForeground()
+        }
+    }
+
+    private func beginForegroundPinning() {
+        guard !isPinningForeground else { return }
+        isPinningForeground = true
+        pinAllStagedScenesForeground(reason: "锁屏当帧")
+        for delay in [0.2, 0.5, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.isPinningForeground else { return }
+                self.pinAllStagedScenesForeground(reason: "后台 \(delay)s")
+            }
+        }
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self, self.isPinningForeground,
+                  UIApplication.shared.applicationState != .active else { return }
+            self.pinAllStagedScenesForeground(reason: "后台周期 1s")
+        }
+        timer.tolerance = 0.2
+        RunLoop.main.add(timer, forMode: .common)
+        foregroundPinningTimer = timer
+    }
+
+    private func endForegroundPinning() {
+        guard isPinningForeground else { return }
+        isPinningForeground = false
+        foregroundPinningTimer?.invalidate()
+        foregroundPinningTimer = nil
+    }
+
     /// Tells guests to start/stop backdrop luma sampling. Only needed in fullscreen mode,
     /// where the floating zoom button needs adaptive glyph colors. In split mode the dock
     /// controls sit on a solid background, no sampling needed.
@@ -1815,12 +1854,9 @@ private var keepAlivePiPEnabled: Bool {
         // 2) Locally cover every card with whatever frozen frame already exists (from the last
         //    round) immediately, so even the resign animation itself never shows a black gap.
         coverCardsWithFrozenFrames()
-        // 3) Re-pin scenes foreground while pinning is on, so iOS doesn't tear the scene down.
+        // 3) Start escalating re-pin so scenes stay foreground while backgrounded.
         if scenePinningEnabled {
-            for app in apps {
-                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-                vc.appSceneVC.lcPinForeground()
-            }
+            beginForegroundPinning()
         }
         // 4) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
         if keepAlivePiPEnabled {
@@ -1861,6 +1897,7 @@ private var keepAlivePiPEnabled: Bool {
     @objc private func appWillEnterForeground() {
         endBackgroundTaskIfNeeded()
         lastHostWakeAt = Date()
+        endForegroundPinning()
         // Guests' own didBecomeActive is stripped under hosting; tell them to re-arm frame-ready.
         LCStageNotifyHostForegrounding()
         // Cover with the snapshots taken at willResignActive first. Each cover is lifted only by

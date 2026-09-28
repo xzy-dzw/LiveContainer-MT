@@ -460,14 +460,11 @@ static NSSet<NSString *> *LCStageMaskedLifecycleNames(void) {
     static NSSet *names;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // Only the "waking up" direction. Backgrounding (WillResignActive / DidEnterBackground /
-        // WillDeactivate / DidEnterBackground) passes through so apps pause naturally.
-        names = [NSSet setWithArray:@[
-            UISceneWillEnterForegroundNotification,
-            UISceneDidActivateNotification,
-            UIApplicationWillEnterForegroundNotification,
-            UIApplicationDidBecomeActiveNotification,
-        ]];
+        // No notifications are swallowed. The host's escalating re-pin scheduler keeps scenes
+        // foreground while backgrounded, so iOS never delivers these transitions to guests in the
+        // first place. If the re-pin fails (jetsam / scene tear-down), the notification still
+        // arrives and the app handles it correctly.
+        names = [NSSet set];
     });
     return names;
 }
