@@ -698,7 +698,7 @@ final class MultitaskStageGlassButton: UIButton {
         // lets scrolling hit the panel's peak. The link is invalidated when the stage closes, so
         // single-app mode is unaffected.
         if #available(iOS 15.0, *) {
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 120, preferred: 120)
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
         }
         link.add(to: .main, forMode: .common)
         self.link = link
