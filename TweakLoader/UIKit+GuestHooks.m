@@ -659,6 +659,8 @@ static void UIKitGuestHooksInit() {
                                         (__bridge CFStringRef)LCStageHostForegroundingNotificationName,
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
+        static void LCStageStartBackdropCallback(CFNotificationCenterRef, void *, CFStringRef, const void *, CFDictionaryRef);
+        static void LCStageStopBackdropCallback(CFNotificationCenterRef, void *, CFStringRef, const void *, CFDictionaryRef);
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                         NULL,
                                         LCStageStartBackdropCallback,
