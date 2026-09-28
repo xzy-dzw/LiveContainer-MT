@@ -4,7 +4,7 @@
 
 <div align="center">
   <h1><b>LiveContainer 多任务版</b></h1>
-  <p><i>在 LiveContainer 官方预发行版上打造的虚拟窗口多任务分支：一主三副，同屏多开</i></p>
+  <p><i>在 LiveContainer 上实现一主三副虚拟窗口，同屏多开多个 App</i></p>
 </div>
 
 <p align="center">
@@ -15,75 +15,66 @@
 
 ## 这是什么
 
-本项目是 [LiveContainer](https://github.com/LiveContainer/LiveContainer) 的非官方中文分支，在官方预发行版（nightly，基线提交 `4dbe0f9`）完整源码之上，加入了虚拟窗口多任务内核。所有多任务代码集中在 `MultitaskSupport/` 目录和 guest 侧的 `TweakLoader/UIKit+GuestHooks.m`，构建脚本与 GitHub Actions 编译流程跟随官方，每次发布都产出与官方同名的两个 IPA：
+本项目是 [LiveContainer](https://github.com/LiveContainer/LiveContainer) 的非官方分支，在官方 nightly 源码之上构建了虚拟窗口多任务内核。多个 App 以远程 scene hosting 方式同屏运行，通过底部 Dock 切换、全屏、关闭。
 
-| 文件 | 说明 | 适合谁 |
-|---|---|---|
-| **LiveContainer.ipa** | 单文件版，只含 LiveContainer 本体（约 4.5 MB） | 用证书自签、AltStore、TrollStore 等方式安装的用户 |
-| **LiveContainer+SideStore.ipa** | 二合一版，内置 SideStore（约 34 MB） | 想免电脑签名、7 天自动重签的用户 |
+两个 IPA 构建产物：
 
-> 两个包的**多任务功能完全一致**，区别只是是否内置 SideStore。用 SideStore 二合一版时，安装升级请选择「保留 App 扩展（Keep App Extensions）」。
+| 文件 | 说明 |
+|---|---|
+| **LiveContainer.ipa** | 单文件版（约 4.5 MB） |
+| **LiveContainer+SideStore.ipa** | 内置 SideStore 自动重签（约 34 MB） |
 
-## 多任务功能特性
+## 功能
 
-- **一主三副虚拟窗口舞台**：最多 4 个小 App 同屏运行，点副窗即切主位，带弹性分屏动画与玻璃控制条
-- **冷启动占位封面**：大 App 加载时显示「图标 + 名称 + 转圈」而不是黑屏，首帧渲染后自动淡入揭开
-- **切后台不闪黑**：副窗全程保活不挂起；每个 App 失活时自动冻结最后一屏，回前台先盖真画面再换新帧
-- **锁屏/息屏保活**：多任务舞台期间屏幕常亮，并通过混音播放会话让宿主与小 App 锁屏后不被系统冻结
-- **看门狗兜底**：每秒健康检查，基于真实进程号（getpgid）收尸崩溃窗口，**不会误杀主线程暂时卡顿的健康 App**；孤儿进程与容器锁自动回收
-- **电竞风帧数显示**：SF Mono 等宽数字 + 霓虹绿 OSD 芯片，跳帧不抖动
-- 支持点击链接跳转宿主、画中画最小化、多任务设置项（默认多任务启动、首次启动最大化等）
+- **一主三副虚拟窗口**：最多 4 个 App 同屏，点副窗切主位，弹性分屏动画
+- **窗口控制条**：全屏 / 关闭 / 镜像切换，玻璃质感设计
+- **冷启动占位**：大 App 加载时显示图标 + 名称 + 转圈，首帧渲染后自动淡入
+- **后台保活**：定位 + 混音音频 + 画中画三重保活通道，舞台期间 App 不被系统挂起
+- **页面状态保持**：锁屏/切后台时 escalating re-pin 维持 scene 前台，返回后不刷新、不回首页
+- **进程看门狗**：基于 getpgid 检测崩溃窗口并自动回收，不误杀主线程卡顿的健康 App
+- **FPS 显示**：等宽数字 OSD，实时帧率
+
+## 技术实现
+
+多任务代码集中在两个目录：
+
+```
+MultitaskSupport/          host 侧
+├── AppSceneViewController      基于 _UISceneHostingController 的远程 scene 承载
+├── DecoratedAppSceneViewController  窗口卡片、启动占位、控制条
+├── MultitaskDockView           舞台管理：布局、看门狗、保活、re-pin
+├── MultitaskStage              分屏布局与 FPS 芯片
+└── LCStageIPC.h                host↔guest Darwin 通知与共享 defaults 通道
+
+TweakLoader/
+└── UIKit+GuestHooks.m        guest 侧：生命周期屏蔽、backdrop 采样、触摸隔离
+```
+
+核心技术点：
+- 复用 iOS 私有 `_UISceneHostingController` 跨进程托管 App（与 Xcode Previews 同一套机制）
+- host 在 willResignActive 启动 escalating re-pin 定时器（0.2s/0.5s/1s/每 1s），靠定位保活在后台持续运行
+- guest 端通过 Darwin 通知接收 backdrop 采样指令，仅全屏时启动离屏渲染
+- 窗口回收基于 getpgid 进程存活检测，无需 guest 心跳
 
 ## 系统要求
 
-- iOS / iPadOS 16.0 及以上（推荐 iOS 17+，真机主要在 iOS 26 上验证）
-- 侧载安装需开启「设置 → 隐私与安全性 → 开发者模式」
-- 安装或升级 IPA 时选择「保留 App 扩展」，否则多任务 guest 进程无法拉起
+- iOS / iPadOS 16.0+（推荐 iOS 17+，主要在 iOS 26 上验证）
+- 侧载安装需开启开发者模式
+- 升级 IPA 时选择「保留 App 扩展」
 
-## 安装方法
+## 使用
 
-1. 前往 [Releases](https://github.com/xzy-dzw/LiveContainer-MT/releases) 下载需要的 IPA
-2. 用你常用的侧载工具安装（证书签名 / AltStore / SideStore / TrollStore 等）
-3. 首次打开多开的 App 前，在 LiveContainer 设置里确认多任务模式为「虚拟窗口」
-4. 二合一版的 SideStore 签名配置（Apple ID、自动刷新）属于 SideStore 功能，请参考 [SideStore 官方文档](https://docs.sidestore.io/)
-
-## 使用方法
-
-- 在 App 列表点开任意 App，即自动进入多任务舞台；连续打开最多 4 个
-- 点任意副窗口卡片：切到主位；点玻璃条上的按钮：全屏 / 关闭
-- 从屏幕底部 Dock 可以再启动其他 App；第 5 个窗口会被中文提示拦下（请先关闭一个）
-- 同一 App 重复启动不会再开一个窗口，而是把已有窗口提到主位
-
-## 目录结构（多任务代码在哪）
-
-```
-LiveContainer/
-├── MultitaskSupport/              ★ 多任务内核（host 侧）
-│   ├── MultitaskDockView.swift      舞台管理器：窗口、布局、看门狗、保活
-│   ├── MultitaskStage.swift         分屏布局与 FPS 计数芯片
-│   ├── MultitaskManager.swift       容器锁与孤儿进程回收
-│   ├── AppSceneViewController.*     guest 场景承载（_UISceneHostingController）
-│   ├── DecoratedAppSceneViewController.*  窗口卡片、启动封面、冻结帧
-│   ├── LCStageIPC.h                 host 与 guest 的 Darwin/IPC 通道
-│   └── UIKitHooks.m                 host 侧触摸与通知钩子
-├── TweakLoader/
-│   └── UIKit+GuestHooks.m         ★ guest 侧：心跳、冻结帧截图、首帧上报
-└── LiveContainerSwiftUI/Views/Settings/
-    └── LCMultitaskSettingView.swift  多任务设置页
-```
+1. App 列表点开 App 即进入多任务舞台，最多 4 个
+2. 点副窗切主位，控制条按钮全屏/关闭
+3. 底部 Dock 可继续启动新 App
+4. 设置页可切换保活通道、默认多任务启动、锁定页面状态等
 
 ## 从源码构建
 
-项目包含官方全部源码与三个子模块（fishhook / OpenSSL / litehook），CI 流程与官方一致：
+CI 跟随官方流程：push 到 `main` 自动构建两个 IPA。手动执行「构建 IPA」workflow 并勾选发布即可发 Release。
 
-- 推送到 `main` 或提交 PR：自动构建两个 IPA 作为构建产物（不发布 Release）
-- 手动执行「构建 IPA」工作流并勾选「发布中文 Release」：构建成功后自动创建中文 Release 并上传两个 IPA
+## 致谢
 
-本地复现官方打包：安装 Xcode 26.2 后直接使用工程根目录的 `.github/build_github.sh`；仓库外层提供的 `build.sh` 用于补丁链整合与静态校验。
-
-## 致谢与声明
-
-- 内核基于 [LiveContainer](https://github.com/LiveContainer/LiveContainer)（nightly，`4dbe0f9`）
+- 基于 [LiveContainer](https://github.com/LiveContainer/LiveContainer) nightly
 - 二合一版内置 [SideStore](https://github.com/SideStore/SideStore)
-- 本项目为爱好者非官方分支，与 LiveContainer / SideStore 官方无关；遇到问题请先在本仓库 Issues 反馈
-- 仅供学习交流与个人备份使用，请遵守所在地法律法规及相关软件许可
+- 爱好者非官方分支，仅供学习交流
