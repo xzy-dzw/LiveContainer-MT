@@ -5,6 +5,7 @@
 //  Created by s s on 2025/5/17.
 //
 #import "AppSceneViewController.h"
+#import "LCStageLog.h"
 #import "DecoratedAppSceneViewController.h"
 #import <QuartzCore/QuartzCore.h>
 #import "LiveContainerSwiftUI-Swift.h"
@@ -81,7 +82,7 @@
                                       relativeToURL:nil
                                               error:&bookmarkError];
         if (!data) {
-            NSLog(@"[LiveContainer] bookmark creation failed for %@: %@", url, bookmarkError);
+            os_log_error(LCStageLog(), "[LC] bookmark creation failed for %{public}@: %{public}@", url, bookmarkError);
         }
         return data;
     };
@@ -491,20 +492,20 @@
 - (void)handleExtensionInterruption {
     const int pidAtInterrupt = _pid;
     BOOL aliveAtInterrupt = self.isAppRunning;
-    NSLog(@"[LCStage][场景] appex 请求被中断（bundle=%@, pid=%d, 进程存活=%@），0.5s 后验尸",
-          _bundleId, pidAtInterrupt, aliveAtInterrupt ? @"是" : @"否");
+    os_log_info(LCStageLog(), "[LCStage][scene] appex interrupted bundle=%{public}@ pid=%d alive=%d, post-mortem in 0.5s",
+          _bundleId, pidAtInterrupt, aliveAtInterrupt);
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) self = weakSelf;
         if(!self) { return; }
         if(self.isAppRunning) {
-            NSLog(@"[LCStage][场景] 中断后验尸：pid=%d 仍存活，忽略本次中断并补钉前台（launchCount=%ld）",
+            os_log_info(LCStageLog(), "[LCStage][scene] post-mortem: pid=%d alive, re-pinning foreground (launchCount=%ld)",
                   pidAtInterrupt, (long)LCStageHostGuestLaunchCount(self.dataUUID));
             [self lc_pinForeground];
             return;
         }
-        NSLog(@"[LCStage][场景] 中断后验尸：pid=%d 已确认死亡，执行场景清理", pidAtInterrupt);
+        os_log_info(LCStageLog(), "[LCStage][scene] post-mortem: pid=%d confirmed dead, cleaning up", pidAtInterrupt);
         [self appTerminationCleanUp];
     });
 }

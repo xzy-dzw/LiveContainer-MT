@@ -8,6 +8,7 @@
 #import "utils.h"
 #import "UIKitPrivate+MultitaskSupport.h"
 #import "LCStageIPC.h"
+#import "LCStageLog.h"
 #import "LiveContainerSwiftUI-Swift.h"
 
 static BOOL LCHasRemoteSheetProviderSelector;
@@ -100,6 +101,15 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
         return NO;
     }
     if(@available(iOS 16.0, *)) {
+        // Fast path: when the stage isn't actually intercepting (single app, collapsed,
+        // fullscreen, no side window) and there is no quarantined sequence in flight, forward
+        // straight to the original implementation. This makes the swizzle O(1) for the common
+        // single-app touch path instead of enumerating touches and touching the hash table.
+        if(!LCInterceptedTouches || LCInterceptedTouches.count == 0) {
+            if(![MultitaskDockManager.shared lcIsInterceptingTouches]) {
+                return NO;
+            }
+        }
         if(!LCInterceptedTouches) {
             LCInterceptedTouches = [NSHashTable weakObjectsHashTable];
         }
@@ -127,7 +137,7 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
             CGPoint location = [touch locationInView:hitTestWindow];
             if([MultitaskDockManager.shared interceptTouchAtLocation:location inWindow:hitTestWindow]) {
                 [LCInterceptedTouches addObject:touch];
-                NSLog(@"[LCStage][触摸] 新触摸落在副窗区域，拦截本序列并提升该窗口");
+                os_log_debug(LCStageLog(), "[LCStage][touch] side-window touch began, quarantining sequence");
             }
         }
 

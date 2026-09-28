@@ -6,6 +6,15 @@
 #import "../MultitaskSupport/LCStageIPC.h"
 #import <LocalAuthentication/LocalAuthentication.h>
 #import "Localization.h"
+#import <os/log.h>
+
+// Guest-side stage logger (asynchronous, replaces synchronous NSLog on the touch hot path).
+static os_log_t LCGuestStageLog(void) {
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ log = os_log_create("com.livecontainer.stage", "guest"); });
+    return log;
+}
 
 UIInterfaceOrientation LCOrientationLock = UIInterfaceOrientationUnknown;
 NSMutableArray<NSString*>* LCSupportedUrlSchemes = nil;
@@ -131,7 +140,7 @@ static NSString *LCGuestResolveDataUUID(void) {
                       options:AVAudioSessionCategoryOptionMixWithOthers
                         error:&error]
         || ![session setActive:YES error:&error]) {
-        NSLog(@"[LCStage][保活] guest %@ 音频会话失败，2 秒后重试: %@", LCGuestDataUUID, error);
+        os_log_error(LCGuestStageLog(), "[LCStage][keepalive] guest %{public}@ audio session failed, retry in 2s: %{public}@", LCGuestDataUUID, error);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self.wantsRunning) { [self startLocked]; }
@@ -154,7 +163,7 @@ static NSString *LCGuestResolveDataUUID(void) {
     }
     [engine connect:player to:engine.mainMixerNode format:format];
     if (![engine startAndReturnError:&error]) {
-        NSLog(@"[LCStage][保活] guest %@ 引擎启动失败，2 秒后重试: %@", LCGuestDataUUID, error);
+        os_log_error(LCGuestStageLog(), "[LCStage][keepalive] guest %{public}@ engine start failed, retry in 2s: %{public}@", LCGuestDataUUID, error);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self.wantsRunning) { [self startLocked]; }
@@ -167,7 +176,7 @@ static NSString *LCGuestResolveDataUUID(void) {
     self.player = player;
     self.running = YES;
     [self registerObservers];
-    NSLog(@"[LCStage][保活] guest %@ 静音音轨已启动", LCGuestDataUUID);
+    os_log_info(LCGuestStageLog(), "[LCStage][keepalive] guest %{public}@ silent track started", LCGuestDataUUID);
 }
 
 - (void)stopLockedDeactivating:(BOOL)deactivate {
@@ -185,7 +194,7 @@ static NSString *LCGuestResolveDataUUID(void) {
                                      withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
                                            error:nil];
     }
-    NSLog(@"[LCStage][保活] guest %@ 静音音轨已停止（释放会话=%@）", LCGuestDataUUID,
+    os_log_info(LCGuestStageLog(), "[LCStage][keepalive] guest %{public}@ silent track stopped (deactivate=%{public}@)", LCGuestDataUUID,
           deactivate ? @"是" : @"否");
 }
 
@@ -199,7 +208,7 @@ static NSString *LCGuestResolveDataUUID(void) {
         typeof(self) self = weakSelf;
         NSUInteger type = [note.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
         if (type == AVAudioSessionInterruptionTypeBegan) {
-            NSLog(@"[LCStage][保活] guest %@ 被中断，结束后自动续播", LCGuestDataUUID);
+            os_log_info(LCGuestStageLog(), "[LCStage][keepalive] guest %{public}@ interrupted, will resume", LCGuestDataUUID);
         } else if (type == AVAudioSessionInterruptionTypeEnded) {
             // Tear the graph down and reconcile; startLocked re-activates the session and engine.
             [self hardRestart];
@@ -209,7 +218,7 @@ static NSString *LCGuestResolveDataUUID(void) {
         [NSNotificationCenter.defaultCenter addObserverForName:AVAudioSessionMediaServicesWereResetNotification
                                                         object:nil queue:NSOperationQueue.mainQueue
                                                     usingBlock:^(NSNotification *note) {
-        NSLog(@"[LCStage][保活] guest %@ 媒体服务重置，重建引擎", LCGuestDataUUID);
+        os_log_info(LCGuestStageLog(), "[LCStage][keepalive] guest %{public}@ media reset, rebuilding engine", LCGuestDataUUID);
         [weakSelf hardRestart];
     }];
 }
@@ -337,7 +346,7 @@ static NSData *LCGuestRenderBackdropGrid(UIView *view) {
 @interface LCFrameReadySignaler : NSObject
 @property(nonatomic, strong) CADisplayLink *link;
 @property(nonatomic, assign) NSInteger ticks;
-@property(nonatomic, assign) NSInteger goodFrames;
+@property(nonatomic, assign) NSInteger nextSampleTick;
 @property(nonatomic, assign) CFAbsoluteTime armedAt;
 @property(nonatomic, assign) BOOL done;
 + (instancetype)shared;
@@ -362,7 +371,7 @@ static NSData *LCGuestRenderBackdropGrid(UIView *view) {
     [self.link invalidate];
     self.link = nil;
     self.ticks = 0;
-    self.goodFrames = 0;
+    self.nextSampleTick = 4;
     self.done = NO;
     self.armedAt = CFAbsoluteTimeGetCurrent();
     self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
@@ -380,22 +389,35 @@ static NSData *LCGuestRenderBackdropGrid(UIView *view) {
 - (void)tick:(CADisplayLink *)link {
     if (self.done) { return; }
     self.ticks += 1;
-    if (self.ticks % 2 != 0) { return; }  // sample every 2nd tick
+
+    // Adaptive sampling: the FIRST tick samples immediately (16ms) so a normal app lifts its cover
+    // as soon as its first frame is on screen. If that first sample is a pure-black empty system
+    // buffer, we back off instead of re-rendering the whole window every 32ms: sample again at
+    // nextSampleTick. The render is a small 24x24 RGBA buffer (was 40x40).
+    BOOL shouldSample = NO;
+    if (self.ticks == 1) {
+        shouldSample = YES;
+    } else if (self.ticks >= self.nextSampleTick) {
+        shouldSample = YES;
+    }
+    if (!shouldSample) {
+        if (CFAbsoluteTimeGetCurrent() - self.armedAt > 3.0) {
+            [self finishWithReason:@"3s backstop"];
+        }
+        return;
+    }
 
     CGFloat mean = 0, std = 0;
-    if (LCGuestRenderLumaStats(LCGuestKeyWindow(), 40, &mean, &std)) {
+    if (LCGuestRenderLumaStats(LCGuestKeyWindow(), 24, &mean, &std)) {
         if (mean > 0.02 || std > 0.01) {
-            self.goodFrames += 1;
-        } else {
-            self.goodFrames = 0;
-        }
-        if (self.goodFrames >= 2) {
-            [self finishWithReason:[NSString stringWithFormat:@"亮度=%.3f 噪点=%.3f", mean, std]];
+            [self finishWithReason:[NSString stringWithFormat:@"luma=%.3f noise=%.3f", mean, std]];
             return;
         }
     }
+    self.nextSampleTick = self.ticks + 6;
+
     if (CFAbsoluteTimeGetCurrent() - self.armedAt > 3.0) {
-        [self finishWithReason:[NSString stringWithFormat:@"3s 兜底（亮度=%.3f 噪点=%.3f）", mean, std]];
+        [self finishWithReason:[NSString stringWithFormat:@"3s backstop (luma=%.3f noise=%.3f)", mean, std]];
     }
 }
 
@@ -506,7 +528,7 @@ static void UIKitGuestHooksInit() {
 
     // Restart evidence for the host's [LCStage][场景] logs: one bump per process lifetime.
     LCStageGuestBumpLaunchCount(LCGuestDataUUID);
-    NSLog(@"[LCStage][场景] guest 进程启动 uuid=%@ pid=%d launchCount=%ld",
+    os_log_info(LCGuestStageLog(), "[LCStage][scene] guest launched uuid=%{public}@ pid=%d launchCount=%ld",
           LCGuestDataUUID, NSProcessInfo.processInfo.processIdentifier,
           (long)LCStageHostGuestLaunchCount(LCGuestDataUUID));
     // Lifecycle masking hooks are installed unconditionally but only act while a stage is active
@@ -758,7 +780,7 @@ static void LCStageStopBackdropCallback(CFNotificationCenterRef center, void *ob
         }
         if (promoteRequested) {
             LCStageRequestPromote(LCGuestDataUUID);
-            NSLog(@"[LCStage][触摸] 副窗触摸序列已隔离，请求提升该窗口（uuid=%@）", LCGuestDataUUID);
+            os_log_debug(LCGuestStageLog(), "[LCStage][touch] side-window touch quarantined, requesting promotion (uuid=%{public}@)", LCGuestDataUUID);
         }
 
         // Decide over EVERY touch of THIS event, including endings (mirrors the host-side hook):

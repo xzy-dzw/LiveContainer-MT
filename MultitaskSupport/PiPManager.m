@@ -7,6 +7,7 @@
 #include "PiPManager.h"
 #include "AppSceneViewController.h"
 #include "DecoratedAppSceneViewController.h"
+#include "LCStageLog.h"
 #include "../LiveContainer/utils.h"
 
 API_AVAILABLE(ios(16.0))
@@ -18,13 +19,19 @@ API_AVAILABLE(ios(16.0))
 @end
 
 
+/// Static context pointer for the bounds KVO on pipVideoCallViewController.view.layer, used to
+/// disambiguate from any other KVO registrations and to make add/remove pairing safe.
+static int const LCPiPBoundsKVOContext = 0;
+
 @implementation PiPManager
 API_AVAILABLE(ios(16.0))
 static PiPManager* sharedInstance = nil;
 
 + (instancetype)shared {
-    if(!sharedInstance)
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
         sharedInstance = [[self alloc] init];
+    });
     return sharedInstance;
 }
 
@@ -45,9 +52,9 @@ static PiPManager* sharedInstance = nil;
 }
 
 - (instancetype)init {
-    NSError* error = nil;
-    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&error];
-    [[AVAudioSession sharedInstance] setActive:YES withOptions:1 error:&error];
+    // Do NOT touch AVAudioSession here. PiP is used as a background keep-alive channel: the audio
+    // session must only be activated while a PiP is actually running (see WillStart/DidStop below),
+    // so merely touching the manager to read state never interrupts the user's own audio playback.
     return self;
 }
 
@@ -57,7 +64,9 @@ static PiPManager* sharedInstance = nil;
         [self.displayingDecoratedVC unminimizeWindowPiP];
         [self pictureInPictureControllerDidStopPictureInPicture:self.pipController];
     }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)([self.pipController isPictureInPictureActive] * 0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // If a PiP is still tearing down, give it a moment to finish before starting the next one.
+    NSTimeInterval delay = [self.pipController isPictureInPictureActive] ? 0.3 : 0.0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         self.displayingVC = vc;
         self.pipVideoCallViewController = [AVPictureInPictureVideoCallViewController new];
         self.pipVideoCallViewController.preferredContentSize = vc.view.bounds.size;
@@ -96,10 +105,24 @@ static PiPManager* sharedInstance = nil;
         self.displayingVC.contentView.frame = CGRectMake(0, 0, self.displayingVC.view.bounds.size.width, self.displayingVC.view.bounds.size.height);
     }
     [self.pipVideoCallViewController.view addSubview:self.pipVideoCallContentView];
+
+    // Activate the Playback audio session ONLY now that a PiP is actually starting: this is the
+    // keep-alive channel that lets the host stay running in the background. It is torn down in
+    // DidStop. Never touched while PiP is idle, so ordinary music playback is unaffected.
+    NSError *activationError = nil;
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:&activationError];
+    [[AVAudioSession sharedInstance] setActive:YES withOptions:1 error:&activationError];
+
+    // Idempotent KVO pairing: remove any stale observer from a previous run before adding the
+    // fresh one, so a second PiP never stacks observeValue callbacks. The layer may be brand new
+    // (first PiP), so the remove is wrapped in @try.
+    @try {
+        [self.pipVideoCallViewController.view.layer removeObserver:self forKeyPath:@"bounds" context:&LCPiPBoundsKVOContext];
+    } @catch (NSException * __unused exception) {}
     [self.pipVideoCallViewController.view.layer addObserver:self
                                 forKeyPath:@"bounds"
                                    options:NSKeyValueObservingOptionNew
-                                   context:NULL];
+                                   context:&LCPiPBoundsKVOContext];
     self.pipVideoCallViewController.preferredContentSize = self.displayingVC.view.bounds.size;
     [self.displayingVC setBackgroundNotificationEnabled:false];
     self.displayingVC.shouldIgnoreSceneUpdates = YES;
@@ -117,6 +140,15 @@ static PiPManager* sharedInstance = nil;
 }
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)pictureInPictureController {
+    // Always pair the bounds KVO registration, even if the layer changed between start and stop.
+    @try {
+        [self.pipVideoCallViewController.view.layer removeObserver:self forKeyPath:@"bounds" context:&LCPiPBoundsKVOContext];
+    } @catch (NSException * __unused exception) {}
+
+    // Release the keep-alive audio session now that PiP is no longer running.
+    NSError *deactivationError = nil;
+    [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:&deactivationError];
+
     [self.displayingVC.view insertSubview:self.displayingVC.contentView atIndex:0];
     [self.displayingVC setBackgroundNotificationEnabled:true];
     // resize if needed (eg orientation differs)
@@ -131,7 +163,7 @@ static PiPManager* sharedInstance = nil;
 }
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)pictureInPictureController failedToStartPictureInPictureWithError:(NSError *)error {
-    NSLog(@"%@", error.description);
+    os_log_error(LCStageLog(), "[LCStage][PiP] 启动失败: %{public}@", error.description);
 }
 
 - (void)observeValueForKeyPath:(NSString*)keyPath ofObject:(NSObject*)object change:(NSDictionary<NSString *,id> *) change context:(void *) context {

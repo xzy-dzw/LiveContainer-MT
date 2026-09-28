@@ -8,6 +8,14 @@
 import Foundation
 import Darwin
 
+import OSLog
+
+// Unified asynchronous stage logger (replaces synchronous NSLog on the main thread).
+private let LCStageOSLog = Logger(subsystem: "com.livecontainer.stage", category: "stage")
+private func LCSLog(_ message: String) {
+    LCStageOSLog.info("\(message, privacy: .public)")
+}
+
 enum MultitaskMode : Int {
     case virtualWindow = 0
     case nativeWindow = 1
@@ -98,10 +106,10 @@ enum MultitaskMode : Int {
             // while the old guest is still alive would let the next launch mount the same data
             // container twice, causing 0xdead10cc jetsams or data corruption. Let the caller
             // surface the failure instead of double-opening the container.
-            NSLog("[LCStage] 无法向孤儿 guest 进程 pid=%d 发送信号（errno=%d），保留容器锁以防双开", pid, errno)
+            LCSLog("[LCStage] 无法向孤儿 guest 进程 pid=\(pid) 发送信号（errno=\(errno)），保留容器锁以防双开")
             return false
         }
-        NSLog("[LCStage] reaping orphaned guest pid=%d holding container %@", pid, container)
+        LCSLog("[LCStage] reaping orphaned guest pid=\(pid) holding container \(container)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
             guard isLiveProcessExecutable(pid: pid) else { return }
             kill(pid, SIGKILL)

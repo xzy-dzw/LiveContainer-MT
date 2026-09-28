@@ -9,7 +9,19 @@
 
 @implementation VirtualWindowsHostView
 - (instancetype)init {
-    CGRect frame = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).keyWindow.bounds;
+    // Resolve a key window bounds defensively: this view may be created before any UIWindowScene
+    // exists (e.g. very early launch), and the previous cast to connectedScenes.anyObject crashed
+    // when the first scene wasn't a UIWindowScene or when there were no scenes at all.
+    CGRect frame = CGRectZero;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            if (windowScene.keyWindow) {
+                frame = windowScene.keyWindow.bounds;
+                break;
+            }
+        }
+    }
     self = [super initWithFrame:frame];
     self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     // The stage is its own page rather than an overlay on the app list, so it paints an opaque

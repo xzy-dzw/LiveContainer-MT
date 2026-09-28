@@ -12,6 +12,14 @@ import SwiftUI
 import UIKit
 import CoreText
 
+import OSLog
+
+// Unified asynchronous stage logger (replaces synchronous NSLog on the main thread).
+private let LCStageOSLog = Logger(subsystem: "com.livecontainer.stage", category: "stage")
+private func LCSLog(_ message: String) {
+    LCStageOSLog.info("\(message, privacy: .public)")
+}
+
 // MARK: - Geometry
 
 @objc class MultitaskStageLayout: NSObject {
@@ -245,9 +253,9 @@ enum MultitaskStageFont {
             if let name = firstResolvableCandidate() {
                 return name
             }
-            NSLog("[LCStage] BlenderPro-Bold 注册/解析失败：\(error?.takeRetainedValue().localizedDescription ?? "未知错误")；已安装含 Blender 的字体族：\(UIFont.familyNames.filter { $0.localizedCaseInsensitiveContains("blender") })")
+            LCSLog("[LCStage] BlenderPro-Bold 注册/解析失败：\(error?.takeRetainedValue().localizedDescription ?? "未知错误")；已安装含 Blender 的字体族：\(UIFont.familyNames.filter { $0.localizedCaseInsensitiveContains("blender") })")
         } else {
-            NSLog("[LCStage] 未在 App 包内找到 BlenderPro-Bold.ttf，FPS 字体回退系统字体；已安装含 Blender 的字体族：\(UIFont.familyNames.filter { $0.localizedCaseInsensitiveContains("blender") })")
+            LCSLog("[LCStage] 未在 App 包内找到 BlenderPro-Bold.ttf，FPS 字体回退系统字体；已安装含 Blender 的字体族：\(UIFont.familyNames.filter { $0.localizedCaseInsensitiveContains("blender") })")
         }
         return nil
     }()
@@ -682,10 +690,10 @@ final class MultitaskStageGlassButton: UIButton {
         windowStart = 0
         lastShownValue = nil
         let link = CADisplayLink(target: self, selector: #selector(sampleTick))
-        // Ask for the display's whole range instead of the default 60Hz ceiling. On a ProMotion
-        // phone this is what lets the stage run at up to 120Hz; the 60 floor is for the stage's
-        // lifetime only, so an idle launcher isn't pinned to a high refresh rate.
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        // Intentionally do NOT set preferredFrameRateRange: the counter only needs timestamp deltas
+        // to count frames, and pinning minimum:60 / preferred:120 here would force the whole display
+        // to stay on ProMotion high refresh for the stage's lifetime even while idle. Leaving it
+        // unset lets the system's VRR drop the refresh rate when nothing is animating.
         // .common so the readout keeps sampling while the dock is scrolled or a window dragged.
         link.add(to: .main, forMode: .common)
         self.link = link

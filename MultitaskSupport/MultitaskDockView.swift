@@ -15,6 +15,14 @@ import AVKit
 import CoreMedia
 import CoreLocation
 
+import OSLog
+
+// Unified asynchronous stage logger (replaces synchronous NSLog on the main thread).
+private let LCStageOSLog = Logger(subsystem: "com.livecontainer.stage", category: "stage")
+private func LCSLog(_ message: String) {
+    LCStageOSLog.info("\(message, privacy: .public)")
+}
+
 // MARK: - App Info Provider
 class AppInfoProvider {
     
@@ -22,11 +30,14 @@ class AppInfoProvider {
     
     private var infoCacheByUUID = [String: LCAppInfo]()
     private var infoCacheByName = [String: LCAppInfo]()
+    // Insertion-order bookkeeping so overflow evicts the OLDEST entry instead of nuking the whole
+    // cache (which forced a full disk re-read on the next lookup for every app).
+    private var uuidOrder: [String] = []
+    private var nameOrder: [String] = []
     private let cacheQueue = DispatchQueue(label: "com.livecontainer.appinfoprovider.cachequeue", attributes: .concurrent)
 
     /// Coarse upper bound on each cache dictionary. Entries otherwise accumulate forever as
-    /// apps are installed/removed. On overflow we drop the whole dictionary (it rebuilds
-    /// lazily from disk on the next lookup) instead of maintaining a real LRU list.
+    /// apps are installed/removed. On overflow we evict the oldest entry, not the whole cache.
     private static let maxCacheCount = 64
 
     private init() {}
@@ -61,8 +72,12 @@ class AppInfoProvider {
                let appInfo = LCAppInfo(bundlePath: bundlePath) {
                 
                 cacheQueue.async(flags: .barrier) {
-                    if self.infoCacheByUUID[dataUUID] == nil && self.infoCacheByUUID.count >= Self.maxCacheCount {
-                        self.infoCacheByUUID.removeAll()
+                    if self.infoCacheByUUID[dataUUID] == nil {
+                        if self.infoCacheByUUID.count >= Self.maxCacheCount, let oldest = self.uuidOrder.first {
+                            self.infoCacheByUUID.removeValue(forKey: oldest)
+                            self.uuidOrder.removeFirst()
+                        }
+                        self.uuidOrder.append(dataUUID)
                     }
                     self.infoCacheByUUID[dataUUID] = appInfo
                 }
@@ -91,8 +106,12 @@ class AppInfoProvider {
             for appDir in appDirs where appDir.hasSuffix(".app") {
                 if let appInfo = LCAppInfo(bundlePath: "\(appsPath)/\(appDir)"), appInfo.displayName() == appName {
                     cacheQueue.async(flags: .barrier) {
-                        if self.infoCacheByName[appName] == nil && self.infoCacheByName.count >= Self.maxCacheCount {
-                            self.infoCacheByName.removeAll()
+                        if self.infoCacheByName[appName] == nil {
+                            if self.infoCacheByName.count >= Self.maxCacheCount, let oldest = self.nameOrder.first {
+                                self.infoCacheByName.removeValue(forKey: oldest)
+                                self.nameOrder.removeFirst()
+                            }
+                            self.nameOrder.append(appName)
                         }
                         self.infoCacheByName[appName] = appInfo
                     }
@@ -204,9 +223,9 @@ private final class StageAudioKeepAlive {
             self.player = player
             self.isRunning = true
             registerObservers()
-            NSLog("[LCStage][保活] 宿主静音音轨已启动（playback/mixWithOthers）")
+            LCSLog("[LCStage][保活] 宿主静音音轨已启动（playback/mixWithOthers）")
         } catch {
-            NSLog("[LCStage][保活] 宿主静音音轨启动失败，2 秒后重试: \(error)")
+            LCSLog("[LCStage][保活] 宿主静音音轨启动失败，2 秒后重试: \(error)")
             scheduleRetry()
         }
     }
@@ -221,7 +240,7 @@ private final class StageAudioKeepAlive {
         if isRunning {
             isRunning = false
             try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-            NSLog("[LCStage][保活] 宿主静音音轨已停止")
+            LCSLog("[LCStage][保活] 宿主静音音轨已停止")
         }
     }
 
@@ -240,18 +259,18 @@ private final class StageAudioKeepAlive {
             let raw = (note.userInfo?[AVAudioSessionInterruptionTypeKey] as? NSNumber)?.uintValue
             let typeValue = raw.flatMap(AVAudioSession.InterruptionType.init(rawValue:))
             if typeValue == .began {
-                NSLog("[LCStage][保活] 音频会话被中断（来电/Siri 等），等待结束后续播")
+                LCSLog("[LCStage][保活] 音频会话被中断（来电/Siri 等），等待结束后续播")
                 self.player?.pause()
             } else if typeValue == .ended {
                 let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? NSNumber)
                     .map { AVAudioSession.InterruptionOptions(rawValue: $0.uintValue) } ?? []
-                NSLog("[LCStage][保活] 中断结束，恢复静音音轨（shouldResume=\(options.contains(.shouldResume))）")
+                LCSLog("[LCStage][保活] 中断结束，恢复静音音轨（shouldResume=\(options.contains(.shouldResume))）")
                 // Restart unconditionally: our own audio must resume regardless of the option.
                 self.hardRestart()
             }
         })
         observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
-            NSLog("[LCStage][保活] 系统媒体服务重置，重建静音音轨")
+            LCSLog("[LCStage][保活] 系统媒体服务重置，重建静音音轨")
             self?.hardRestart()
         })
         observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
@@ -260,7 +279,7 @@ private final class StageAudioKeepAlive {
             if reason == AVAudioSession.RouteChangeReason.newDeviceAvailable.rawValue
                 || reason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue
                 || reason == AVAudioSession.RouteChangeReason.wakeFromSleep.rawValue {
-                NSLog("[LCStage][保活] 音频路由变化（reason=\(reason)），确认音轨仍在播放")
+                LCSLog("[LCStage][保活] 音频路由变化（reason=\(reason)），确认音轨仍在播放")
                 if self.engine?.isRunning != true { self.hardRestart() }
             }
         })
@@ -315,7 +334,7 @@ private final class StageLocationKeepAlive: NSObject {
         guard !isArmed else { return }
         isArmed = true
         guard CLLocationManager.locationServicesEnabled() else {
-            NSLog("[LCStage][保活] 定位通道待命，但系统定位服务未开启（音轨+PiP 继续兜底）")
+            LCSLog("[LCStage][保活] 定位通道待命，但系统定位服务未开启（音轨+PiP 继续兜底）")
             return
         }
         manager.desiredAccuracy = kCLLocationAccuracyBest
@@ -329,12 +348,12 @@ private final class StageLocationKeepAlive: NSObject {
             // First stage entry: ask for Always directly. iOS may grant WhenInUse first and
             // re-prompt for Always later; didChangeAuthorization starts updates for either.
             manager.requestAlwaysAuthorization()
-            NSLog("[LCStage][保活] 定位通道请求「始终允许」权限")
+            LCSLog("[LCStage][保活] 定位通道请求「始终允许」权限")
         case .authorizedAlways, .authorizedWhenInUse:
             manager.startUpdatingLocation()
-            NSLog("[LCStage][保活] 定位通道已启动（\(manager.authorizationStatus == .authorizedAlways ? "始终" : "使用期间")）")
+            LCSLog("[LCStage][保活] 定位通道已启动（\(manager.authorizationStatus == .authorizedAlways ? "始终" : "使用期间")）")
         case .restricted, .denied:
-            NSLog("[LCStage][保活] 定位权限被拒绝，定位通道不可用（音轨+PiP 继续兜底）")
+            LCSLog("[LCStage][保活] 定位权限被拒绝，定位通道不可用（音轨+PiP 继续兜底）")
         @unknown default:
             manager.requestAlwaysAuthorization()
         }
@@ -344,7 +363,7 @@ private final class StageLocationKeepAlive: NSObject {
         guard isArmed else { return }
         isArmed = false
         manager.stopUpdatingLocation()
-        NSLog("[LCStage][保活] 定位通道已关闭")
+        LCSLog("[LCStage][保活] 定位通道已关闭")
     }
 
     // Coordinates are irrelevant — the delegate only exists to drive the session lifecycle.
@@ -354,9 +373,9 @@ private final class StageLocationKeepAlive: NSObject {
         case .authorizedAlways, .authorizedWhenInUse:
             // startUpdatingLocation is idempotent; this also covers the WhenInUse → Always upgrade.
             manager.startUpdatingLocation()
-            NSLog("[LCStage][保活] 定位权限变为已授权，定位通道启动")
+            LCSLog("[LCStage][保活] 定位权限变为已授权，定位通道启动")
         case .denied, .restricted:
-            NSLog("[LCStage][保活] 定位权限被关闭，定位通道失效（音轨+PiP 继续兜底）")
+            LCSLog("[LCStage][保活] 定位权限被关闭，定位通道失效（音轨+PiP 继续兜底）")
         default: break
         }
     }
@@ -373,7 +392,7 @@ extension StageLocationKeepAlive: CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         // Transient errors (no fix available etc.) must not stop the session; the manager keeps
         // trying and the background assertion stands.
-        NSLog("[LCStage][保活] 定位回调错误（不影响保活会话）: \(error)")
+        LCSLog("[LCStage][保活] 定位回调错误（不影响保活会话）: \(error)")
     }
 }
 
@@ -427,7 +446,7 @@ private final class StagePiPKeepAlive: NSObject {
     func arm() {
         guard isSupported, !isArmed else { return }
         isArmed = true
-        NSLog("[LCStage][保活] PiP 第二通道已待命（黑帧 1fps，退后台自动开小窗）")
+        LCSLog("[LCStage][保活] PiP 第二通道已待命（黑帧 1fps，退后台自动开小窗）")
     }
 
     /// Mounts the 1pt black layer into the stage window. Idempotent across layout passes and
@@ -464,7 +483,7 @@ private final class StagePiPKeepAlive: NSObject {
         retriesLeft = 0
         pipController?.stopPictureInPicture()
         teardownViews()
-        NSLog("[LCStage][保活] PiP 第二通道已关闭")
+        LCSLog("[LCStage][保活] PiP 第二通道已关闭")
     }
 
     /// Called at host willResignActive: the automatic-from-inline mechanism normally opens PiP by
@@ -566,7 +585,7 @@ private final class StagePiPKeepAlive: NSObject {
             guard let self, self.isArmed else { return }
             if let pip = self.pipController, !pip.isPictureInPictureActive {
                 if pip.isPictureInPicturePossible {
-                    NSLog("[LCStage][保活] PiP 被挤掉，尝试重拉（剩余 \(self.retriesLeft) 次）")
+                    LCSLog("[LCStage][保活] PiP 被挤掉，尝试重拉（剩余 \(self.retriesLeft) 次）")
                     pip.startPictureInPicture()
                 } else if self.retriesLeft > 0 {
                     // Transition still settling: consume one slot and try again later. Total
@@ -585,12 +604,12 @@ private final class StagePiPKeepAlive: NSObject {
 extension StagePiPKeepAlive: AVPictureInPictureControllerDelegate {
     func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
         retriesLeft = 0
-        NSLog("[LCStage][保活] PiP 小窗已启动，第二通道断言生效")
+        LCSLog("[LCStage][保活] PiP 小窗已启动，第二通道断言生效")
     }
 
     func pictureInPictureController(_ controller: AVPictureInPictureController,
                                     failedToStartPictureInPictureWithError error: Error) {
-        NSLog("[LCStage][保活] PiP 启动失败（音频通道仍在兜底）: \(error)")
+        LCSLog("[LCStage][保活] PiP 启动失败（音频通道仍在兜底）: \(error)")
     }
 
     func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
@@ -645,6 +664,14 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     }
 
     @objc public var windowHostingView = VirtualWindowsHostView()
+
+    /// Fast-path gate for the host-side sendEvent hook (UIKitHooks.m). Returns YES only when the
+    /// stage is actually up with at least one side window that could intercept touches. The hook
+    /// reads this on every touch event; when NO it forwards straight to the original implementation
+    /// without touching the quarantine hash table.
+    @objc public var lcIsInterceptingTouches: Bool {
+        return isStagePresented && !isStageCollapsed && apps.count >= 2
+    }
 
     private var dockHost: UIHostingController<AnyView>?
     /// The four fixed glass controls, mounted directly on the key window:
@@ -1023,16 +1050,20 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
                 // Corner, border and frame all change in the same block so the layer animates
                 // the radius instead of snapping it the moment fullscreen toggles.
                 view.layer.cornerCurve = .continuous
+                // Only re-write layer properties when they actually change: during a drag the
+                // animation block runs every frame, and re-resolving UIColor.separator.cgColor
+                // plus re-assigning identical cornerRadius/borderWidth/maskedCorners is pure
+                // Core Animation bookkeeping. We stash the last-applied values on the view itself.
+                let wantRadius: CGFloat = fullscreen ? 0 : MultitaskStageLayout.cornerRadius
+                let wantCorners: CACornerMask = fullscreen
+                    ? MultitaskStageLayout.allCorners
+                    : MultitaskStageLayout.maskedCorners(index, count: count)
+                let wantBorder: CGFloat = fullscreen ? 0 : MultitaskStageLayout.hairline
+                if view.layer.cornerRadius != wantRadius { view.layer.cornerRadius = wantRadius }
+                if view.layer.maskedCorners != wantCorners { view.layer.maskedCorners = wantCorners }
+                if view.layer.borderWidth != wantBorder { view.layer.borderWidth = wantBorder }
+                // borderColor stays per-layout: separator is a dynamic color that must follow dark/light mode.
                 view.layer.borderColor = UIColor.separator.cgColor
-                if fullscreen {
-                    view.layer.cornerRadius = 0
-                    view.layer.maskedCorners = MultitaskStageLayout.allCorners
-                    view.layer.borderWidth = 0
-                } else {
-                    view.layer.cornerRadius = MultitaskStageLayout.cornerRadius
-                    view.layer.maskedCorners = MultitaskStageLayout.maskedCorners(index, count: count)
-                    view.layer.borderWidth = MultitaskStageLayout.hairline
-                }
             }
 
             // The main window has to end up frontmost, so front the slots back to front.
@@ -1656,34 +1687,40 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     // its own copy of the buffer) therefore stays runnable while backgrounded/locked, which is
     // what keeps jetsam from collecting the side windows.
 
+    // Cached keep-alive toggles. These are only written from the settings page (which calls
+    // applyKeepAliveSettings) or on stage entry, so we read them once into ivars instead of
+    // hitting NSUserDefaults on every watchdog tick / touch interception.
+    private var cachedKeepAliveAudio = false
+    private var cachedKeepAlivePiP = false
+    private var cachedKeepAliveLocation = true
+    private var cachedScenePinning = true
+
+    /// Re-read every keep-alive toggle from App Group defaults into the cache. Called on stage
+    /// entry and by the settings toggles.
+    private func refreshKeepAliveCache() {
+        let defaults = LCUtils.appGroupUserDefault
+        cachedKeepAliveAudio = (defaults.object(forKey: LCStageIPCKeepAliveAudioKey) != nil)
+            && defaults.bool(forKey: LCStageIPCKeepAliveAudioKey)
+        cachedKeepAlivePiP = (defaults.object(forKey: LCStageIPCPiPKeepAliveKey) != nil)
+            && defaults.bool(forKey: LCStageIPCPiPKeepAliveKey)
+        cachedKeepAliveLocation = (defaults.object(forKey: LCStageIPCLocationKeepAliveKey) == nil)
+            || defaults.bool(forKey: LCStageIPCLocationKeepAliveKey)
+        cachedScenePinning = (defaults.object(forKey: LCStageIPCPinningKey) == nil)
+            || defaults.bool(forKey: LCStageIPCPinningKey)
+    }
+
     /// User toggle from the multitask settings page (App Group so guests read the same key).
     /// v4.1.2: backup channel — a missing key defaults to OFF.
-    private var keepAliveAudioEnabled: Bool {
-        let defaults = LCUtils.appGroupUserDefault
-        if defaults.object(forKey: LCStageIPCKeepAliveAudioKey) == nil { return false }
-        return defaults.bool(forKey: LCStageIPCKeepAliveAudioKey)
-    }
+    private var keepAliveAudioEnabled: Bool { cachedKeepAliveAudio }
 
     /// PiP second-channel toggle (App Group). v4.1.2: backup channel — a missing key defaults to OFF.
-        private var scenePinningEnabled: Bool {
-        let defaults = LCUtils.appGroupUserDefault
-        if defaults.object(forKey: LCStageIPCPinningKey) == nil { return true }
-        return defaults.bool(forKey: LCStageIPCPinningKey)
-    }
+    private var scenePinningEnabled: Bool { cachedScenePinning }
 
-private var keepAlivePiPEnabled: Bool {
-        let defaults = LCUtils.appGroupUserDefault
-        if defaults.object(forKey: LCStageIPCPiPKeepAliveKey) == nil { return false }
-        return defaults.bool(forKey: LCStageIPCPiPKeepAliveKey)
-    }
+    private var keepAlivePiPEnabled: Bool { cachedKeepAlivePiP }
 
     /// Continuous-location primary-channel toggle (App Group). Missing key defaults to ON. Location is the
     /// only channel on by default as of v4.1.2.
-    private var keepAliveLocationEnabled: Bool {
-        let defaults = LCUtils.appGroupUserDefault
-        if defaults.object(forKey: LCStageIPCLocationKeepAliveKey) == nil { return true }
-        return defaults.bool(forKey: LCStageIPCLocationKeepAliveKey)
-    }
+    private var keepAliveLocationEnabled: Bool { cachedKeepAliveLocation }
 
     /// One-time v4.1.2 migration: existing users ran audio + PiP + location. Real-device testing
     /// proved location alone sufficient, so the first launch after upgrade explicitly turns the other two OFF
@@ -1697,13 +1734,14 @@ private var keepAlivePiPEnabled: Bool {
         defaults.set(true, forKey: LCStageIPCLocationKeepAliveKey)
         defaults.set(true, forKey: markerKey)
         defaults.synchronize()
-        NSLog("[LCStage][保活] v4.1.2 一次性迁移：仅保留定位通道，宿主音轨/PiP/副窗音轨默认关闭（代码保留可随时重新开启）")
+        LCSLog("[LCStage][保活] v4.1.2 一次性迁移：仅保留定位通道，宿主音轨/PiP/副窗音轨默认关闭（代码保留可随时重新开启）")
     }
 
     /// Called by the settings toggles while a stage is live: start/stop each channel immediately
     /// instead of waiting for the next stage entry.
     @objc func applyKeepAliveSettings() {
         guard isKeepAliveActive else { return }
+        refreshKeepAliveCache()
         if keepAliveAudioEnabled {
             StageAudioKeepAlive.shared.start()
         } else {
@@ -1726,6 +1764,7 @@ private var keepAlivePiPEnabled: Bool {
         guard isKeepAliveActive != active else { return }
         isKeepAliveActive = active
         if active {
+            refreshKeepAliveCache()
             UIApplication.shared.isIdleTimerDisabled = true
             // Layered lifecycle, weakest to strongest; each layer is independent, so any native
             // interruption can only knock out one at a time:
@@ -1748,14 +1787,14 @@ private var keepAlivePiPEnabled: Bool {
             } else {
                 StageLocationKeepAlive.shared.disarm()
             }
-            NSLog("[LCStage][保活] 舞台保活已激活（定位=\(keepAliveLocationEnabled)，音轨=\(keepAliveAudioEnabled)，PiP=\(keepAlivePiPEnabled)）")
+            LCSLog("[LCStage][保活] 舞台保活已激活（定位=\(keepAliveLocationEnabled)，音轨=\(keepAliveAudioEnabled)，PiP=\(keepAlivePiPEnabled)）")
         } else {
             UIApplication.shared.isIdleTimerDisabled = false
             StageAudioKeepAlive.shared.stop()
             StagePiPKeepAlive.shared.disarm()
             StageLocationKeepAlive.shared.disarm()
             endBackgroundTaskIfNeeded()
-            NSLog("[LCStage][保活] 舞台保活已关闭")
+            LCSLog("[LCStage][保活] 舞台保活已关闭")
         }
     }
 
@@ -1766,7 +1805,7 @@ private var keepAlivePiPEnabled: Bool {
         backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "LCStageBackground") { [weak self] in
             self?.endBackgroundTaskIfNeeded()
         }
-        NSLog("[LCStage][保活] 已申请后台过渡时间")
+        LCSLog("[LCStage][保活] 已申请后台过渡时间")
     }
 
     private func endBackgroundTaskIfNeeded() {
@@ -1778,8 +1817,11 @@ private var keepAlivePiPEnabled: Bool {
     /// Darwin callback from a guest that just rendered real frames. Reveals every staged card
     /// whose guest reported a newer frame-ready timestamp.
     @objc func handleGuestFrameReady() {
+        // One synchronize per watchdog tick instead of one per window (was 4x synchronous disk
+        // writes per second at 4 windows). Reads after this use the NoSync variant.
+        LCStageSharedDefaultsSync()
         for app in apps {
-            let readyAt = LCStageHostFrameReadyAt(app.appUUID)
+            let readyAt = LCStageHostFrameReadyAtNoSync(app.appUUID)
             guard readyAt > (lastFrameReadyAt[app.appUUID] ?? 0) else { continue }
             lastFrameReadyAt[app.appUUID] = readyAt
             // A real frame beat the 0.3s lazy cover to it: cancel the pending cover so the

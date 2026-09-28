@@ -219,6 +219,11 @@ struct MultitaskAppWindow: View {
         if isManual {
             didRequestManualClose = true
         }
+        // Drop the registry entry for this window so appDict doesn't accumulate dead UUIDs over
+        // many open/close cycles. openExistingAppWindow will return NO for a removed entry.
+        if let appInfo = appInfo {
+            MultitaskWindowManager.appDict.removeValue(forKey: appInfo.dataUUID)
+        }
         guard let session = sceneDelegate.window?.windowScene?.session else { return }
         UIApplication.shared.requestSceneSessionDestruction(session, options: nil) { error in
             print(error)

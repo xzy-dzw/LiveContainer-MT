@@ -259,6 +259,19 @@ static inline CFAbsoluteTime LCStageHostFrameReadyAt(NSString *guestUUID) {
     return [defaults doubleForKey:[LCStageIPCFrameReadyKeyPrefix stringByAppendingString:guestUUID]];
 }
 
+/// Host: reads a guest's frame-ready timestamp WITHOUT synchronizing. Call in a loop after a
+/// single synchronize to avoid N synchronous disk writes per watchdog tick.
+static inline CFAbsoluteTime LCStageHostFrameReadyAtNoSync(NSString *guestUUID) {
+    if (guestUUID.length == 0) { return 0; }
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    return [defaults doubleForKey:[LCStageIPCFrameReadyKeyPrefix stringByAppendingString:guestUUID]];
+}
+
+/// Host: one-shot synchronize of the shared defaults, call once before a batch of NoSync reads.
+static inline void LCStageSharedDefaultsSync(void) {
+    [LCStageSharedDefaults() synchronize];
+}
+
 /// Guest: bumps this container's monotonic launch counter and records the live pid. Runs exactly
 /// once per guest process start (TweakLoader constructor), so the counter doubles as restart
 /// evidence for the host's [LCStage][场景] logs.
