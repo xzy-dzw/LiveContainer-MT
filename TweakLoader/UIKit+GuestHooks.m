@@ -472,9 +472,10 @@ static NSSet<NSString *> *LCStageMaskedLifecycleNames(void) {
 static BOOL LCStageGuestHasActivatedOnce = NO;
 
 static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
-    // Foreground pinning / lifecycle masking removed: never suppress the guest's own lifecycle
-    // broadcasts (the "lock page state" feature is gone).
-    return NO;
+    if (name.length == 0 || ![LCStageMaskedLifecycleNames() containsObject:name]) { return NO; }
+    if (!LCStageGuestHasActivatedOnce) { return NO; }
+    if (!LCStageGuestPinningEnabled()) { return NO; }
+    return LCStageGuestIsStageActive();
 }
 
 @interface NSNotificationCenter (LCStageLifecycleMask)
@@ -499,6 +500,9 @@ static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
 
 @implementation UIScene (LCStageLifecycleMask)
 - (UISceneActivationState)hook_lc_activationState {
+    if (LCStageGuestPinningEnabled() && LCStageGuestIsStageActive()) {
+        return UISceneActivationStateForegroundActive;
+    }
     return [self hook_lc_activationState];
 }
 @end
@@ -588,58 +592,12 @@ static void UIKitGuestHooksInit() {
     }
 
 
-    // MARK: - Guest heartbeat for dead-window cleanup
-
-    // Every guest process writes a timestamp to the shared App Group once per second. The
-    // host MultitaskDockManager reads this in performLayout: any window whose heartbeat has
-    // not moved for 10+ seconds is considered crashed/dead and gets removed from the stage
-    // immediately, instead of lingering as a black screen until the user relaunches it.
-    // This is the single most reliable cleanup signal — exit callbacks are asynchronous
-    // and silently dropped when the system SIGKILLs the extension under memory pressure.
-    NSString *dataUUID = LCGuestDataUUID;
-    NSString *hbKey = [NSString stringWithFormat:@"LCGuestHeartbeat.%@", dataUUID.length ? dataUUID : @""];
-    // Beat once right now, before the timer: loading this dylib is itself the proof that the
-    // guest really launched the app (a guest that bailed out in LCBootstrap never gets here), and
-    // the host's watchdog must not have to wait a whole timer period to see that liveness.
-    NSUserDefaults *groupDefaults = [NSUserDefaults lcSharedDefaults];
-    [groupDefaults setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
-    [groupDefaults synchronize];
-    __block NSTimer *heartbeatTimer = nil;
-    // Use +weak reference so the timer block doesn't retain anything — if NSTimer ever holds
-    // strong references to non-UI objects we don't care; we just want to fire every second.
-    // timerWithTimeInterval: does NOT schedule itself on a runloop (unlike
-    // scheduledTimerWithTimeInterval:), so there is exactly one add — below, in common modes.
-    // This also stays correct if this constructor ever runs off the main thread.
-    heartbeatTimer = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *t) {
-        NSUserDefaults *group = [NSUserDefaults lcSharedDefaults];
-        // CFAbsoluteTimeGetCurrent() is a CoreFoundation primitive — no extra framework link
-        // required, unlike CACurrentMediaTime which lives in QuartzCore.
-        [group setDouble:CFAbsoluteTimeGetCurrent() forKey:hbKey];
-        [group synchronize];
-    }];
-    // The host allows 10s of silence before pruning, so the 1s cadence does not need to be exact:
-    // tolerance lets the system coalesce this wake-up with other timers and save battery.
-    heartbeatTimer.tolerance = 0.2;
-    [[NSRunLoop mainRunLoop] addTimer:heartbeatTimer forMode:NSRunLoopCommonModes];
-    NSLog(@"[LCGuestHeartbeat] started for %@ (key=%@)", dataUUID, hbKey);
-
     // MARK: - Backdrop luminance grid for adaptive control glyphs
     //
-    // The host cannot snapshot a hosted scene's cross-process content (it renders black), so the
-    // MAIN guest renders its own content into a coarse 16×12 luma grid twice per second. The host
-    // maps every stage control to the grid cell behind it and tints that control white on dark
-    // content / dark on light content — a mostly light app with a dark strip behind the controls
-    // no longer flips every glyph to the wrong colour. Side windows never sample (their glyphs
-    // are hidden); the cost is one 64×48 software render at 2Hz.
-    NSTimer *backdropGridTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-        if (!LCStageGuestIsMainWindow(LCGuestDataUUID)) { return; }
-        NSData *grid = LCGuestRenderBackdropGrid(LCGuestKeyWindow());
-        if (grid.length > 0) {
-            LCStageGuestWriteBackdropGrid(LCGuestDataUUID, grid);
-        }
-    }];
-    backdropGridTimer.tolerance = 0.15;
-    [[NSRunLoop mainRunLoop] addTimer:backdropGridTimer forMode:NSRunLoopCommonModes];
+    // Notification-driven: the host starts/stops the 0.5s sampling timer (see
+    // LCGuestStartBackdropSampling / LCGuestStopBackdropSampling). In split mode the timer is
+    // never created, so the guest pays zero renderInContext: cost during scrolling.
+
 
     // MARK: - First-frame report + frozen-frame capture
     //
@@ -699,6 +657,18 @@ static void UIKitGuestHooksInit() {
                                         NULL,
                                         LCStageHostForegroundingCallback,
                                         (__bridge CFStringRef)LCStageHostForegroundingNotificationName,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        LCStageStartBackdropCallback,
+                                        (__bridge CFStringRef)LCStageStartBackdropSamplingNotificationName,
+                                        NULL,
+                                        CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL,
+                                        LCStageStopBackdropCallback,
+                                        (__bridge CFStringRef)LCStageStopBackdropSamplingNotificationName,
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
         swizzle(UIApplication.class, @selector(sendEvent:), @selector(hook_lcStage_sendEvent:));
@@ -782,6 +752,44 @@ static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, voi
     [LCGuestKeepAliveAudio.shared disarmForForeground];
     [[LCFrameReadySignaler shared] arm];
 }
+
+#pragma mark - Backdrop luma grid sampling (notification-driven)
+
+static NSTimer *LCGuestBackdropGridTimer = nil;
+
+static void LCGuestStartBackdropSampling(void) {
+    if (LCGuestBackdropGridTimer) { return; }
+    NSTimer *t = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *_) {
+        if (!LCStageGuestIsMainWindow(LCGuestDataUUID)) { return; }
+        NSData *grid = LCGuestRenderBackdropGrid(LCGuestKeyWindow());
+        if (grid.length > 0) {
+            LCStageGuestWriteBackdropGrid(LCGuestDataUUID, grid);
+        }
+    }];
+    t.tolerance = 0.15;
+    [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+    LCGuestBackdropGridTimer = t;
+}
+
+static void LCGuestStopBackdropSampling(void) {
+    [LCGuestBackdropGridTimer invalidate];
+    LCGuestBackdropGridTimer = nil;
+}
+
+static void LCStageStartBackdropCallback(CFNotificationCenterRef center, void *observer,
+                                         CFStringRef name, const void *object,
+                                         CFDictionaryRef userInfo) {
+    LCGuestStartBackdropSampling();
+}
+
+static void LCStageStopBackdropCallback(CFNotificationCenterRef center, void *observer,
+                                        CFStringRef name, const void *object,
+                                        CFDictionaryRef userInfo) {
+    LCGuestStopBackdropSampling();
+}
+
+#pragma mark - Lifecycle broadcast masking (foreground pinning)
+
 
 @interface UIApplication (LCStageTouchHook)
 - (void)hook_lcStage_sendEvent:(UIEvent *)event;

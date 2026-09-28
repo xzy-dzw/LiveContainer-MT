@@ -64,6 +64,20 @@ static NSString * const LCStageHostBackgroundingNotificationName =
 static NSString * const LCStageHostForegroundingNotificationName =
     @"com.kdt.livecontainer.stage.hostForegrounding";
 
+/// Posted by the host when entering fullscreen mode. The main-window guest starts its
+/// 0.5s backdrop luma grid timer (needed to tint the floating zoom button's glyphs).
+/// Broadcast; only the main guest actually renders.
+static NSString * const LCStageStartBackdropSamplingNotificationName =
+    @"com.kdt.livecontainer.stage.startBackdrop";
+/// Posted by the host when exiting fullscreen. Every guest invalidates its backdrop timer.
+static NSString * const LCStageStopBackdropSamplingNotificationName =
+    @"com.kdt.livecontainer.stage.stopBackdrop";
+
+/// App Group Bool. When YES (default), the host re-pins scenes foreground on background and
+/// guests swallow UIScene lifecycle broadcasts, so an app like Instagram doesn't navigate back
+/// to its feed when the screen locks.
+static NSString * const LCStageIPCPinningKey = @"LCStageScenePinning";
+
 /// App Group Bool written by the host's multitask settings page. When YES and
 /// the stage is active, every guest process runs its own near-silent looping
 /// audio buffer so the system grants it a playback assertion while backgrounded.
@@ -146,6 +160,20 @@ static inline void LCStageNotifyHostBackgrounding(void) {
 static inline void LCStageNotifyHostForegrounding(void) {
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          (__bridge CFStringRef)LCStageHostForegroundingNotificationName,
+                                         NULL, NULL, TRUE);
+}
+
+/// Host: tell every guest to start backdrop luma sampling (entering fullscreen).
+static inline void LCStageNotifyStartBackdropSampling(void) {
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         (__bridge CFStringRef)LCStageStartBackdropSamplingNotificationName,
+                                         NULL, NULL, TRUE);
+}
+
+/// Host: tell every guest to stop backdrop luma sampling (exiting fullscreen).
+static inline void LCStageNotifyStopBackdropSampling(void) {
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         (__bridge CFStringRef)LCStageStopBackdropSamplingNotificationName,
                                          NULL, NULL, TRUE);
 }
 
@@ -261,6 +289,13 @@ static inline BOOL LCStageGuestIsMainWindow(NSString *guestUUID) {
     NSUserDefaults *defaults = LCStageSharedDefaults();
     if (!LCStageGuestIsStageActive()) { return NO; }
     return [[defaults stringForKey:LCStageIPCMainUUIDKey] isEqualToString:guestUUID];
+}
+
+/// Guest: whether foreground pinning / lifecycle masking is enabled. Missing key defaults to YES.
+static inline BOOL LCStageGuestPinningEnabled(void) {
+    NSUserDefaults *defaults = LCStageSharedDefaults();
+    if ([defaults objectForKey:LCStageIPCPinningKey] == nil) { return YES; }
+    return [defaults boolForKey:LCStageIPCPinningKey];
 }
 
 /// Guest (main window only): publishes a coarse luminance grid of its rendered content.

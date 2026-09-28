@@ -1396,38 +1396,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     private func pruneDeadWindows(allowHeartbeatPrune: Bool = true) -> Bool {
         let now = Date()
         var deadUUIDs: Set<String> = []
-        if allowHeartbeatPrune {
-            let absoluteNow = CFAbsoluteTimeGetCurrent()
-            for app in apps {
-                // A window that just entered the stage is never pruned: its guest still has to
-                // boot, and the heartbeat key may hold a previous run's timestamp until the new
-                // guest writes its own (write-addressed keys survive in the App Group).
-                guard now.timeIntervalSince(app.addedAt) > Self.guestStartGrace else { continue }
-
-                // Every guest writes a heartbeat once per second (UIKit+GuestHooks.m).
-                let hbKey = "LCGuestHeartbeat.\(app.appUUID)"
-                // The heartbeat timer runs on the guest's MAIN run loop, so a stale timestamp
-                // does not prove the process is dead: a heavy game blocking its main thread,
-                // a debugger pause or the system throttling a side appex all freeze the timer
-                // while the process is very much alive. SIGTERM-ing that process would destroy
-                // unsaved user data. getpgid is the ground truth — only collect a window whose
-                // pid is actually gone; alive-but-quiet windows stay on the stage.
-                let decorated = app.view?._viewDelegate() as? DecoratedAppSceneViewController
-                let processAlive = decorated?.appSceneVC.isAppRunning ?? false
-                let heartbeatFresh: Bool = {
-                    guard let last = LCUtils.appGroupUserDefault.object(forKey: hbKey) as? Double else { return false }
-                    return absoluteNow - last <= 10
-                }()
-
-                let definitelyDead: Bool
-                if LCUtils.appGroupUserDefault.object(forKey: hbKey) != nil {
-                    definitelyDead = !heartbeatFresh && !processAlive
-                } else {
-                    // No heartbeat at all after the grace window: either a guest built without
-                    // TweakLoader (then processAlive is the only signal) or one that never ran.
-                    definitelyDead = app.appInfo != nil && !processAlive
-                }
-                guard definitelyDead else { continue }
+        // Prune based on process liveness (getpgid) and detached views. No heartbeat:
+        // the guest process being gone is the ground truth.
+        for app in apps {
+            guard now.timeIntervalSince(app.addedAt) > Self.guestStartGrace else { continue }
+            let decorated = app.view?._viewDelegate() as? DecoratedAppSceneViewController
+            let processAlive = decorated?.appSceneVC.isAppRunning ?? false
+            if app.appInfo != nil && !processAlive {
                 deadUUIDs.insert(app.appUUID)
             }
         }
@@ -1579,6 +1554,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
 
         lastSettledFullscreen = isFullscreen
         lastSettledMainUUID = apps.first?.appUUID
+        syncBackdropSampling()
 
         // The main window changed (fullscreen toggle, promotion, refill after a close), so its
         // touch region has to cover the slot it sits in now. Windows that slid into side slots
@@ -1611,6 +1587,17 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         }
     }
 
+    /// Tells guests to start/stop backdrop luma sampling. Only needed in fullscreen mode,
+    /// where the floating zoom button needs adaptive glyph colors. In split mode the dock
+    /// controls sit on a solid background, no sampling needed.
+    private func syncBackdropSampling() {
+        if isFullscreen && !isStageCollapsed {
+            LCStageNotifyStartBackdropSampling()
+        } else {
+            LCStageNotifyStopBackdropSampling()
+        }
+    }
+
     /// Re-pushes the MAIN window's settled geometry into its hosted scene.
     ///
     /// This used to be a foreground NO→YES blip hidden behind a stage snapshot. Both halves of
@@ -1637,6 +1624,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         fpsCounter.isCounting = false
         fpsCounter.isHidden = true
         stopBackdropProbe()
+        LCStageNotifyStopBackdropSampling()
         // No stage on screen: every guest keeps its own touches again.
         publishStageRoles(active: false)
         notifyCollapsedStateChanged()
@@ -1676,7 +1664,13 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
     }
 
     /// PiP second-channel toggle (App Group). v4.1.2: backup channel — a missing key defaults to OFF.
-    private var keepAlivePiPEnabled: Bool {
+        private var scenePinningEnabled: Bool {
+        let defaults = LCUtils.appGroupUserDefault
+        if defaults.object(forKey: LCStageIPCPinningKey) == nil { return true }
+        return defaults.bool(forKey: LCStageIPCPinningKey)
+    }
+
+private var keepAlivePiPEnabled: Bool {
         let defaults = LCUtils.appGroupUserDefault
         if defaults.object(forKey: LCStageIPCPiPKeepAliveKey) == nil { return false }
         return defaults.bool(forKey: LCStageIPCPiPKeepAliveKey)
@@ -1821,7 +1815,15 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // 2) Locally cover every card with whatever frozen frame already exists (from the last
         //    round) immediately, so even the resign animation itself never shows a black gap.
         coverCardsWithFrozenFrames()
-        // 3) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
+        // 3) Foreground pinning: re-assert foreground on every scene so iOS doesn't deactivate
+        //    the guest while we're backgrounded. This prevents surface rebuild + black flash.
+        if scenePinningEnabled {
+            for app in apps {
+                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+                vc.appSceneVC.lcPinForeground()
+            }
+        }
+        // 4) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
         if keepAlivePiPEnabled {
             StagePiPKeepAlive.shared.nudgeStart()
         }
@@ -1925,6 +1927,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             self.lastSettledMainUUID = self.apps.first?.appUUID
             self.lastSettledGeneration = self.pendingGeometryGeneration
             self.commitMainWindowGeometry()
+            self.syncBackdropSampling()
         }
     }
 
@@ -2206,6 +2209,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             self.fpsCounter.isCounting = false
             self.allChromeButtons.forEach { $0.isHidden = true }
             self.stopBackdropProbe()
+            LCStageNotifyStopBackdropSampling()
             self.notifyCollapsedStateChanged()
         })
     }

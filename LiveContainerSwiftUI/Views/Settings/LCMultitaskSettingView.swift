@@ -20,6 +20,7 @@ struct LCMultitaskSettingView: View {
     @AppStorage("LCStageKeepAliveAudio", store: LCUtils.appGroupUserDefault) var keepAliveAudio = false
     @AppStorage("LCStageKeepAlivePiP", store: LCUtils.appGroupUserDefault) var keepAlivePiP = false
     @AppStorage("LCStageKeepAliveLocation", store: LCUtils.appGroupUserDefault) var keepAliveLocation = true
+    @AppStorage("LCStageScenePinning", store: LCUtils.appGroupUserDefault) var scenePinning = true
 
     var body: some View {
         List {
@@ -53,6 +54,14 @@ struct LCMultitaskSettingView: View {
                     }
                     Toggle(isOn: $redirectURLToHost) {
                         Text("lc.settings.redirectURLToHost".loc)
+                    }
+                    Toggle(isOn: $scenePinning) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("锁定 App 页面状态")
+                            Text("切后台/锁屏时不让 App 以为自己退到了后台，防止刷到一半跳回首页")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                     Toggle(isOn: $keepAliveLocation) {
                         VStack(alignment: .leading, spacing: 2) {
