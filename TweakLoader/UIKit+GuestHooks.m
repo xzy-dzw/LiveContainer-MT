@@ -20,6 +20,12 @@ static void LCStageHostBackgroundingCallback(CFNotificationCenterRef center, voi
 static void LCStageHostForegroundingCallback(CFNotificationCenterRef center, void *observer,
                                              CFStringRef name, const void *object,
                                              CFDictionaryRef userInfo);
+static void LCStageStartBackdropCallback(CFNotificationCenterRef center, void *observer,
+                                         CFStringRef name, const void *object,
+                                         CFDictionaryRef userInfo);
+static void LCStageStopBackdropCallback(CFNotificationCenterRef center, void *observer,
+                                        CFStringRef name, const void *object,
+                                        CFDictionaryRef userInfo);
 
 /// Resolved once in the constructor: the data container UUID this guest runs with. Drives the
 /// heartbeat key and the side-window quarantine verdict.
@@ -659,8 +665,6 @@ static void UIKitGuestHooksInit() {
                                         (__bridge CFStringRef)LCStageHostForegroundingNotificationName,
                                         NULL,
                                         CFNotificationSuspensionBehaviorDeliverImmediately);
-        static void LCStageStartBackdropCallback(CFNotificationCenterRef, void *, CFStringRef, const void *, CFDictionaryRef);
-        static void LCStageStopBackdropCallback(CFNotificationCenterRef, void *, CFStringRef, const void *, CFDictionaryRef);
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                         NULL,
                                         LCStageStartBackdropCallback,
