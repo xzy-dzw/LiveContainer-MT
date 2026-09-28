@@ -1815,7 +1815,14 @@ private var keepAlivePiPEnabled: Bool {
         // 2) Locally cover every card with whatever frozen frame already exists (from the last
         //    round) immediately, so even the resign animation itself never shows a black gap.
         coverCardsWithFrozenFrames()
-        // 3) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
+        // 3) Re-pin scenes foreground while pinning is on, so iOS doesn't tear the scene down.
+        if scenePinningEnabled {
+            for app in apps {
+                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
+                vc.appSceneVC.lcPinForeground()
+            }
+        }
+        // 4) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
         if keepAlivePiPEnabled {
             StagePiPKeepAlive.shared.nudgeStart()
         }

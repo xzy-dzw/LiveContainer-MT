@@ -460,13 +460,11 @@ static NSSet<NSString *> *LCStageMaskedLifecycleNames(void) {
     static NSSet *names;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
+        // Only the "waking up" direction. Backgrounding (WillResignActive / DidEnterBackground /
+        // WillDeactivate / DidEnterBackground) passes through so apps pause naturally.
         names = [NSSet setWithArray:@[
-            UISceneWillDeactivateNotification,
-            UISceneDidActivateNotification,
             UISceneWillEnterForegroundNotification,
-            UISceneDidEnterBackgroundNotification,
-            UIApplicationWillResignActiveNotification,
-            UIApplicationDidEnterBackgroundNotification,
+            UISceneDidActivateNotification,
             UIApplicationWillEnterForegroundNotification,
             UIApplicationDidBecomeActiveNotification,
         ]];
