@@ -1815,17 +1815,7 @@ private var keepAlivePiPEnabled: Bool {
         // 2) Locally cover every card with whatever frozen frame already exists (from the last
         //    round) immediately, so even the resign animation itself never shows a black gap.
         coverCardsWithFrozenFrames()
-        // 3) Foreground pinning: re-assert foreground on every scene so iOS doesn't deactivate
-        //    the guest while we're backgrounded. This prevents surface rebuild + black flash.
-        if scenePinningEnabled {
-            for app in apps {
-                guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
-                vc.appSceneVC.lcPinForeground()
-            }
-            LCUtils.appGroupUserDefault.set(true, forKey: LCStageIPCStayPinnedKey)
-            LCUtils.appGroupUserDefault.synchronize()
-        }
-        // 4) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
+        // 3) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
         if keepAlivePiPEnabled {
             StagePiPKeepAlive.shared.nudgeStart()
         }
@@ -1865,8 +1855,6 @@ private var keepAlivePiPEnabled: Bool {
         endBackgroundTaskIfNeeded()
         lastHostWakeAt = Date()
         // Guests' own didBecomeActive is stripped under hosting; tell them to re-arm frame-ready.
-        LCUtils.appGroupUserDefault.set(false, forKey: LCStageIPCStayPinnedKey)
-        LCUtils.appGroupUserDefault.synchronize()
         LCStageNotifyHostForegrounding()
         // Cover with the snapshots taken at willResignActive first. Each cover is lifted only by
         // that guest's own pixel-verified frame-ready report (handleGuestFrameReady, also polled by

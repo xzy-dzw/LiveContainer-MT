@@ -465,6 +465,10 @@ static NSSet<NSString *> *LCStageMaskedLifecycleNames(void) {
             UISceneDidActivateNotification,
             UISceneWillEnterForegroundNotification,
             UISceneDidEnterBackgroundNotification,
+            UIApplicationWillResignActiveNotification,
+            UIApplicationDidEnterBackgroundNotification,
+            UIApplicationWillEnterForegroundNotification,
+            UIApplicationDidBecomeActiveNotification,
         ]];
     });
     return names;
@@ -481,7 +485,7 @@ static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
     if (name.length == 0 || ![LCStageMaskedLifecycleNames() containsObject:name]) { return NO; }
     if (!LCStageGuestHasActivatedOnce) { return NO; }
     if (!LCStageGuestPinningEnabled()) { return NO; }
-    return LCStageGuestShouldMaskLifecycle();
+    return LCStageGuestIsStageActive();
 }
 
 @interface NSNotificationCenter (LCStageLifecycleMask)
@@ -506,7 +510,7 @@ static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
 
 @implementation UIScene (LCStageLifecycleMask)
 - (UISceneActivationState)hook_lc_activationState {
-    if (LCStageGuestPinningEnabled() && LCStageGuestShouldMaskLifecycle()) {
+    if (LCStageGuestPinningEnabled() && LCStageGuestIsStageActive()) {
         return UISceneActivationStateForegroundActive;
     }
     return [self hook_lc_activationState];
