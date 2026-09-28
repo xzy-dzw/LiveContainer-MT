@@ -1822,6 +1822,8 @@ private var keepAlivePiPEnabled: Bool {
                 guard let vc = app.view?._viewDelegate() as? DecoratedAppSceneViewController else { continue }
                 vc.appSceneVC.lcPinForeground()
             }
+            LCUtils.appGroupUserDefault.set(true, forKey: LCStageIPCStayPinnedKey)
+            LCUtils.appGroupUserDefault.synchronize()
         }
         // 4) Backup channels only: the PiP nudge runs solely when the user enabled PiP.
         if keepAlivePiPEnabled {
@@ -1863,6 +1865,8 @@ private var keepAlivePiPEnabled: Bool {
         endBackgroundTaskIfNeeded()
         lastHostWakeAt = Date()
         // Guests' own didBecomeActive is stripped under hosting; tell them to re-arm frame-ready.
+        LCUtils.appGroupUserDefault.set(false, forKey: LCStageIPCStayPinnedKey)
+        LCUtils.appGroupUserDefault.synchronize()
         LCStageNotifyHostForegrounding()
         // Cover with the snapshots taken at willResignActive first. Each cover is lifted only by
         // that guest's own pixel-verified frame-ready report (handleGuestFrameReady, also polled by

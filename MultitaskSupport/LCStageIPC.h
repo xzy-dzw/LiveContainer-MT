@@ -78,6 +78,12 @@ static NSString * const LCStageStopBackdropSamplingNotificationName =
 /// to its feed when the screen locks.
 static NSString * const LCStageIPCPinningKey = @"LCStageScenePinning";
 
+/// Set by the host at willResignActive (while pinning is on) and cleared at willEnterForeground.
+/// Guests keep masking lifecycle broadcasts even after the roles timestamp goes stale (the host
+/// is suspended and can't republish). Without this, 5s after lock the guest stops masking and
+/// apps like Douyin pause / Instagram refreshes.
+static NSString * const LCStageIPCStayPinnedKey = @"LCStageStayPinned";
+
 /// App Group Bool written by the host's multitask settings page. When YES and
 /// the stage is active, every guest process runs its own near-silent looping
 /// audio buffer so the system grants it a playback assertion while backgrounded.
@@ -296,6 +302,13 @@ static inline BOOL LCStageGuestPinningEnabled(void) {
     NSUserDefaults *defaults = LCStageSharedDefaults();
     if ([defaults objectForKey:LCStageIPCPinningKey] == nil) { return YES; }
     return [defaults boolForKey:LCStageIPCPinningKey];
+}
+
+/// Guest: whether lifecycle masking should stay active right now. True either while the stage
+/// is freshly published, or while the host has flagged itself as staying pinned (backgrounded).
+static inline BOOL LCStageGuestShouldMaskLifecycle(void) {
+    if (LCStageGuestIsStageActive()) { return YES; }
+    return [LCStageSharedDefaults() boolForKey:LCStageIPCStayPinnedKey];
 }
 
 /// Guest (main window only): publishes a coarse luminance grid of its rendered content.

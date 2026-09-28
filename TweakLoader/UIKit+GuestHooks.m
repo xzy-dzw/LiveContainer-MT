@@ -481,7 +481,7 @@ static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
     if (name.length == 0 || ![LCStageMaskedLifecycleNames() containsObject:name]) { return NO; }
     if (!LCStageGuestHasActivatedOnce) { return NO; }
     if (!LCStageGuestPinningEnabled()) { return NO; }
-    return LCStageGuestIsStageActive();
+    return LCStageGuestShouldMaskLifecycle();
 }
 
 @interface NSNotificationCenter (LCStageLifecycleMask)
@@ -506,7 +506,7 @@ static BOOL LCStageShouldMaskLifecycleName(NSString *name) {
 
 @implementation UIScene (LCStageLifecycleMask)
 - (UISceneActivationState)hook_lc_activationState {
-    if (LCStageGuestPinningEnabled() && LCStageGuestIsStageActive()) {
+    if (LCStageGuestPinningEnabled() && LCStageGuestShouldMaskLifecycle()) {
         return UISceneActivationStateForegroundActive;
     }
     return [self hook_lc_activationState];
