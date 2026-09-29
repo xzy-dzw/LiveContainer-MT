@@ -679,10 +679,12 @@ static void LCStageRolesChangedCallback(CFNotificationCenterRef center, void *ob
     // Pull the host's latest role state so the NEXT touch-began verdict is fresh. Verdicts of
     // sequences already in flight are intentionally NOT revisited (see above).
     [NSUserDefaults.lcSharedDefaults synchronize];
-    // Drop the fast-path cache so the next event re-reads the just-published roles. This only
-    // invalidates (never serves) the cache, so the callback's arbitrary thread cannot race a
-    // main-thread reader on the verdict itself.
-    LCStageCachedIsSideWindowValidUntil = 0;
+    // Drop the fast-path cache on the MAIN THREAD. Darwin delivers this callback on an arbitrary
+    // thread; writing validUntil directly here could race a main-thread sendEvent reader that is
+    // mid-check. Hop to the main queue so all access to the two cached statics is main-thread only.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LCStageCachedIsSideWindowValidUntil = 0;
+    });
     // Stage active state is also the on/off switch for this guest's keep-alive audio.
     [LCGuestKeepAliveAudio.shared reconcile];
 }
