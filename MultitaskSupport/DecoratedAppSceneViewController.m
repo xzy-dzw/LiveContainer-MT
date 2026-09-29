@@ -203,7 +203,7 @@
 
 - (void)hideContentCoversAnimated:(BOOL)animated {
     if(self.launchPlaceholder.hidden) { return; }
-    [UIView animateWithDuration:animated ? 0.25 : 0 animations:^{
+    [UIView animateWithDuration:animated ? 0.25 : 0 delay:0 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
         self.launchPlaceholder.alpha = 0;
     } completion:^(BOOL finished) {
         self.launchPlaceholder.hidden = YES;
@@ -320,7 +320,7 @@
 }
 
 - (void)minimizeWindowPiP {
-    [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
+    [UIView animateWithDuration:0.3 delay:0 options:(UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionBeginFromCurrentState) animations:^{
         self.view.alpha = 0;
     } completion:^(BOOL finished) {
         self.view.hidden = YES;
@@ -328,7 +328,7 @@
 }
 
 - (void)unminimizeWindowPiP {
-    [UIView animateWithDuration:0.3 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
+    [UIView animateWithDuration:0.3 delay:0 options:(UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionBeginFromCurrentState) animations:^{
         self.view.hidden = NO;
         self.view.alpha = 1;
     } completion:nil];

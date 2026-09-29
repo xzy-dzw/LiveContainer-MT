@@ -1220,7 +1220,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             layoutToken &+= 1
             let token = layoutToken
             UIView.transition(with: windowHostingView, duration: 0.2, options: [.transitionCrossDissolve, .allowUserInteraction], animations: update)
-            UIView.animate(withDuration: 0.2) {
+            UIView.animate(withDuration: 0.2, options: [.beginFromCurrentState, .allowUserInteraction]) {
                 self.dockHost?.view.alpha = self.isFullscreen ? 0 : 1
                 self.fpsCounter.alpha = (self.isFullscreen || self.isStageCollapsed) ? 0 : 1
                 for button in self.allChromeButtons {
@@ -1266,7 +1266,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             dockHost?.view.alpha = 0
             fpsCounter.alpha = 0
             allChromeButtons.forEach { $0.alpha = 0 }
-            UIView.animate(withDuration: 0.22, delay: 0, options: .allowUserInteraction) {
+            UIView.animate(withDuration: 0.22, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
                 self.windowHostingView.alpha = 1
                 self.dockHost?.view.alpha = dockTargetAlpha
                 self.fpsCounter.alpha = self.isFullscreen ? 0 : 1
@@ -1660,7 +1660,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // No stage on screen: every guest keeps its own touches again.
         publishStageRoles(active: false)
         notifyCollapsedStateChanged()
-        UIView.animate(withDuration: 0.2, animations: {
+        UIView.animate(withDuration: 0.2, options: [.beginFromCurrentState, .allowUserInteraction], animations: {
             self.windowHostingView.alpha = 0
             self.dockHost?.view.alpha = 0
             self.allChromeButtons.forEach { $0.alpha = 0 }
@@ -2115,7 +2115,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // Kill interaction on the first frame of the fade-out: a tap landing during the 0.22s
         // animation must not toggle fullscreen, persist a mirror flip or close a hidden window.
         allChromeButtons.forEach { $0.isUserInteractionEnabled = false }
-        UIView.animate(withDuration: 0.22, delay: 0, options: .allowUserInteraction, animations: {
+        UIView.animate(withDuration: 0.22, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction], animations: {
             self.windowHostingView.alpha = 0
             self.dockHost?.view.alpha = 0
             self.fpsCounter.alpha = 0

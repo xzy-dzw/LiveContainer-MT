@@ -115,24 +115,22 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
         }
 
         for(UITouch *touch in touches) {
-            // Sequences leave the table the moment they finish.
-            if(touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled) {
-                [LCInterceptedTouches removeObject:touch];
-                continue;
-            }
+            // Only Began gets a fresh hit-test verdict. Ended/Cancelled are intentionally NOT
+            // removed here: they must stay in the table through the swallow-decision below, so a
+            // quarantined sequence that lifts its finger is dropped entirely. Previously the
+            // Ended was removed up front and then delivered to the side guest, which received a
+            // touchesEnded with no matching touchesBegan and corrupted its gesture recognizers.
             if(touch.phase != UITouchPhaseBegan) {
                 continue;
             }
-            // A new sequence always starts untrusted: purge any verdict an earlier sequence left
-            // on this (possibly recycled) UITouch instance before re-evaluating its location.
             [LCInterceptedTouches removeObject:touch];
 
             UIWindow *hitTestWindow = window ?: touch.window;
             if(hitTestWindow == nil) {
-                continue; // not bound yet at the UIApplication level; the UIWindow hook gets it
+                continue;
             }
             if(window != nil && touch.window != nil && touch.window != window) {
-                continue; // event bound to a different window than the one dispatching
+                continue;
             }
             CGPoint location = [touch locationInView:hitTestWindow];
             if([MultitaskDockManager.shared interceptTouchAtLocation:location inWindow:hitTestWindow]) {
@@ -141,11 +139,6 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
             }
         }
 
-        // Decide over EVERY touch of THIS event, including endings. A tracked sequence's own
-        // ended was just removed from the table above (it must be delivered: the guest never got
-        // its began); and an untracked ended/cancelled — e.g. the main-window finger lifting
-        // while a quarantined side finger still moves — must veto the swallow, or that guest
-        // never receives touchesEnded and its gesture/button hangs highlighted.
         BOOL allTracked = YES;
         BOOL anyTracked = NO;
         for(UITouch *touch in touches) {
@@ -156,14 +149,18 @@ static BOOL LCProcessStageTouches(UIEvent *event, UIWindow *window) {
             }
         }
         if(allTracked && anyTracked) {
-            // Every live touch in the event belongs to a quarantined sequence: drop the event
-            // so the side guest never sees it.
+            // Every touch in this event belongs to a quarantined sequence (including a tracked
+            // Ended/Cancelled): drop the whole event. Consume the ending touches from the table.
+            for(UITouch *touch in touches) {
+                if(touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled) {
+                    [LCInterceptedTouches removeObject:touch];
+                }
+            }
             return YES;
         }
-        // Mixed event: this one is delivered, so release ONLY the side sequences that ride in
-        // it (swallowing their later moved/ended after this delivery would split the gesture).
-        // Sequences not present in this event keep their quarantine.
         if(anyTracked) {
+            // Mixed event (tracked + untracked fingers): deliver it, and release every tracked
+            // touch riding in this event (including its Ended) so later events are clean.
             for(UITouch *touch in touches) {
                 [LCInterceptedTouches removeObject:touch];
             }

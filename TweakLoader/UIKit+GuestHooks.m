@@ -760,21 +760,14 @@ static void LCStageStopBackdropCallback(CFNotificationCenterRef center, void *ob
         NSSet<UITouch *> *touches = event.allTouches;
         BOOL promoteRequested = NO;
         for (UITouch *touch in touches) {
-            // Sequences leave the table the moment they finish.
-            if (touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled) {
-                [LCStageSideTouches removeObject:touch];
-                continue;
-            }
+            // Only Began gets a fresh verdict. Ended/Cancelled are intentionally NOT removed here:
+            // they must remain in the table through the swallow-decision below, so a tracked
+            // sequence that lifts its finger is dropped entirely (guest never sees a stray Ended
+            // without a matching Began, which would corrupt gesture recognizer state).
             if (touch.phase != UITouchPhaseBegan) { continue; }
-            // A new sequence always starts fresh: purge any verdict a recycled UITouch instance
-            // carried from an earlier sequence, then adjudicate ONCE for this whole gesture.
-            // Always a FRESH verdict (never the cached gate value) so a began is never
-            // misclassified by a 0.5s-stale cache.
             [LCStageSideTouches removeObject:touch];
             if (LCStageGuestIsSideWindow(LCGuestDataUUID)) {
                 [LCStageSideTouches addObject:touch];
-                // Several Began can ride one UIEvent (two fingers landing almost together); the
-                // host promotes idempotently, so request it once per event rather than per finger.
                 promoteRequested = YES;
             }
         }
@@ -783,9 +776,6 @@ static void LCStageStopBackdropCallback(CFNotificationCenterRef center, void *ob
             os_log_debug(LCGuestStageLog(), "[LCStage][touch] side-window touch quarantined, requesting promotion (uuid=%{public}@)", LCGuestDataUUID);
         }
 
-        // Decide over EVERY touch of THIS event, including endings (mirrors the host-side hook):
-        // a tracked sequence's own ended was just removed and must be delivered together with any
-        // untracked finger in the same event, otherwise gestures/buttons hang highlighted.
         BOOL allTracked = YES;
         BOOL anyTracked = NO;
         for (UITouch *touch in touches) {
@@ -796,13 +786,19 @@ static void LCStageStopBackdropCallback(CFNotificationCenterRef center, void *ob
             }
         }
         if (allTracked && anyTracked) {
-            // Every live touch belongs to a quarantined side-window sequence: drop the whole
-            // event so the guest app never sees it.
+            // Every touch in this event belongs to a quarantined sequence (including a tracked
+            // Ended/Cancelled): drop the whole event so the guest never sees a stray end.
+            // Ended/Cancelled touches are dropped from the table now that they are consumed.
+            for (UITouch *touch in touches) {
+                if (touch.phase == UITouchPhaseEnded || touch.phase == UITouchPhaseCancelled) {
+                    [LCStageSideTouches removeObject:touch];
+                }
+            }
             return;
         }
         if (anyTracked) {
-            // Mixed event: it is delivered, so release ONLY the side sequences riding in it —
-            // swallowing their later moved/ended after this delivery would split the gesture.
+            // Mixed event (tracked + untracked fingers): deliver it, and release every tracked
+            // touch riding in this event (including its Ended) so later events are clean.
             for (UITouch *touch in touches) {
                 [LCStageSideTouches removeObject:touch];
             }
