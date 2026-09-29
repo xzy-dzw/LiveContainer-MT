@@ -1220,7 +1220,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
             layoutToken &+= 1
             let token = layoutToken
             UIView.transition(with: windowHostingView, duration: 0.2, options: [.transitionCrossDissolve, .allowUserInteraction], animations: update)
-            UIView.animate(withDuration: 0.2, options: [.beginFromCurrentState, .allowUserInteraction]) {
+            UIView.animate(withDuration: 0.2, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) {
                 self.dockHost?.view.alpha = self.isFullscreen ? 0 : 1
                 self.fpsCounter.alpha = (self.isFullscreen || self.isStageCollapsed) ? 0 : 1
                 for button in self.allChromeButtons {
@@ -1660,7 +1660,7 @@ extension StagePiPKeepAlive: AVPictureInPictureSampleBufferPlaybackDelegate {
         // No stage on screen: every guest keeps its own touches again.
         publishStageRoles(active: false)
         notifyCollapsedStateChanged()
-        UIView.animate(withDuration: 0.2, options: [.beginFromCurrentState, .allowUserInteraction], animations: {
+        UIView.animate(withDuration: 0.2, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction], animations: {
             self.windowHostingView.alpha = 0
             self.dockHost?.view.alpha = 0
             self.allChromeButtons.forEach { $0.alpha = 0 }
