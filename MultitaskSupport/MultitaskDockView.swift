@@ -307,10 +307,9 @@ private final class StageAudioKeepAlive {
 /// under memory pressure. It is independent of AVAudioSession, so a native app (WeChat voice
 /// message, phone call) that interrupts or suspends our playback cannot touch this assertion.
 ///
-/// Battery is kept minimal: desiredAccuracy is Best (which also makes iOS treat the session as
-/// navigation-level, showing the status-bar arrow less), while distanceFilter is essentially
-/// infinite so the GPS radio is not actually woken up to fix positions. We never read the
-/// coordinates; the session itself is the point.
+/// Battery is kept minimal: desiredAccuracy is Reduced (WiFi/cell tower only, no satellite
+/// search) and distanceFilter is effectively infinite so no location callbacks fire. We never
+/// read the coordinates; the session itself is the background-assertion point.
 @available(iOS 16.0, *)
 private final class StageLocationKeepAlive: NSObject {
     static let shared = StageLocationKeepAlive()
@@ -337,7 +336,15 @@ private final class StageLocationKeepAlive: NSObject {
             LCSLog("[LCStage][保活] 定位通道待命，但系统定位服务未开启（音轨+PiP 继续兜底）")
             return
         }
-        manager.desiredAccuracy = kCLLocationAccuracyBest
+        // We never consume a real location — the session only exists as a background assertion.
+        // kCLLocationAccuracyBest keeps the GPS radio actively searching satellites the whole time
+        // the stage is up (very hot); Reduced (iOS 14+) uses WiFi/cell tower only, no satellite
+        // search, and still satisfies the background-location entitlement.
+        if #available(iOS 14.0, *) {
+            manager.desiredAccuracy = kCLLocationAccuracyReduced
+        } else {
+            manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        }
         // Effectively "never actually move": do not wake the GPS radio to fix positions, only keep
         // the continuous-location session alive.
         manager.distanceFilter = 999_999
